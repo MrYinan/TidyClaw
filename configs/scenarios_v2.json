@@ -1,0 +1,502 @@
+{
+  "schema_version": 2,
+  "description": "V2 single-room multi-condition benchmark scenarios for OpenClaw household service tasks. Online Agent still only uses /observation; this config is for backend-controlled benchmark setup and offline evaluation.",
+  "task_classes": {
+    "pickup_target": "visible household object that can be picked up or tidied",
+    "place_receptacle": "visible support/container candidate for PutObject",
+    "obstacle": "large object or geometry that constrains movement",
+    "cleanable_object": "legacy cleanable floor proxy used by the clean skill",
+    "ignored_object": "visible object that is not relevant to the current task"
+  },
+  "service_task_note": "V2.2 uses AI2-THOR native household objects as the main benchmark/data route. Legacy floor_trash scenarios remain for clean-skill regression tests.",
+  "scenarios": [
+    {
+      "name": "empty_room_patrol",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "No seeded trash. Tests patrol stability and false clean rate.",
+      "tags": ["empty", "false_positive"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": []
+    },
+    {
+      "name": "front_floor_trash",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "One floor trash proxy in front-center. Tests direct clean behavior.",
+      "tags": ["floor_trash", "direct_clean"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {"kind": "floor_trash", "layout": "front-center", "distance": 0.6, "object_types": ["Apple", "Tomato", "Potato", "Book"]}
+      ]
+    },
+    {
+      "name": "left_floor_trash_alignment",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "One floor trash proxy in front-left. Tests alignment before cleaning.",
+      "tags": ["floor_trash", "alignment", "left"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {"kind": "floor_trash", "layout": "front-left", "distance": 0.6, "object_types": ["Apple", "Tomato", "Potato", "Book"]}
+      ]
+    },
+    {
+      "name": "right_floor_trash_alignment",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "One floor trash proxy in front-right. Tests alignment before cleaning.",
+      "tags": ["floor_trash", "alignment", "right"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {"kind": "floor_trash", "layout": "front-right", "distance": 0.6, "object_types": ["Apple", "Tomato", "Potato", "Book"]}
+      ]
+    },
+    {
+      "name": "far_floor_trash_approach",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "One floor trash proxy farther ahead. Tests approach-then-clean behavior.",
+      "tags": ["floor_trash", "approach", "reachability"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {"kind": "floor_trash", "layout": "far-front", "distance": 1.05, "object_types": ["Apple", "Tomato", "Potato", "Book"]}
+      ]
+    },
+    {
+      "name": "non_floor_decoy_no_clean",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "A cleanable-looking object is elevated, so it must be treated as non_floor_object and not cleaned.",
+      "tags": ["non_floor_object", "false_clean"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {"kind": "non_floor_decoy", "layout": "front-center", "distance": 0.6, "y": 0.85, "object_types": ["Apple", "Tomato", "Potato", "Book"]}
+      ]
+    },
+    {
+      "name": "mixed_floor_and_non_floor",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "One floor trash and one elevated decoy. Tests task semantic discrimination.",
+      "tags": ["mixed", "floor_trash", "non_floor_object"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {"kind": "floor_trash", "layout": "front-left", "distance": 0.65, "object_types": ["Apple", "Tomato", "Potato", "Book"]},
+        {"kind": "non_floor_decoy", "layout": "front-right", "distance": 0.65, "y": 0.85, "object_types": ["Apple", "Tomato", "Potato", "Book"]}
+      ]
+    },
+    {
+      "name": "wall_collision_recovery",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "Start near a likely boundary-facing pose. Tests action feedback, collision recording and recovery. If the pose is open in your AI2-THOR version, use another FloorPlan or adjust initial_pose.",
+      "tags": ["obstacle", "collision", "recovery"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.5, "y": 0.9, "z": -1.5},
+        "rotation": {"x": 0, "y": 270, "z": 0}
+      },
+      "seed_objects": []
+    },
+    {
+      "name": "book_front_pick",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "One Book-like pickup target in front-center. Tests direct pickup behavior for V2.2 service tasks.",
+      "tags": ["service", "pickup", "book", "direct_pick"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {
+          "kind": "pickup_target",
+          "dataset_label": "Book",
+          "task_semantic_class": "pickup_target",
+          "layout": "front-center",
+          "distance": 0.6,
+          "object_types": ["Book", "Apple", "Tomato", "Potato"]
+        }
+      ]
+    },
+    {
+      "name": "apple_front_pick",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "One Apple pickup target in front-center. Tests fruit pickup as a household service action.",
+      "tags": ["service", "pickup", "apple", "direct_pick"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {
+          "kind": "pickup_target",
+          "dataset_label": "Apple",
+          "task_semantic_class": "pickup_target",
+          "layout": "front-center",
+          "distance": 0.6,
+          "object_types": ["Apple", "Tomato", "Potato"]
+        }
+      ]
+    },
+    {
+      "name": "potato_front_pick",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "Potato pickup target in front-center for focused small-object training.",
+      "tags": ["service", "pickup", "potato", "direct_pick", "focused_training"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {
+          "kind": "pickup_target",
+          "object_type": "Potato",
+          "dataset_label": "Potato",
+          "task_semantic_class": "pickup_target",
+          "layout": "front-center",
+          "distance": 0.6
+        }
+      ]
+    },
+    {
+      "name": "potato_far_front_pick",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "Small far Potato pickup target near the lower image center for approach-training.",
+      "tags": ["service", "pickup", "potato", "approach", "focused_training"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {
+          "kind": "pickup_target",
+          "object_type": "Potato",
+          "dataset_label": "Potato",
+          "task_semantic_class": "pickup_target",
+          "layout": "far-front",
+          "distance": 1.05
+        }
+      ]
+    },
+    {
+      "name": "cup_front_pick_focused",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "Cup pickup target in front-center for focused confusion-pair training.",
+      "tags": ["service", "pickup", "cup", "direct_pick", "focused_training"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {
+          "kind": "pickup_target",
+          "object_type": "Cup",
+          "dataset_label": "Cup",
+          "task_semantic_class": "pickup_target",
+          "layout": "front-center",
+          "distance": 0.6
+        }
+      ]
+    },
+    {
+      "name": "cup_far_front_pick",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "Small far Cup pickup target near the lower image center for Potato/Cup confusion training.",
+      "tags": ["service", "pickup", "cup", "approach", "focused_training"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {
+          "kind": "pickup_target",
+          "object_type": "Cup",
+          "dataset_label": "Cup",
+          "task_semantic_class": "pickup_target",
+          "layout": "far-front",
+          "distance": 1.05
+        }
+      ]
+    },
+    {
+      "name": "book_on_floor_to_table",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "A Book-like pickup target and a nearby table-like receptacle. Tests pickup followed by placement.",
+      "tags": ["service", "pickup", "place", "book", "table"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {
+          "kind": "pickup_target",
+          "dataset_label": "Book",
+          "task_semantic_class": "pickup_target",
+          "layout": "front-center",
+          "distance": 0.58,
+          "object_types": ["Book", "Apple", "Tomato", "Potato"]
+        },
+        {
+          "kind": "place_receptacle",
+          "dataset_label": "DiningTable",
+          "task_semantic_class": "place_receptacle",
+          "layout": "front-right",
+          "distance": 0.75,
+          "y": 0.72,
+          "object_types": ["CounterTop", "Sink", "Bowl", "Plate"]
+        }
+      ]
+    },
+    {
+      "name": "mixed_book_and_cabinet",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "A pickup target plus a chair-like obstacle proxy. Tests target selection while obstacle signals remain active.",
+      "tags": ["service", "pickup", "obstacle", "mixed"],
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {
+          "kind": "pickup_target",
+          "dataset_label": "Book",
+          "task_semantic_class": "pickup_target",
+          "layout": "front-left",
+          "distance": 0.6,
+          "object_types": ["Book", "Apple", "Tomato", "Potato"]
+        },
+        {
+          "kind": "obstacle",
+          "dataset_label": "Chair",
+          "task_semantic_class": "obstacle",
+          "layout": "front-right",
+          "distance": 0.75,
+          "object_types": ["Chair", "ArmChair", "Stool"]
+        }
+      ]
+    },
+    {
+      "name": "cup_front_pick",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "Cup pickup target in front-center.",
+      "look_down": true,
+      "seed_objects": [
+        {
+          "kind": "pickup_target",
+          "object_type": "Cup",
+          "layout": "front-center",
+          "distance": 0.6,
+          "task_semantic_class": "pickup_target"
+        }
+      ],
+      "tags": ["service", "pickup", "cup"]
+    },
+    {
+      "name": "bowl_front_receptacle",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "Bowl receptacle target in front-center.",
+      "look_down": true,
+      "seed_objects": [
+        {
+          "kind": "place_receptacle",
+          "object_type": "Bowl",
+          "layout": "front-center",
+          "distance": 0.6,
+          "y": 0.2,
+          "task_semantic_class": "place_receptacle"
+        }
+      ],
+      "tags": ["service", "receptacle", "bowl"]
+    },
+    {
+      "name": "plate_front_pick",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "Plate pickup target in front-center.",
+      "look_down": true,
+      "seed_objects": [
+        {
+          "kind": "pickup_target",
+          "object_type": "Plate",
+          "layout": "front-center",
+          "distance": 0.6,
+          "task_semantic_class": "pickup_target"
+        }
+      ],
+      "tags": ["service", "pickup", "plate"]
+    },
+    {
+      "name": "regression_shelf_context_no_pick",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "Regression: visible Shelf/ShelvingUnit context must prevent shelf/tabletop objects from being treated as floor pickup targets.",
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 90, "z": 0}
+      },
+      "seed_objects": [],
+      "tags": ["service", "regression", "shelf", "no_pick", "support_context"]
+    },
+    {
+      "name": "regression_tabletop_decoy_no_pick",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "Regression: elevated pickup-looking object must not be treated as a floor pickup target in floor-only tidy mode.",
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {
+          "kind": "non_floor_decoy",
+          "dataset_label": "Book",
+          "task_semantic_class": "pickup_target",
+          "layout": "front-center",
+          "distance": 0.6,
+          "y": 0.85,
+          "object_types": ["Book", "Apple", "Tomato", "Potato"]
+        }
+      ],
+      "tags": ["service", "regression", "tabletop", "no_pick", "floor_only"]
+    },
+    {
+      "name": "general_kitchen_floorplan2",
+      "scene": "FloorPlan2",
+      "mode": "benchmark",
+      "description": "General kitchen coverage for service perception generalization.",
+      "look_down": true,
+      "seed_objects": [],
+      "tags": ["service", "generalization", "kitchen"]
+    },
+    {
+      "name": "general_kitchen_floorplan3",
+      "scene": "FloorPlan3",
+      "mode": "benchmark",
+      "description": "General kitchen coverage for service perception generalization.",
+      "look_down": true,
+      "seed_objects": [],
+      "tags": ["service", "generalization", "kitchen"]
+    },
+    {
+      "name": "general_kitchen_floorplan4",
+      "scene": "FloorPlan4",
+      "mode": "benchmark",
+      "description": "General kitchen coverage for service perception generalization.",
+      "look_down": true,
+      "seed_objects": [],
+      "tags": ["service", "generalization", "kitchen"]
+    },
+    {
+      "name": "general_kitchen_floorplan5",
+      "scene": "FloorPlan5",
+      "mode": "benchmark",
+      "description": "General kitchen coverage for service perception generalization.",
+      "look_down": true,
+      "seed_objects": [],
+      "tags": ["service", "generalization", "kitchen"]
+    },
+    {
+      "name": "general_living_floorplan201",
+      "scene": "FloorPlan201",
+      "mode": "benchmark",
+      "description": "General living-room coverage for service perception generalization.",
+      "look_down": true,
+      "seed_objects": [],
+      "tags": ["service", "generalization", "living_room"]
+    },
+    {
+      "name": "general_living_floorplan202",
+      "scene": "FloorPlan202",
+      "mode": "benchmark",
+      "description": "General living-room coverage for service perception generalization.",
+      "look_down": true,
+      "seed_objects": [],
+      "tags": ["service", "generalization", "living_room"]
+    },
+    {
+      "name": "general_bedroom_floorplan301",
+      "scene": "FloorPlan301",
+      "mode": "benchmark",
+      "description": "General bedroom coverage for service perception generalization.",
+      "look_down": true,
+      "seed_objects": [],
+      "tags": ["service", "generalization", "bedroom"]
+    },
+    {
+      "name": "general_bedroom_floorplan302",
+      "scene": "FloorPlan302",
+      "mode": "benchmark",
+      "description": "General bedroom coverage for service perception generalization.",
+      "look_down": true,
+      "seed_objects": [],
+      "tags": ["service", "generalization", "bedroom"]
+    },
+    {
+      "name": "general_bathroom_floorplan401",
+      "scene": "FloorPlan401",
+      "mode": "benchmark",
+      "description": "General bathroom coverage for service perception generalization.",
+      "look_down": true,
+      "seed_objects": [],
+      "tags": ["service", "generalization", "bathroom"]
+    },
+    {
+      "name": "general_bathroom_floorplan402",
+      "scene": "FloorPlan402",
+      "mode": "benchmark",
+      "description": "General bathroom coverage for service perception generalization.",
+      "look_down": true,
+      "seed_objects": [],
+      "tags": ["service", "generalization", "bathroom"]
+    }
+  ]
+}

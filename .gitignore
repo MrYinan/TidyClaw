@@ -1,0 +1,41 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local editor/OpenClaw runtime
+.openclaw/
+.vscode/
+
+# Runtime logs/state
+*.log
+memory/*state*.json
+memory/*process*.log
+memory/heartbeat-state.json
+memory/mission-state.json
+memory/patrol-state.json
+memory/room-state.json
+memory/mission-archive.json
+
+# Dataset/model outputs
+datasets/
+runs/
+*.pt
+*.onnx
+*.engine
+
+# Large generated files
+*.mp4
+*.avi
+*.mov
+*.zip
+
+# System files
+Thumbs.db
+.DS_Store

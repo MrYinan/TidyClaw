@@ -1,0 +1,32 @@
+mission-state.json:
+{
+  "mission": "room_patrol_clean",
+  "enabled": false,
+  "mode": "IDLE",
+  "current_room": "current_room",
+  "summary_needed": false,
+  "final_summary": "",
+  "last_result": null
+}
+
+patrol-state.json:
+{
+  "enabled": false,
+  "mode": "IDLE",
+  "step_count": 0,
+  "max_steps": 50,
+  "failed_attempts": 0,
+  "last_action": null,
+  "consecutive_no_target": 0,
+  "consecutive_repeated_view": 0
+}
+
+room-state.json:
+{
+  "current_room": {
+    "visited_steps": 0,
+    "trash_found": [],
+    "trash_cleaned": [],
+    "room_complete": false
+  }
+}

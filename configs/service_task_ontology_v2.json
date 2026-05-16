@@ -1,0 +1,82 @@
+{
+  "schema_version": 2,
+  "description": "Task ontology for V2.2 household service planning. Online perception detects AI2-THOR household object labels, then maps them to task semantics used by the runner.",
+  "task_semantic_classes": [
+    "pickup_target",
+    "place_receptacle",
+    "obstacle",
+    "cleanable_object",
+    "ignored_object"
+  ],
+  "object_classes": [
+    "Book",
+    "Apple",
+    "Tomato",
+    "Potato",
+    "Mug",
+    "Cup",
+    "Bowl",
+    "Plate",
+    "CounterTop",
+    "Sink",
+    "Cabinet"
+  ],
+  "task_class_map": {
+    "Book": "pickup_target",
+    "Apple": "pickup_target",
+    "Tomato": "pickup_target",
+    "Potato": "pickup_target",
+    "Mug": "pickup_target",
+    "Cup": "pickup_target",
+    "Bowl": "place_receptacle",
+    "Plate": "pickup_target",
+    "CounterTop": "place_receptacle",
+    "Sink": "place_receptacle",
+    "Cabinet": "obstacle"
+  },
+  "pickup_targets": [
+    "Book",
+    "Apple",
+    "Tomato",
+    "Potato",
+    "Mug",
+    "Cup",
+    "Plate"
+  ],
+  "place_receptacles": [
+    "Bowl",
+    "CounterTop",
+    "Sink"
+  ],
+  "obstacles": [
+    "Cabinet"
+  ],
+  "cleanable_objects": [
+    "Apple",
+    "Tomato",
+    "Potato",
+    "Book"
+  ],
+  "ignored_objects": [],
+  "dual_role_objects": {
+    "Bowl": [
+      "pickup_target",
+      "place_receptacle"
+    ],
+    "Plate": [
+      "pickup_target",
+      "place_receptacle"
+    ]
+  },
+  "v2_scope": {
+    "version": "v2.2-service-task-minimal",
+    "reason": "This ontology is intentionally restricted to object types confirmed in the current AI2-THOR backend coverage check. Removed classes such as Sofa, Bed, Chair, RemoteControl and CoffeeTable will be added later after adding living-room or bedroom benchmark scenarios.",
+    "main_task": "active household service planning with pickup/place/clean as skills"
+  },
+  "notes": [
+    "AI2-THOR metadata may be used offline to generate labels and benchmark scenarios.",
+    "Online Agent decisions must use RGB-derived perception plus sanitized action feedback only.",
+    "Clean remains available as a service skill, but pickup/place is the V2.2 main service task.",
+    "Bowl and Plate can be dual-role objects in AI2-THOR, but the initial runner should use the simplified task_class_map to avoid ambiguous decisions."
+  ]
+}
