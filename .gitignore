@@ -39,3 +39,4 @@ runs/
 # System files
 Thumbs.db
 .DS_Store
+memory/
