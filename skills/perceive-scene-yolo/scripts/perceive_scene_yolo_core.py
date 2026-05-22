@@ -1332,6 +1332,36 @@ def make_surface_candidate(
         "ROBOT_DEPTH_SURFACE_PLACE_NOW_MAX_GROUND_DISTANCE",
         env_float("ROBOT_PLACE_MAX_DISTANCE", 1.0),
     )
+    hard_min_w = env_float("ROBOT_DEPTH_SURFACE_REGION_MIN_W_PIXELS", 45.0)
+    hard_min_h = env_float("ROBOT_DEPTH_SURFACE_REGION_MIN_H_PIXELS", 35.0)
+    hard_min_area_ratio = env_float("ROBOT_DEPTH_SURFACE_REGION_MIN_AREA_RATIO", 0.004)
+    hard_min_ground = env_float("ROBOT_DEPTH_SURFACE_REGION_MIN_DISTANCE_M", 0.55)
+    hard_max_ground = env_float("ROBOT_DEPTH_SURFACE_REGION_MAX_DISTANCE_M", 1.50)
+    hard_min_height = env_float("ROBOT_DEPTH_SURFACE_REGION_MIN_HEIGHT_M", 0.55)
+    hard_max_height = env_float("ROBOT_DEPTH_SURFACE_REGION_MAX_HEIGHT_M", 1.15)
+    image_margin = env_float("ROBOT_DEPTH_SURFACE_IMAGE_EDGE_MARGIN_PIXELS", 8.0)
+    parent_margin = env_float("ROBOT_DEPTH_SURFACE_PARENT_EDGE_MARGIN_PIXELS", 6.0)
+    parent_box = bbox_pixel_tuple(parent)
+    if parent_box is None:
+        parent_box = (0.0, 0.0, float(image_w), float(image_h))
+    px1, py1, px2, py2 = parent_box
+    area_ok = bool(width >= hard_min_w and height >= hard_min_h and area_ratio >= hard_min_area_ratio)
+    hard_distance_ok = bool(hard_min_ground <= ground_distance_m <= hard_max_ground)
+    hard_height_ok = bool(height_m is not None and hard_min_height <= float(height_m) <= hard_max_height)
+    image_edge_ok = bool(
+        x1 >= image_margin
+        and y1 >= image_margin
+        and x2 <= float(image_w) - image_margin
+        and y2 <= float(image_h) - image_margin
+    )
+    parent_edge_ok = bool(
+        x1 >= px1 + parent_margin
+        and y1 >= py1 + parent_margin
+        and x2 <= px2 - parent_margin
+        and y2 <= py2 - parent_margin
+    )
+    edge_ok = bool(image_edge_ok and parent_edge_ok)
+    hard_geometry_ready = bool(area_ok and hard_distance_ok and hard_height_ok and edge_ok)
     min_place_score = env_float("ROBOT_DEPTH_SURFACE_PLACE_NOW_MIN_SCORE", 0.48)
     distance_in_context = bool(
         depth_m <= max_context_depth
@@ -1341,38 +1371,51 @@ def make_surface_candidate(
         depth_m <= max_place_now_depth
         and min_place_now_ground <= ground_distance_m <= max_place_now_ground
     )
-    usable_surface = bool((not blocked) and score >= min_place_score and distance_in_context)
+    usable_surface = bool((not blocked) and score >= min_place_score and distance_in_context and hard_geometry_ready)
     place_now = bool(usable_surface and distance_place_ready and abs(bearing_deg) <= center_tolerance_deg)
+    rejection_reasons: List[str] = []
+    if not area_ok:
+        rejection_reasons.append("too_small")
+    if ground_distance_m < hard_min_ground:
+        rejection_reasons.append("too_close")
+    elif ground_distance_m > hard_max_ground:
+        rejection_reasons.append("too_far")
+    if not hard_height_ok:
+        rejection_reasons.append("height_out_of_range")
+    if not image_edge_ok:
+        rejection_reasons.append("touches_image_edge")
+    if not parent_edge_ok:
+        rejection_reasons.append("touches_parent_edge")
     if blocked:
-        reject_reason = "blocked_surface"
-    elif score < min_place_score:
-        reject_reason = "surface_score_too_low"
-    elif ground_distance_m < min_context_ground:
-        reject_reason = "too_close_for_surface_context"
-    elif ground_distance_m > max_context_ground:
-        reject_reason = "too_far_for_surface_context"
-    elif depth_m > max_context_depth:
-        reject_reason = "depth_too_far_for_surface_context"
-    elif not distance_place_ready:
-        reject_reason = "outside_place_distance_range"
-    elif abs(bearing_deg) > center_tolerance_deg:
-        reject_reason = "needs_alignment"
-    else:
-        reject_reason = None
+        rejection_reasons.append("blocked_surface")
+    if score < min_place_score:
+        rejection_reasons.append("surface_score_too_low")
+    if ground_distance_m < min_context_ground and "too_close" not in rejection_reasons:
+        rejection_reasons.append("too_close_for_surface_context")
+    elif ground_distance_m > max_context_ground and "too_far" not in rejection_reasons:
+        rejection_reasons.append("too_far_for_surface_context")
+    if depth_m > max_context_depth:
+        rejection_reasons.append("depth_too_far_for_surface_context")
+    if not distance_place_ready and "too_close" not in rejection_reasons and "too_far" not in rejection_reasons:
+        rejection_reasons.append("outside_place_distance_range")
+    if abs(bearing_deg) > center_tolerance_deg:
+        rejection_reasons.append("needs_alignment")
+    reject_reason = rejection_reasons[0] if rejection_reasons else None
 
     parent_label = str(parent.get("label") or parent.get("raw_label") or "receptacle")
     bbox_dict = {"x": int(round(x1)), "y": int(round(y1)), "w": int(round(width)), "h": int(round(height))}
     candidate_id = surface_region_id(parent_label, bbox_dict, height_m, ground_distance_m)
-    rejection_reasons = [reject_reason] if reject_reason else []
     geometry_checks = {
-        "area_ok": True,
-        "distance_ok": bool(distance_place_ready),
-        "height_ok": bool(height_m is None or env_float("ROBOT_DEPTH_SURFACE_MIN_HEIGHT_M", 0.35) <= float(height_m) <= env_float("ROBOT_DEPTH_SURFACE_MAX_HEIGHT_M", 1.25)),
-        "edge_ok": True,
+        "area_ok": bool(area_ok),
+        "distance_ok": bool(hard_distance_ok),
+        "height_ok": bool(hard_height_ok),
+        "edge_ok": bool(edge_ok),
         "depth_stable": True,
         "normal_like_horizontal": True,
         "region_w": round(float(width), 3),
         "region_h": round(float(height), 3),
+        "image_edge_ok": bool(image_edge_ok),
+        "parent_edge_ok": bool(parent_edge_ok),
     }
     candidate: JsonDict = {
         "id": candidate_id,
