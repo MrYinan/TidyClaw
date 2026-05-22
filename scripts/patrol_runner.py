@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -73,10 +74,21 @@ PLACE_RETARGET_ERRORS = {
     "error_visual_receptacle_ambiguous",
     "error_place_failed",
     "error_place_inventory_not_empty",
-    "error_place_no_reachable_point",
     "error_place_object_missing_after_action",
     "error_place_position_unreachable",
     "error_place_receptacle_mismatch",
+}
+PLACE_APPROACH_ERRORS = {
+    "error_receptacle_too_far",
+}
+PLACE_RETRY_ERRORS = {
+    "error_place_no_reachable_point",
+}
+PLACE_COOLDOWN_ERRORS = {
+    "error_place_no_reachable_point",
+    "no_reachable_point",
+    "receptacle_not_interactable",
+    "controlled_point_unavailable",
 }
 PICKUP_RETARGET_ERRORS = {
     "error_no_pickup_target_in_front",
@@ -85,11 +97,21 @@ PICKUP_RETARGET_ERRORS = {
     "error_visual_pickup_ambiguous",
     "error_target_not_pickupable",
 }
-
-
+#下面定义了任务阶段,你现在的 tidy 任务是 ALFRED-style pick-place 状态机。
+#你可以把它理解成机器人做“找物体 → 捡起来 → 找地方 → 放下 → 验证完成”的流程表。
+#service_task_state_path
 SERVICE_TASK_STATE_PATH = MEMORY_DIR / "service-task-state.json"
-SERVICE_INITIAL_PHASE = "SEARCH_PICKUP_TARGET"
-SERVICE_DONE_PHASE = "TASK_DONE"
+SURFACE_CANDIDATE_MEMORY_PATH = MEMORY_DIR / "surface-candidate-memory.json"
+#service_initial_phase：     phase:阶段
+SERVICE_INITIAL_PHASE = "SEARCH_PICKUP_TARGET"#任务一开始处于什么阶段
+#service_done_pase
+SERVICE_DONE_PHASE = "TASK_DONE"#任务最终完成时叫什么阶段
+"""拾取阶段：
+先找要捡的东西
+锁定它
+对齐它:目标已经找到了，但还没对准，需要调整方向。
+捡起来
+确认手里有东西"""
 SERVICE_PICKUP_PHASES = {
     "SEARCH_PICKUP_TARGET",
     "LOCK_PICKUP_TARGET",
@@ -97,9 +119,19 @@ SERVICE_PICKUP_PHASES = {
     "PICK_OBJECT",
     "VERIFY_HOLDING",
 }
+#放置阶段：
+"""
+再找放置点
+锁定放置点
+靠近:放置位置已经找到了，但距离还不够，需要往前靠近。
+对齐:放置位置看到了，但不够居中，需要调整方向。
+放置
+验证任务完成
+"""
 SERVICE_PLACE_PHASES = {
     "SEARCH_RECEPTACLE",
     "LOCK_RECEPTACLE",
+    "APPROACH_RECEPTACLE",
     "ALIGN_RECEPTACLE",
     "PLACE_OBJECT",
     "VERIFY_TASK_DONE",
@@ -274,8 +306,19 @@ def run_script(script: Path, args: Sequence[str], timeout_seconds: int) -> Scrip
         )
 
 
-def run_yolo_service(image_path: str, timeout_seconds: int) -> ScriptResult:
-    payload = json.dumps({"image": image_path}, ensure_ascii=False).encode("utf-8")
+def run_yolo_service(
+    image_path: str,
+    timeout_seconds: int,
+    *,
+    depth_path: str = "",
+    camera: Optional[JsonDict] = None,
+) -> ScriptResult:
+    payload_data: JsonDict = {"image": image_path}
+    if depth_path:
+        payload_data["depth_path"] = depth_path
+    if isinstance(camera, dict) and camera:
+        payload_data["camera"] = camera
+    payload = json.dumps(payload_data, ensure_ascii=False).encode("utf-8")
     request = urlrequest.Request(
         YOLO_SERVICE_URL,
         data=payload,
@@ -326,6 +369,13 @@ def run_yolo_service(image_path: str, timeout_seconds: int) -> ScriptResult:
 
 def truthy(value: Any) -> bool:
     return bool(value)
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def get_nested_number(data: JsonDict, *keys: str, default: float = 0.0) -> float:
@@ -467,10 +517,13 @@ class PatrolRunner:
         self.consecutive_action_failures = 0
         self.pending_navigation_recommendation: Optional[JsonDict] = None
         self.holding_object = False
+        self.held_move_blocked_until: Dict[str, int] = {}
         self.service_failures: Dict[str, int] = {}
         self.service_state = self.load_service_task_state()
+        self.surface_candidate_memory = self.load_surface_candidate_memory()
         self.pending_service_completions: List[str] = []
         self.pending_placed_objects: List[str] = []
+        self.current_analysis: JsonDict = {}
 
         try:
             state = self.manager.load_state()
@@ -504,6 +557,9 @@ class PatrolRunner:
             "target_attempts": 0,
             "receptacle_attempts": 0,
             "receptacle_alignment_streak": 0,
+            "receptacle_action_hint": None,
+            "receptacle_action_hint_until_step": None,
+            "receptacle_last_position_hint": None,
             "completed_subgoals": [],
             "recently_placed_labels": {},
             "last_reason": "initialized",
@@ -574,6 +630,127 @@ class PatrolRunner:
                 },
             )
 
+    def default_surface_candidate_memory(self) -> JsonDict:
+        return {
+            "schema_version": 1,
+            "cooldown_default_steps": int(env_float("ROBOT_SURFACE_CANDIDATE_COOLDOWN_STEPS", 8.0)),
+            "candidates": {},
+        }
+
+    def load_surface_candidate_memory(self) -> JsonDict:
+        if not SURFACE_CANDIDATE_MEMORY_PATH.exists():
+            return self.default_surface_candidate_memory()
+        try:
+            data = json.loads(SURFACE_CANDIDATE_MEMORY_PATH.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return self.default_surface_candidate_memory()
+        if not isinstance(data, dict):
+            return self.default_surface_candidate_memory()
+        memory = self.default_surface_candidate_memory()
+        memory.update(data)
+        if not isinstance(memory.get("candidates"), dict):
+            memory["candidates"] = {}
+        return memory
+
+    def save_surface_candidate_memory(self) -> None:
+        if str(self.config.task_mode or "clean").strip().lower() != "tidy":
+            return
+        if self.config.dry_run:
+            return
+        self.surface_candidate_memory["last_update"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        SURFACE_CANDIDATE_MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(self.surface_candidate_memory, ensure_ascii=False, indent=2) + "\n"
+        SURFACE_CANDIDATE_MEMORY_PATH.write_text(payload, encoding="utf-8")
+
+    def surface_candidate_identifier(self, candidate: Optional[JsonDict]) -> str:
+        if not isinstance(candidate, dict):
+            return "surface:unknown"
+        for key in ("failed_candidate_id", "surface_candidate_id", "id"):
+            value = candidate.get(key)
+            if value:
+                return str(value)
+        return candidate_key(candidate)
+
+    def surface_cooldown_remaining(self, candidate: Optional[JsonDict]) -> int:
+        candidate_id = self.surface_candidate_identifier(candidate)
+        entries = self.surface_candidate_memory.get("candidates")
+        entry = entries.get(candidate_id) if isinstance(entries, dict) else None
+        if not isinstance(entry, dict):
+            return 0
+        try:
+            until_step = int(entry.get("cooldown_until_step", 0) or 0)
+        except (TypeError, ValueError):
+            until_step = 0
+        return max(0, until_step - self.current_step_count())
+
+    def annotate_surface_memory(self, candidate: JsonDict) -> None:
+        if str(candidate.get("task_semantic_class") or "") != "place_receptacle":
+            return
+        if not (
+            candidate.get("surface_candidate_id")
+            or candidate.get("id")
+            or str(candidate.get("surface_candidate_source") or "") in {"depth_geometry", "depth_region_geometry"}
+        ):
+            return
+        remaining = self.surface_cooldown_remaining(candidate)
+        memory_checks = candidate.get("memory_checks") if isinstance(candidate.get("memory_checks"), dict) else {}
+        memory_checks = dict(memory_checks)
+        memory_checks["failed_recently"] = bool(remaining > 0)
+        memory_checks["cooldown_remaining"] = int(remaining)
+        candidate["memory_checks"] = memory_checks
+        candidate["failed_recently"] = bool(remaining > 0)
+        candidate["cooldown_remaining"] = int(remaining)
+        if remaining > 0:
+            candidate["visual_place_ready"] = False
+            candidate["final_place_ready"] = False
+            candidate["place_now"] = False
+            reasons = list(candidate.get("rejection_reasons") or [])
+            cooldown_reason = f"cooldown:{remaining}"
+            if cooldown_reason not in reasons:
+                reasons.append(cooldown_reason)
+            candidate["rejection_reasons"] = reasons
+
+    def mark_surface_candidate_failed(
+        self,
+        candidate: Optional[JsonDict],
+        *,
+        result_type: str,
+        failed_candidate_id: Optional[str] = None,
+    ) -> None:
+        if not isinstance(candidate, dict) and not failed_candidate_id:
+            return
+        candidate_id = str(failed_candidate_id or self.surface_candidate_identifier(candidate))
+        entries = self.surface_candidate_memory.setdefault("candidates", {})
+        if not isinstance(entries, dict):
+            entries = {}
+            self.surface_candidate_memory["candidates"] = entries
+        entry = entries.get(candidate_id) if isinstance(entries.get(candidate_id), dict) else {}
+        failure_count = int(entry.get("failure_count", 0) or 0) + 1
+        base_cooldown = max(1, int(env_float("ROBOT_SURFACE_CANDIDATE_COOLDOWN_STEPS", 8.0)))
+        cooldown_steps = base_cooldown * min(4, failure_count)
+        until_step = self.current_step_count() + cooldown_steps
+        entries[candidate_id] = {
+            "candidate_id": candidate_id,
+            "failure_count": failure_count,
+            "last_result_type": result_type,
+            "last_failed_step": self.current_step_count(),
+            "cooldown_until_step": until_step,
+            "cooldown_steps": cooldown_steps,
+            "candidate": self.short_candidate(candidate) if isinstance(candidate, dict) else None,
+            "last_update": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        self.save_surface_candidate_memory()
+        self.emit(
+            "surface_candidate_cooldown_written",
+            {
+                "candidate_id": candidate_id,
+                "result_type": result_type,
+                "failure_count": failure_count,
+                "cooldown_steps": cooldown_steps,
+                "cooldown_until_step": until_step,
+            },
+        )
+
     def reset_service_task_state(self, *, reason: str) -> None:
         self.service_state = self.default_service_task_state()
         self.service_state["last_reason"] = reason
@@ -595,7 +772,7 @@ class PatrolRunner:
         entry.update(payload)
         history.append(entry)
         self.service_state["history"] = history[-80:]
-
+    #把当前任务阶段切换成：phase阶段
     def set_service_phase(
         self,
         phase: str,
@@ -669,6 +846,9 @@ class PatrolRunner:
             self.service_state["receptacle_last_seen_step"] = step
             self.service_state["receptacle_lost_scan_count"] = 0
             self.service_state["receptacle_attempts"] = int(self.service_state.get("receptacle_attempts", 0) or 0) + 1
+            self.service_state["receptacle_action_hint"] = None
+            self.service_state["receptacle_action_hint_until_step"] = None
+            self.service_state["receptacle_last_position_hint"] = str(candidate.get("position_hint") or "")
             phase = "LOCK_RECEPTACLE"
         self.set_service_phase(phase, reason=reason, candidate=candidate)
 
@@ -688,8 +868,68 @@ class PatrolRunner:
             self.service_state["receptacle_last_seen_step"] = None
             self.service_state["receptacle_lost_scan_count"] = 0
             self.service_state["receptacle_attempts"] = 0
+            self.service_state["receptacle_action_hint"] = None
+            self.service_state["receptacle_action_hint_until_step"] = None
+            self.service_state["receptacle_last_position_hint"] = None
             next_phase = "SEARCH_RECEPTACLE"
         self.set_service_phase(next_phase, reason=reason)
+
+    def store_receptacle_action_hint(self, action: Any, *, steps: int = 4) -> None:
+        hint = str(action or "").strip()
+        if hint not in MOVE_ACTIONS:
+            self.service_state["receptacle_action_hint"] = None
+            self.service_state["receptacle_action_hint_until_step"] = None
+            return
+        self.service_state["receptacle_action_hint"] = hint
+        self.service_state["receptacle_action_hint_until_step"] = self.current_step_count() + max(1, int(steps))
+
+    def current_receptacle_action_hint(self) -> Optional[str]:
+        hint = str(self.service_state.get("receptacle_action_hint") or "").strip()
+        if hint not in MOVE_ACTIONS:
+            return None
+        try:
+            until_step = int(self.service_state.get("receptacle_action_hint_until_step", -1) or -1)
+        except (TypeError, ValueError):
+            return None
+        if until_step < self.current_step_count():
+            self.service_state["receptacle_action_hint"] = None
+            self.service_state["receptacle_action_hint_until_step"] = None
+            return None
+        return hint
+
+    def remember_receptacle_position_hint(self, candidate: Optional[JsonDict]) -> None:
+        if not isinstance(candidate, dict):
+            return
+        position_hint = str(candidate.get("position_hint") or "").strip()
+        if position_hint:
+            self.service_state["receptacle_last_position_hint"] = position_hint
+
+    def block_held_move_action(self, action: Any, *, reason: str, steps: int = 4) -> None:
+        action_text = str(action or "").strip()
+        if action_text not in MOVE_ACTIONS:
+            return
+        until_step = self.current_step_count() + max(1, int(steps))
+        self.held_move_blocked_until[action_text] = until_step
+        self.emit(
+            "held_move_action_blocked",
+            {
+                "action": action_text,
+                "reason": reason,
+                "until_step": until_step,
+            },
+        )
+
+    def held_move_action_blocked(self, action: str) -> bool:
+        if action not in MOVE_ACTIONS:
+            return False
+        until_step = int(self.held_move_blocked_until.get(action, -1) or -1)
+        if until_step < self.current_step_count():
+            self.held_move_blocked_until.pop(action, None)
+            return False
+        return True
+
+    def held_move_action_recently_bad(self, action: str) -> bool:
+        return bool(self.holding_object and (self.held_move_action_blocked(action) or self.recent_action_failed(action)))
 
     def max_locked_scan_steps(self, *, role: str) -> int:
         env_name = "ROBOT_MAX_LOCKED_PICKUP_SCAN_STEPS" if role == "pickup" else "ROBOT_MAX_LOCKED_PLACE_SCAN_STEPS"
@@ -797,6 +1037,8 @@ class PatrolRunner:
                 continue
             if candidate.get("task_semantic_class") != task_class:
                 continue
+            if task_class == "place_receptacle":
+                self.annotate_surface_memory(candidate)
             if self.is_suppressed(candidate):
                 continue
             if not truthy(candidate.get("reachable")):
@@ -807,12 +1049,73 @@ class PatrolRunner:
                 continue
             if task_class == "place_receptacle" and self.receptacle_visual_box_ambiguous(candidate):
                 continue
+            if task_class == "place_receptacle" and truthy(candidate.get("failed_recently")):
+                continue
+            if task_class == "place_receptacle" and not self.receptacle_candidate_is_actionable_or_promising(candidate):
+                continue
             key = candidate_key(candidate)
             if key in seen_keys:
                 continue
             seen_keys.add(key)
             candidates.append(candidate)
         candidates.sort(key=lambda item: self.service_candidate_score(item, task_class=task_class), reverse=True)
+        return candidates
+
+    def visible_receptacle_context_candidates(self, analysis: JsonDict) -> List[JsonDict]:
+        """Visible receptacles that are not yet place-ready but should guide alignment.
+
+        This is the ALFRED-style separation between interaction and navigation:
+        a visible CounterTop may be too far or off-center for PutObject, but if
+        the agent is already holding something it should rotate/approach toward
+        that receptacle instead of handing control to frontier exploration.
+        """
+        pools: List[Any] = [
+            analysis.get("best_receptacle_candidate"),
+            *(analysis.get("receptacle_candidates", []) or []),
+            *(analysis.get("service_candidates", []) or []),
+        ]
+        candidates: List[JsonDict] = []
+        seen_keys = set()
+        for candidate in pools:
+            if not isinstance(candidate, dict):
+                continue
+            if str(candidate.get("task_semantic_class") or "") != "place_receptacle":
+                continue
+            self.annotate_surface_memory(candidate)
+            if self.is_suppressed(candidate):
+                continue
+            if truthy(candidate.get("failed_recently")):
+                continue
+            if not truthy(candidate.get("reachable")):
+                continue
+            if not truthy(candidate.get("is_support_surface")):
+                continue
+            if self.receptacle_visual_box_ambiguous(candidate):
+                continue
+            position_hint = str(candidate.get("position_hint") or "")
+            if position_hint not in {"front-left", "front-center", "front-right"}:
+                continue
+            try:
+                confidence = float(candidate.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            if confidence < 0.50:
+                continue
+            key = candidate_key(candidate)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            candidates.append(candidate)
+
+        def score(candidate: JsonDict) -> float:
+            value = self.service_candidate_score(candidate, task_class="place_receptacle")
+            if truthy(candidate.get("needs_alignment")):
+                value += 0.8
+            if truthy(candidate.get("needs_approach")):
+                value += 0.4
+            return value
+
+        candidates.sort(key=score, reverse=True)
         return candidates
 
     def service_candidate_score(self, candidate: JsonDict, *, task_class: str) -> float:
@@ -822,6 +1125,15 @@ class PatrolRunner:
         cx_ratio = float(geometry.get("cx_ratio", 0.5) or 0.5)
         center_bonus = max(0.0, 0.5 - abs(cx_ratio - 0.5))
         value = confidence * 2.0 + min(area_ratio, 0.20) + center_bonus
+        if str(candidate.get("surface_candidate_source") or "") == "depth_geometry":
+            value += float(candidate.get("score", 0.0) or 0.0) * 3.0
+        if str(candidate.get("surface_candidate_source") or "") == "depth_region_geometry":
+            value += float(candidate.get("score", 0.0) or 0.0) * 3.0
+            if truthy(candidate.get("visual_place_ready")):
+                value += 1.0
+        memory_checks = candidate.get("memory_checks") if isinstance(candidate.get("memory_checks"), dict) else {}
+        if truthy(candidate.get("failed_recently")) or truthy(memory_checks.get("failed_recently")):
+            value -= 100.0
         if task_class == "pickup_target" and truthy(candidate.get("pickup_now")):
             value += 5.0
         if task_class == "place_receptacle" and truthy(candidate.get("place_now")):
@@ -842,6 +1154,40 @@ class PatrolRunner:
             return float(geometry.get("cx_ratio", 0.5) or 0.5) - 0.5
         except (TypeError, ValueError):
             return 0.0
+
+    def candidate_ground_distance(self, candidate: JsonDict) -> Optional[float]:
+        for value in (candidate.get("ground_distance"), candidate.get("ground_distance_m")):
+            try:
+                result = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(result):
+                return result
+        for container_key in ("geometry", "depth", "center_3d"):
+            container = candidate.get(container_key)
+            if not isinstance(container, dict):
+                continue
+            for key in ("ground_distance_m", "ground_distance"):
+                try:
+                    result = float(container.get(key))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(result):
+                    return result
+        return None
+
+    def depth_surface_place_distance_ready(self, candidate: JsonDict) -> bool:
+        if str(candidate.get("surface_candidate_source") or "") != "depth_geometry":
+            return True
+        ground_distance = self.candidate_ground_distance(candidate)
+        if ground_distance is None:
+            return False
+        min_distance = env_float("ROBOT_DEPTH_SURFACE_PLACE_NOW_MIN_GROUND_DISTANCE", 0.50)
+        max_distance = env_float(
+            "ROBOT_DEPTH_SURFACE_PLACE_NOW_MAX_GROUND_DISTANCE",
+            env_float("ROBOT_PLACE_MAX_DISTANCE", 1.0),
+        )
+        return bool(min_distance <= ground_distance <= max_distance)
 
     def pickup_label_allowed(self, candidate: JsonDict) -> bool:
         allowed = tuple(label.strip().lower() for label in self.config.pickup_target_labels if label.strip())
@@ -940,6 +1286,8 @@ class PatrolRunner:
     def receptacle_visual_box_ambiguous(self, candidate: JsonDict) -> bool:
         if str(candidate.get("task_semantic_class") or "") != "place_receptacle":
             return False
+        if str(candidate.get("surface_candidate_source") or "") == "depth_geometry":
+            return False
         geometry = candidate.get("geometry") if isinstance(candidate.get("geometry"), dict) else {}
         center_offset = abs(self.candidate_center_offset(candidate))
         try:
@@ -995,13 +1343,155 @@ class PatrolRunner:
             return True
         return bool(area_ratio > max_area or width_ratio > max_width)
 
+    def receptacle_candidate_is_actionable_or_promising(self, candidate: JsonDict) -> bool:
+        """Keep only receptacles that are worth navigating toward.
+
+        YOLO can see far table fragments at the image edge. Those are useful as
+        context, but they are not good enough to lock a place subgoal. ALFRED
+        separates navigation from interaction; this filter keeps the lock set
+        focused on a receptacle with enough visual evidence to approach.
+        """
+        if str(candidate.get("task_semantic_class") or "") != "place_receptacle":
+            return False
+        self.annotate_surface_memory(candidate)
+        if truthy(candidate.get("failed_recently")):
+            return False
+        if not truthy(candidate.get("reachable")):
+            return False
+        if not truthy(candidate.get("is_support_surface")):
+            return False
+        if self.receptacle_visual_box_ambiguous(candidate):
+            return False
+
+        if str(candidate.get("surface_candidate_source") or "") == "depth_geometry":
+            try:
+                min_score = float(os.getenv("ROBOT_DEPTH_SURFACE_LOCK_MIN_SCORE", "0.40"))
+            except (TypeError, ValueError):
+                min_score = 0.40
+            score = float(candidate.get("score", 0.0) or 0.0)
+            return bool(
+                not truthy(candidate.get("blocked"))
+                and score >= min_score
+                and (
+                    truthy(candidate.get("place_now"))
+                    or truthy(candidate.get("needs_alignment"))
+                    or truthy(candidate.get("needs_approach"))
+                    or truthy(candidate.get("reachable"))
+                )
+            )
+
+        if str(candidate.get("surface_candidate_source") or "") == "depth_region_geometry":
+            return bool(
+                truthy(candidate.get("visual_place_ready"))
+                or truthy(candidate.get("needs_alignment"))
+                or truthy(candidate.get("needs_approach"))
+            )
+
+        confidence = float(candidate.get("confidence", 0.0) or 0.0)
+        area_ratio = float(candidate.get("area_ratio", 0.0) or 0.0)
+        geometry = candidate.get("geometry") if isinstance(candidate.get("geometry"), dict) else {}
+        bottom_y_ratio = float(geometry.get("bottom_y_ratio", candidate.get("bottom_y_ratio", 0.0)) or 0.0)
+        position_hint = str(candidate.get("position_hint") or "")
+        front_edge_like = bool(
+            truthy(candidate.get("front_edge_receptacle"))
+            or truthy(candidate.get("broad_front_receptacle"))
+            or self.receptacle_front_edge_candidate(candidate)
+        )
+
+        try:
+            min_conf = float(os.getenv("ROBOT_PLACE_LOCK_MIN_CONF", "0.72"))
+        except (TypeError, ValueError):
+            min_conf = 0.72
+        try:
+            min_area = float(os.getenv("ROBOT_PLACE_LOCK_MIN_AREA", "0.025"))
+        except (TypeError, ValueError):
+            min_area = 0.025
+        try:
+            edge_min_conf = float(os.getenv("ROBOT_PLACE_EDGE_LOCK_MIN_CONF", "0.70"))
+        except (TypeError, ValueError):
+            edge_min_conf = 0.70
+        try:
+            edge_min_area = float(os.getenv("ROBOT_PLACE_EDGE_LOCK_MIN_AREA", "0.010"))
+        except (TypeError, ValueError):
+            edge_min_area = 0.010
+
+        if front_edge_like or truthy(candidate.get("place_now")):
+            return bool(
+                position_hint == "front-center"
+                and confidence >= edge_min_conf
+                and area_ratio >= edge_min_area
+            )
+
+        if position_hint not in {"front-left", "front-center", "front-right"}:
+            return False
+        if confidence < min_conf or area_ratio < min_area:
+            return False
+        # A tiny strip high in the image is usually a far tabletop edge. It can
+        # guide exploration, but should not become the active receptacle lock.
+        if position_hint != "front-center" and bottom_y_ratio < 0.55:
+            return False
+        return True
+
+    def service_receptacle_visual_interaction_ready(self, candidate: JsonDict) -> bool:
+        """Return True only when the visible receptacle looks close enough to try PutObject."""
+        if str(candidate.get("task_semantic_class") or "") != "place_receptacle":
+            return False
+        if truthy(candidate.get("needs_alignment")) or truthy(candidate.get("needs_approach")):
+            return False
+        if str(candidate.get("surface_candidate_source") or "") == "depth_geometry":
+            return bool(
+                truthy(candidate.get("place_now"))
+                and truthy(candidate.get("reachable"))
+                and not truthy(candidate.get("blocked"))
+                and self.depth_surface_place_distance_ready(candidate)
+            )
+
+        geometry = candidate.get("geometry") if isinstance(candidate.get("geometry"), dict) else {}
+        bottom_y_ratio = float(geometry.get("bottom_y_ratio", candidate.get("bottom_y_ratio", 0.0)) or 0.0)
+        center_y_ratio = float(geometry.get("cy_ratio", candidate.get("center_y_ratio", 0.0)) or 0.0)
+        front_edge_like = bool(
+            truthy(candidate.get("front_edge_receptacle"))
+            or self.receptacle_front_edge_candidate(candidate)
+        )
+        broad_front_like = bool(truthy(candidate.get("broad_front_receptacle")) or front_edge_like)
+
+        try:
+            place_now_min_bottom = float(os.getenv("ROBOT_PLACE_NOW_MIN_BOTTOM_RATIO", "0.90"))
+        except (TypeError, ValueError):
+            place_now_min_bottom = 0.90
+        try:
+            broad_front_min_bottom = float(os.getenv("ROBOT_PLACE_BROAD_FRONT_MIN_BOTTOM_RATIO", "0.90"))
+        except (TypeError, ValueError):
+            broad_front_min_bottom = 0.90
+        try:
+            min_center_y = float(os.getenv("ROBOT_PLACE_INTERACTION_MIN_CENTER_Y_RATIO", "0.54"))
+        except (TypeError, ValueError):
+            min_center_y = 0.54
+
+        if front_edge_like:
+            return True
+        if broad_front_like:
+            return bool(bottom_y_ratio >= broad_front_min_bottom and center_y_ratio >= min_center_y)
+        if truthy(candidate.get("place_now")):
+            return bool(bottom_y_ratio >= place_now_min_bottom and center_y_ratio >= min_center_y)
+        return False
+
     def locked_or_best_service_candidate(self, analysis: JsonDict, *, task_class: str, role: str) -> Optional[JsonDict]:
         candidates = self.visible_service_candidates(analysis, task_class=task_class)
         for candidate in candidates:
             if self.service_lock_matches(candidate, role=role):
                 return candidate
         return candidates[0] if candidates else None
-
+#判断当前这个候选物体，是否已经满足“可以尝试执行 pick-object”的视觉与状态条件。 
+#  注意，是可以尝试捡，不是 100% 保证一定捡成功
+    """
+    第一层：这个东西是不是允许捡？
+第二层：这个东西是不是视觉上可达？
+第三层：是不是还需要对齐？如果需要，就不能捡
+第四层：是不是被判定在桌子/架子上？如果被阻断，就不能捡
+第五层：置信度够不够？
+第六层：位置是不是正前方、够居中？
+第七层：面积、底部位置是否说明它已经足够近？"""
     def service_pick_ready(self, candidate: JsonDict) -> bool:
         if not self.pickup_task_filter_allowed(candidate):
             return False
@@ -1084,6 +1574,16 @@ class PatrolRunner:
         center_offset = abs(self.candidate_center_offset(candidate))
         if self.receptacle_visual_box_ambiguous(candidate):
             return False
+        if truthy(candidate.get("needs_alignment")) or truthy(candidate.get("needs_approach")):
+            return False
+        if not self.service_receptacle_visual_interaction_ready(candidate):
+            return False
+        if str(candidate.get("surface_candidate_source") or "") == "depth_geometry":
+            return bool(
+                truthy(candidate.get("place_now"))
+                and not truthy(candidate.get("blocked"))
+                and self.depth_surface_place_distance_ready(candidate)
+            )
         if self.config.interaction_grounding == "metadata-hidden":
             return bool(
                 truthy(candidate.get("is_support_surface"))
@@ -1124,8 +1624,15 @@ class PatrolRunner:
         front_edge_like = bool(
             truthy(candidate.get("front_edge_receptacle"))
             or truthy(candidate.get("broad_front_receptacle"))
-            or truthy(candidate.get("place_now"))
+            or self.receptacle_front_edge_candidate(candidate)
         )
+        if not self.service_receptacle_visual_interaction_ready(candidate):
+            return False
+        if (
+            str(candidate.get("surface_candidate_source") or "") == "depth_geometry"
+            and not self.depth_surface_place_distance_ready(candidate)
+        ):
+            return False
         if truthy(candidate.get("needs_approach")) and not front_edge_like:
             return False
 
@@ -1354,29 +1861,45 @@ class PatrolRunner:
             if outcome.stop_requested:
                 return True
         return False
-
+    """
+    1. 拍一张第一视角图片
+    2. 用 YOLO 分析图片
+    3. 同步当前是否拿着物体
+    4. 判断是不是重复视角
+    5. 更新导航记忆
+    6. 决策下一步动作
+    7. 执行动作
+    8. 验证动作是否成功
+    9. 更新服务任务状态
+    10. 把这一步写入状态文件
+    11. 判断是否该停止
+    """
     def run_one_step(self) -> StepOutcome:
         vision_result = self.call_get_vision()
         if not self.skill_success(vision_result, required_field="image_path"):
             return self.handle_perception_failure("vision_failed", vision_result.data)
 
         image_path = str(vision_result.data.get("image_path", ""))
-        analysis_result = self.call_analyze(image_path)
+        depth_path = str(vision_result.data.get("depth_path", "") or "")
+        camera = vision_result.data.get("camera") if isinstance(vision_result.data.get("camera"), dict) else {}
+        analysis_result = self.call_analyze(image_path, depth_path=depth_path, camera=camera)
         if not self.analysis_success(analysis_result):
-            retry_result = self.call_analyze(image_path)
+            retry_result = self.call_analyze(image_path, depth_path=depth_path, camera=camera)
             if not self.analysis_success(retry_result):
                 return self.handle_perception_failure("analysis_failed", retry_result.data)
             analysis_result = retry_result
 
+        #保存本轮感知结果，并更新内部状态
         vision = vision_result.data
         analysis = analysis_result.data
-        self.sync_inventory_state()
-        repeated_view = self.update_repeated_view(vision, analysis)
-        self.update_segment_stats(analysis)
-        self.observe_navigation(vision, analysis)
+        self.current_analysis = analysis
+        self.sync_inventory_state()#它的作用是同步机器人当前是不是拿着东西：
+        repeated_view = self.update_repeated_view(vision, analysis)#这个是在判断：当前画面是不是和之前重复？机器人是不是卡在同一个视角
+        self.update_segment_stats(analysis)#更新当前段的统计信息
+        self.observe_navigation(vision, analysis)#把当前视觉分析结果交给导航记忆模块,更新导航记忆
         self.pending_navigation_recommendation = None
 
-        decision = self.decide(analysis, vision)
+        decision = self.decide(analysis, vision)#决策函数
         self.emit(
             "decision",
             {
@@ -1525,7 +2048,19 @@ class PatrolRunner:
         self.emit_script_result("get_vision", result)
         return result
 
-    def call_analyze(self, image_path: str) -> ScriptResult:
+    def yolo_service_depth_ready(self, analysis: JsonDict, *, depth_path: str) -> bool:
+        if not depth_path:
+            return True
+        notes = [str(item) for item in (analysis.get("notes") or [])]
+        if any(item.startswith("depth_geometry=enabled") for item in notes):
+            return True
+        if str(analysis.get("depth_path") or ""):
+            return True
+        if int(analysis.get("surface_candidate_count", 0) or 0) > 0:
+            return True
+        return False
+
+    def call_analyze(self, image_path: str, *, depth_path: str = "", camera: Optional[JsonDict] = None) -> ScriptResult:
         backend = str(self.config.perception_backend or "yolo").strip().lower()
         script = PERCEPTION_BACKENDS.get(backend)
         if script is None:
@@ -1543,14 +2078,33 @@ class PatrolRunner:
         if backend == "yolo":
             service_mode = str(os.getenv("ROBOT_YOLO_SERVICE_MODE", "auto")).strip().lower()
             if service_mode not in {"0", "false", "no", "off", "disabled"}:
-                service_result = run_yolo_service(image_path, self.config.timeout_seconds)
+                service_result = run_yolo_service(
+                    image_path,
+                    self.config.timeout_seconds,
+                    depth_path=depth_path,
+                    camera=camera if isinstance(camera, dict) else {},
+                )
                 if service_result.ok and service_result.data.get("status") == "success":
-                    self.emit_script_result("analyze_scene_yolo_service", service_result)
-                    return service_result
+                    if self.yolo_service_depth_ready(service_result.data, depth_path=depth_path):
+                        self.emit_script_result("analyze_scene_yolo_service", service_result)
+                        return service_result
+                    self.emit(
+                        "yolo_service_depth_stale",
+                        {
+                            "reason": "depth_path_present_but_service_returned_rgb_only_analysis",
+                            "depth_path": depth_path,
+                            "service_notes": service_result.data.get("notes"),
+                        },
+                    )
                 if service_mode in {"required", "require", "only"}:
                     self.emit_script_result("analyze_scene_yolo_service", service_result)
                     return service_result
-        result = run_script(script, ["--image", image_path], self.config.timeout_seconds)
+        args = ["--image", image_path]
+        if backend == "yolo" and depth_path:
+            args.extend(["--depth", depth_path])
+        if backend == "yolo" and isinstance(camera, dict) and camera:
+            args.extend(["--camera-json", json.dumps(camera, ensure_ascii=False, separators=(",", ":"))])
+        result = run_script(script, args, self.config.timeout_seconds)
         self.emit_script_result(f"analyze_scene_{backend}", result)
         return result
 
@@ -1582,9 +2136,35 @@ class PatrolRunner:
             "surface_hint": candidate.get("surface_hint"),
         }
         for key in (
+            "id",
+            "surface_candidate_id",
+            "region_type",
+            "region_bbox",
+            "region_area_px",
+            "region_area_ratio",
+            "affordance",
+            "parent_object",
+            "parent_label",
+            "source",
+            "surface_candidate_source",
+            "context_only",
+            "context_reason",
+            "blocked",
+            "blocked_by",
+            "score",
+            "height",
+            "distance",
+            "ground_distance",
+            "height_m",
+            "distance_m",
+            "bearing_deg",
             "reachable",
             "pickup_now",
             "place_now",
+            "visual_place_ready",
+            "final_place_ready",
+            "failed_recently",
+            "cooldown_remaining",
             "needs_alignment",
             "needs_approach",
             "is_floor_level",
@@ -1598,15 +2178,41 @@ class PatrolRunner:
         ):
             if key in candidate:
                 payload[key] = candidate.get(key)
+        if role == "place":
+            occupants = candidate.get("visible_occupants")
+            if isinstance(occupants, list):
+                payload["visible_occupants"] = [item for item in occupants if isinstance(item, dict)][:8]
+            avoidance = self.current_analysis.get("placement_avoidance_candidates")
+            if isinstance(avoidance, list):
+                payload["placement_avoidance_candidates"] = [
+                    item for item in avoidance if isinstance(item, dict)
+                ][:16]
         geometry = candidate.get("geometry") if isinstance(candidate.get("geometry"), dict) else {}
         if geometry:
             payload["geometry"] = dict(geometry)
+        for key in (
+            "interaction_point",
+            "depth",
+            "center_3d",
+            "parent_bbox",
+            "geometry_checks",
+            "occupancy_checks",
+            "memory_checks",
+            "executor_checks",
+        ):
+            value = candidate.get(key)
+            if isinstance(value, dict):
+                payload[key] = dict(value)
+        for key in ("rejection_reasons", "blocked_by"):
+            value = candidate.get(key)
+            if isinstance(value, list):
+                payload[key] = list(value)
         place_front_edge = bool(role == "place" and self.receptacle_front_edge_candidate(candidate))
         if place_front_edge:
             payload["front_edge_receptacle"] = True
             payload["broad_front_receptacle"] = True
             payload["visual_box_ambiguous"] = False
-        if role == "place" and bbox:
+        if role == "place" and bbox and "interaction_point" not in payload:
             try:
                 x = float(bbox.get("x", 0.0) or 0.0)
                 y = float(bbox.get("y", 0.0) or 0.0)
@@ -1664,7 +2270,10 @@ class PatrolRunner:
         )
         self.emit_script_result("place_object", result)
         return result
-
+    """机器人手里有没有物体？
+    如果已经拿着东西，就应该进入找放置点阶段。
+    如果手里是空的，就不能继续放置阶段。
+    """
     def sync_inventory_state(self) -> None:
         if str(self.config.task_mode or "clean").strip().lower() != "tidy":
             return
@@ -1793,14 +2402,14 @@ class PatrolRunner:
         except (TypeError, ValueError):
             confidence = 0.0
 
-        if confidence < 0.60:
+        if confidence < 0.60:#如果置信度低于 0.60，就不敢做复杂动作，只执行安全转向探索
             return Decision(
                 kind="move",
                 action=self.safe_turn_action(analysis),
                 mode="EXPLORE",
                 reason=f"low_analysis_confidence:{confidence:.2f}",
             )
-
+        #置信度高，走整理路线
         if str(self.config.task_mode or "clean").strip().lower() == "tidy":
             return self.decide_tidy(analysis, vision)
 
@@ -1809,6 +2418,7 @@ class PatrolRunner:
             require_cleanable=True,
             require_alignment=False,
         )
+        #下面走清扫
         if clean_candidate is not None:
             validation = self.validate_clean_candidate(clean_candidate)
             if not bool(validation.get("clean_allowed", False)):
@@ -1877,20 +2487,18 @@ class PatrolRunner:
         return self.explore_decision(analysis, vision, reason="no_direct_cleanable_target")
 
     def decide_tidy(self, analysis: JsonDict, vision: JsonDict) -> Decision:
-        """ALFRED-style household service policy.
-
-        The policy is phase-driven instead of frame-reactive: once a pickup
-        target is locked, the runner keeps pursuing that subgoal until pickup
-        succeeds, fails out, or the target is lost for several steps.
+        """这是 ALFRED-style household service policy。它不是 frame-reactive，而是
+          phase-driven。也就是说，一旦锁定 pickup target，就会持续追这个子目标，直到拾取成功、
+          失败退出，或者目标丢失多步。
         """
         phase = self.service_phase()
-        if phase == SERVICE_DONE_PHASE:
+        if phase == SERVICE_DONE_PHASE:#如果 phase == TASK_DONE → 重置为继续巡视找物体
             self.set_service_phase(
                 SERVICE_INITIAL_PHASE,
                 reason="previous_service_subgoal_complete_continue_patrol",
             )
             phase = self.service_phase()
-        if phase == "FAILED":
+        if phase == "FAILED":#如果 phase == FAILED → 停止
             return Decision(
                 kind="stop",
                 action="none",
@@ -1898,39 +2506,53 @@ class PatrolRunner:
                 reason="service_task_failed",
             )
 
-        if self.holding_object:
-            if phase not in SERVICE_PLACE_PHASES:
+        if self.holding_object:#如果 holding_object == True → 进入放置阶段
+            if phase not in SERVICE_PLACE_PHASES:#但现在机器人已经拿着东西了，那继续停留在拾取阶段就不对了。
                 self.set_service_phase("SEARCH_RECEPTACLE", reason="holding_object_enter_place_subgoal")
             return self.decide_tidy_place_phase(analysis, vision)
 
-        if phase in SERVICE_PLACE_PHASES:
+        if phase in SERVICE_PLACE_PHASES:#如果没有拿东西但 phase 还在放置阶段 → 回到 pickup 搜索
             self.set_service_phase(SERVICE_INITIAL_PHASE, reason="inventory_empty_return_to_pickup_search")
 
         return self.decide_tidy_pickup_phase(analysis, vision)
+    """这个函数处理拾取阶段。
 
+    流程大概是：
+
+    1. 从 YOLO 分析结果里拿 pickup_target 候选
+    2. 如果之前锁定过目标，就优先找这个目标
+    3. 如果锁定目标丢了，就扫描几步
+    4. 如果丢失太久，就释放锁定，重新找
+    5. 如果找到新目标，就 lock_service_candidate()
+    6. 如果 service_pick_ready(candidate) 成立 → 执行 pick-object
+    7. 否则 → 调用 service_positioning_decision() 去对齐/靠近"""
     def decide_tidy_pickup_phase(self, analysis: JsonDict, vision: JsonDict) -> Decision:
         phase = self.service_phase()
+        #1它不是简单地拿所有 YOLO 检测到的 
+        #pickup target，而是拿 可见 + 可达 + 值得追踪 + 没被屏蔽 + 没被误判为桌上物体 的 pickup 候选。
         candidates = self.visible_service_candidates(analysis, task_class="pickup_target")
+        #读取当前锁定的目标标签     如果视野里面有之前锁定过的苹果，就继续将他锁定为目标
         locked_label = str(self.service_state.get("target_raw_label") or self.service_state.get("target_label") or "")
-
+       #1.1.没有可操作候选 但是有可以 pickup 的类别，就解除之前的锁定
         if not candidates and truthy(analysis.get("pickup_target_detected")):
             if locked_label:
                 self.clear_service_lock(role="pickup", reason="locked_pickup_target_not_actionable")
             clean_decision = self.tidy_clean_fallback_decision(analysis)
             if clean_decision is not None:
                 return clean_decision
-            return self.explore_decision(
+            return self.explore_decision(#返回探索决策
                 analysis,
                 vision,
                 reason="service_pickup_targets_visible_but_not_actionable",
             )
-
+#1.2  有可操作候选  优先找“之前锁定的目标”   比如之前锁定的是 Apple，现在这一帧 candidates 里也有 Apple，那就继续追这个 Apple。
         candidate = next((item for item in candidates if self.service_lock_matches(item, role="pickup")), None)
+        #1.3  之前锁定了目标，但当前没找到它  有可操作候选 
         if locked_label and candidate is None:
-            if candidates:
+            if candidates:#当前有其他 pickup candidates，那就重新锁定新目标
                 self.clear_service_lock(role="pickup", reason="locked_pickup_target_lost_retarget_visible")
                 candidate = candidates[0]
-            else:
+            else:#当前没有任何 candidates，那就记录原来锁定的目标现在丢了几步，为了找回它已经扫描的次数   如果丢的步数太多扫描次数太多，就别追了。
                 lost_steps = self.locked_lost_steps(role="pickup")
                 scan_count = self.increment_locked_scan_count(role="pickup")
                 max_scan_steps = self.max_locked_scan_steps(role="pickup")
@@ -1962,26 +2584,28 @@ class PatrolRunner:
                     ),
                     candidate=None,
                 )
-
+        #1.4 如果前面没有找到锁定目标，也没有 retarget，那么这里就选当前排序最靠前的候选。
         if candidate is None:
             candidate = candidates[0] if candidates else None
-
+        #如果有候选但还没锁定，就锁定它
         if candidate is not None and not self.service_lock_matches(candidate, role="pickup"):
             self.lock_service_candidate(candidate, role="pickup", reason="pickup_target_locked")
-        elif candidate is not None:
+        elif candidate is not None:#如果候选就是已锁定目标，就更新“最后看见时间”
             self.service_state["target_last_seen_step"] = self.current_step_count()
             self.service_state["target_lost_scan_count"] = 0
             if phase == SERVICE_INITIAL_PHASE:
                 self.set_service_phase("LOCK_PICKUP_TARGET", reason="locked_pickup_target_visible", candidate=candidate)
-
+#如果最后还是没有 candidate，清掉 pickup 锁定  开始清扫
         if candidate is None:
             self.clear_service_lock(role="pickup", reason="pickup_target_not_visible")
             clean_decision = self.tidy_clean_fallback_decision(analysis)
             if clean_decision is not None:
                 return clean_decision
             return self.explore_decision(analysis, vision, reason="service_phase_search_pickup_target")
-
-        if self.service_pick_ready(candidate):
+#如果 candidate 已经可以捡，进入 PICK_OBJECT
+#判断当前这个候选物体，是否已经满足“可以尝试执行 pick-object”的视觉与状态条件。 
+#  注意，是可以尝试捡，不是 100% 保证一定捡成功
+        if self.service_pick_ready(candidate):   
             self.set_service_phase("PICK_OBJECT", reason="pickup_candidate_action_ready", candidate=candidate)
             return Decision(
                 kind="pick",
@@ -1990,31 +2614,79 @@ class PatrolRunner:
                 reason="alfred_subgoal_pick_object",
                 candidate=candidate,
             )
-
+#candidate 还不能捡，就进入对齐/靠近逻辑（不能直接捡，就先移动/转向，让目标变得可捡。）
         self.set_service_phase("ALIGN_PICKUP_TARGET", reason="pickup_candidate_needs_positioning", candidate=candidate)
+        #下面这个函数会根据 candidate 的状态决定：如果目标偏左 → RotateLeft如果目标偏右 → RotateRight如果目标在正前方但还远 → MoveAhead如果前方有障碍 → 安全避让
         return self.service_positioning_decision(
             analysis,
             vision,
             candidate,
             base_reason="alfred_align_pickup_target",
         )
+    """这个函数处理放置阶段，逻辑更复杂，因为放置更容易失败。
 
+它会：
+
+1. 从 YOLO 分析结果里拿 place_receptacle 候选
+2. 优先找之前锁定的 receptacle
+3. 如果锁定的 receptacle 不见了，就扫描几步
+4. 如果看见 context candidate，也可以拿来辅助对齐
+5. 如果完全找不到，就执行 holding_receptacle_search_decision()：进入拿着东西找 receptacle 的搜索策略，通常会返回左右转、前进
+6. 如果 receptacle 已经 action ready → place-object
+            当前放置目标已经满足放置条件：
+                在正前方
+                可达
+                不需要对齐
+                不需要靠近
+                视觉上足够可交互
+                置信度/面积/位置够
+            于是进入 PLACE_OBJECT 阶段，
+7. 如果有候选放置目标，但还不能 place → 先 approach 或 align 
+8. 如果对齐太久还不行，可能 backend probe 或换目标"""
     def decide_tidy_place_phase(self, analysis: JsonDict, vision: JsonDict) -> Decision:
         phase = self.service_phase()
+        #真正可作为放置目标追踪的 receptacle 候选。
         candidates = self.visible_service_candidates(analysis, task_class="place_receptacle")
+        #上下文候选。它可能还没达到正式 lock/place 条件，但可以用来辅助对齐和靠近。
+        context_candidates = self.visible_receptacle_context_candidates(analysis)
+        #之前已经锁定的放置目标标签。
         locked_label = str(self.service_state.get("receptacle_raw_label") or self.service_state.get("receptacle_label") or "")
+        #如果之前锁定过一个放置目标，比如counter_top，那这一帧优先从 candidates 里找同一个 counter_top。
         candidate = next((item for item in candidates if self.service_lock_matches(item, role="place")), None)
+        context_candidate = next(
+            (item for item in context_candidates if self.service_lock_matches(item, role="place")),
+            None,
+        )
+        ###如果没有找到和锁定目标匹配的 context candidate(就是如果之前锁定的目标如果不在候选物中)，但画面里有其他可作为上下文的放置目标，那就先拿排序最靠前的一个
+        #candidate：比较靠谱，可能可以锁定、靠近、最终 place-object  
+        # context_candidate：只是“我好像看到桌子/台面在那边”，主要用来导航/对齐
+        if context_candidate is None and context_candidates:
+            context_candidate = context_candidates[0]
+        #如果之前锁定了 receptacle，但当前正式 candidate 找不到
         if locked_label and candidate is None:
             if candidates:
                 self.clear_service_lock(role="place", reason="locked_receptacle_lost_retarget_visible")
                 candidate = candidates[0]
             else:
+                if context_candidate is not None:
+                    self.remember_receptacle_position_hint(context_candidate)
+                    self.set_service_phase(
+                        "ALIGN_RECEPTACLE",
+                        reason="locked_receptacle_visible_as_context",
+                        candidate=context_candidate,
+                    )
+                    return self.service_positioning_decision(#这个函数负责“还不能 pick/place 时该怎么调整位置”。
+                        analysis,
+                        vision,
+                        context_candidate,
+                        base_reason="alfred_align_receptacle_context",
+                    )
                 lost_steps = self.locked_lost_steps(role="place")
                 scan_count = self.increment_locked_scan_count(role="place")
                 max_scan_steps = self.max_locked_scan_steps(role="place")
                 if lost_steps > max_scan_steps or scan_count > max_scan_steps:
                     self.clear_service_lock(role="place", reason="locked_receptacle_lost")
-                    return self.explore_decision(
+                    return self.holding_receptacle_search_decision(
                         analysis,
                         vision,
                         reason=(
@@ -2022,8 +2694,12 @@ class PatrolRunner:
                             f"lost_steps={lost_steps};scan={scan_count}"
                         ),
                     )
-                action, reason_suffix = self.break_rotation_oscillation(
-                    "RotateLeft",
+                preferred = "RotateLeft"
+                last_position_hint = str(self.service_state.get("receptacle_last_position_hint") or "")
+                if last_position_hint == "front-right":
+                    preferred = "RotateRight"
+                action, reason_suffix = self.service_safe_move_action(
+                    preferred,
                     analysis,
                     allow_forward_break=False,
                 )
@@ -2048,10 +2724,50 @@ class PatrolRunner:
             self.service_state["receptacle_lost_scan_count"] = 0
             if phase == "SEARCH_RECEPTACLE":
                 self.set_service_phase("LOCK_RECEPTACLE", reason="locked_receptacle_visible", candidate=candidate)
+        if candidate is not None:
+            self.remember_receptacle_position_hint(candidate)
 
         if candidate is None:
+            if context_candidate is not None:
+                self.remember_receptacle_position_hint(context_candidate)
+                self.set_service_phase(
+                    "ALIGN_RECEPTACLE",
+                    reason="receptacle_context_visible",
+                    candidate=context_candidate,
+                )
+                return self.service_positioning_decision(
+                    analysis,
+                    vision,
+                    context_candidate,
+                    base_reason="alfred_align_receptacle_context",
+                )
             self.clear_service_lock(role="place", reason="receptacle_not_visible")
-            return self.explore_decision(analysis, vision, reason="service_phase_search_receptacle")
+            return self.holding_receptacle_search_decision(
+                analysis,
+                vision,
+                reason="service_phase_search_receptacle",
+            )
+
+        if phase == "APPROACH_RECEPTACLE":
+            hinted = self.receptacle_action_hint_decision(
+                analysis,
+                vision,
+                candidate,
+                base_reason="alfred_interactable_pose_guidance",
+            )
+            if hinted is not None:
+                return hinted
+            try:
+                approach_attempts = int(self.service_state.get("phase_attempts", 0) or 0)
+            except (TypeError, ValueError):
+                approach_attempts = 0
+            if approach_attempts <= 0 or not self.service_place_ready(candidate):
+                return self.service_positioning_decision(
+                    analysis,
+                    vision,
+                    candidate,
+                    base_reason="alfred_approach_receptacle_without_hint",
+                )
 
         if self.service_place_ready(candidate):
             self.set_service_phase("PLACE_OBJECT", reason="receptacle_action_ready", candidate=candidate)
@@ -2105,18 +2821,196 @@ class PatrolRunner:
                 reason=f"receptacle_alignment_timeout:{align_attempts}",
             )
             self.clear_service_lock(role="place", reason="receptacle_alignment_timeout_retarget")
-            return self.explore_decision(
+            return self.holding_receptacle_search_decision(
                 analysis,
                 vision,
                 reason=f"receptacle_alignment_timeout_retarget:{align_attempts}",
+                candidate=candidate,
             )
 
-        self.set_service_phase("ALIGN_RECEPTACLE", reason="receptacle_needs_positioning", candidate=candidate)
+        if (
+            str(candidate.get("position_hint") or "") == "front-center"
+            and not truthy(candidate.get("needs_alignment"))
+            and not self.service_receptacle_visual_interaction_ready(candidate)
+            and self.can_safely_move_ahead(analysis)
+        ):
+            self.set_service_phase("APPROACH_RECEPTACLE", reason="receptacle_needs_approach", candidate=candidate)
+        else:
+            self.set_service_phase("ALIGN_RECEPTACLE", reason="receptacle_needs_positioning", candidate=candidate)
         return self.service_positioning_decision(
             analysis,
             vision,
             candidate,
             base_reason="alfred_align_receptacle",
+        )
+
+    def receptacle_action_hint_decision(
+        self,
+        analysis: JsonDict,
+        vision: JsonDict,
+        candidate: JsonDict,
+        *,
+        base_reason: str,
+    ) -> Optional[Decision]:
+        action = self.current_receptacle_action_hint()
+        if action is None:
+            return None
+        if action == "MoveAhead":
+            if self.can_safely_move_ahead(analysis):
+                return Decision(
+                    kind="move",
+                    action="MoveAhead",
+                    mode="SERVICE",
+                    reason=f"{base_reason};approach_interactable_pose",
+                    candidate=candidate,
+                )
+            self.service_state["receptacle_action_hint"] = None
+            self.service_state["receptacle_action_hint_until_step"] = None
+            return self.holding_receptacle_search_decision(
+                analysis,
+                vision,
+                reason=f"{base_reason};moveahead_hint_not_safe",
+                candidate=candidate,
+            )
+        if action in ROTATE_ACTIONS:
+            action, reason_suffix = self.service_safe_move_action(
+                action,
+                analysis,
+                allow_forward_break=False,
+            )
+            return Decision(
+                kind="move",
+                action=action,
+                mode="SERVICE",
+                reason=f"{base_reason};{reason_suffix}",
+                candidate=candidate,
+            )
+        return None
+
+    def service_safe_move_action(
+        self,
+        preferred: str,
+        analysis: JsonDict,
+        *,
+        allow_forward_break: bool = False,
+    ) -> Tuple[str, str]:
+        action = preferred
+        reason_suffix = "normal"
+        if action in ROTATE_ACTIONS:
+            action, reason_suffix = self.break_rotation_oscillation(
+                action,
+                analysis,
+                allow_forward_break=allow_forward_break,
+            )
+
+        if not self.holding_object or action not in MOVE_ACTIONS:
+            return action, reason_suffix
+
+        if not self.held_move_action_recently_bad(action):
+            return action, reason_suffix
+
+        alternative = self.held_object_alternative_action(action, analysis)
+        if alternative:
+            if alternative in ROTATE_ACTIONS:
+                alternative, alt_suffix = self.break_rotation_oscillation(
+                    alternative,
+                    analysis,
+                    allow_forward_break=False,
+                )
+                if self.held_move_action_recently_bad(alternative):
+                    second = self.held_object_alternative_action(alternative, analysis)
+                    if second:
+                        alternative = second
+                        alt_suffix = "held_second_alternative"
+                return alternative, f"{reason_suffix};held_avoid_{action}:{alt_suffix}"
+            return alternative, f"{reason_suffix};held_avoid_{action}"
+        return action, f"{reason_suffix};held_no_safe_alternative"
+
+    def held_object_alternative_action(self, blocked_action: str, analysis: JsonDict) -> Optional[str]:
+        if blocked_action == "RotateLeft":
+            candidates = ["RotateRight", "MoveBack"]
+        elif blocked_action == "RotateRight":
+            candidates = ["RotateLeft", "MoveBack"]
+        elif blocked_action == "MoveAhead":
+            last_hint = str(self.service_state.get("receptacle_last_position_hint") or "")
+            preferred_turn = "RotateRight" if last_hint == "front-right" else "RotateLeft"
+            candidates = [preferred_turn, OPPOSITE_ROTATION.get(preferred_turn, "RotateRight"), "MoveBack"]
+        elif blocked_action == "MoveBack":
+            candidates = ["RotateRight", "RotateLeft"]
+        else:
+            candidates = ["RotateRight", "RotateLeft", "MoveBack"]
+
+        for action in candidates:
+            if action not in MOVE_ACTIONS:
+                continue
+            if self.held_move_action_recently_bad(action):
+                continue
+            if action == "MoveAhead" and not self.can_safely_move_ahead(analysis):
+                continue
+            if action == "MoveBack" and (
+                self.recent_action_failed("MoveBack")
+                or self.last_action_is("MoveBack")
+                or self.last_action_is("MoveAhead")
+                or self.recent_moveback_loop()
+            ):
+                continue
+            return action
+        return None
+
+    def holding_receptacle_search_decision(
+        self,
+        analysis: JsonDict,
+        vision: JsonDict,
+        *,
+        reason: str,
+        candidate: Optional[JsonDict] = None,
+    ) -> Decision:
+        """Search for a place target while holding an object without frontier wandering."""
+        recommended = str(analysis.get("recommended_action") or "").strip()
+        if recommended in MOVE_ACTIONS:
+            if recommended != "MoveAhead" or self.can_safely_move_ahead(analysis):
+                action, reason_suffix = self.service_safe_move_action(
+                    recommended,
+                    analysis,
+                    allow_forward_break=False,
+                )
+                if action != "MoveAhead" or self.can_safely_move_ahead(analysis):
+                    return Decision(
+                        kind="move",
+                        action=action,
+                        mode="SERVICE",
+                        reason=f"{reason};holding_yolo_guidance:{reason_suffix}",
+                        candidate=candidate,
+                    )
+
+        last_position_hint = str(self.service_state.get("receptacle_last_position_hint") or "")
+        if last_position_hint == "front-right":
+            preferred = "RotateRight"
+        elif last_position_hint == "front-left":
+            preferred = "RotateLeft"
+        elif last_position_hint == "front-center" and self.can_safely_move_ahead(analysis):
+            preferred = "MoveAhead"
+        else:
+            preferred = self.safe_turn_action(analysis)
+
+        if preferred == "MoveAhead" and not self.can_safely_move_ahead(analysis):
+            preferred = self.safe_turn_action(analysis)
+
+        action, reason_suffix = self.service_safe_move_action(
+            preferred,
+            analysis,
+            allow_forward_break=False,
+        )
+        if action == "MoveAhead" and not self.can_safely_move_ahead(analysis):
+            action = self.held_object_alternative_action("MoveAhead", analysis) or self.safe_turn_action(analysis)
+            reason_suffix = f"{reason_suffix};held_no_blind_moveahead"
+
+        return Decision(
+            kind="move",
+            action=action,
+            mode="SERVICE",
+            reason=f"{reason};holding_place_search:{reason_suffix}",
+            candidate=candidate,
         )
 
     def tidy_clean_fallback_decision(self, analysis: JsonDict) -> Optional[Decision]:
@@ -2202,7 +3096,7 @@ class PatrolRunner:
                     reason=f"{base_reason};held_object_clearance_before_left_align",
                     candidate=candidate,
                 )
-            action, reason_suffix = self.break_rotation_oscillation(action, analysis, allow_forward_break=False)
+            action, reason_suffix = self.service_safe_move_action(action, analysis, allow_forward_break=False)
             return Decision(
                 kind="move",
                 action=action,
@@ -2227,7 +3121,7 @@ class PatrolRunner:
                     reason=f"{base_reason};held_object_clearance_before_right_align",
                     candidate=candidate,
                 )
-            action, reason_suffix = self.break_rotation_oscillation(action, analysis, allow_forward_break=False)
+            action, reason_suffix = self.service_safe_move_action(action, analysis, allow_forward_break=False)
             return Decision(
                 kind="move",
                 action=action,
@@ -2240,7 +3134,7 @@ class PatrolRunner:
             center_offset = self.candidate_center_offset(candidate)
             if abs(center_offset) > 0.10:
                 action = "RotateLeft" if center_offset < 0 else "RotateRight"
-                action, reason_suffix = self.break_rotation_oscillation(action, analysis, allow_forward_break=False)
+                action, reason_suffix = self.service_safe_move_action(action, analysis, allow_forward_break=False)
                 direction = "left" if center_offset < 0 else "right"
                 return Decision(
                     kind="move",
@@ -2249,6 +3143,25 @@ class PatrolRunner:
                     reason=f"{base_reason};fine_align_{direction}:{reason_suffix}",
                     candidate=candidate,
                 )
+
+        if position_hint == "front-center" and self.can_safely_move_ahead(analysis):
+            action, reason_suffix = self.service_safe_move_action("MoveAhead", analysis, allow_forward_break=False)
+            if action != "MoveAhead" or self.can_safely_move_ahead(analysis):
+                return Decision(
+                    kind="move",
+                    action=action,
+                    mode="SERVICE",
+                    reason=f"{base_reason};approach_front_center_{task_class}:{reason_suffix}",
+                    candidate=candidate,
+                )
+
+        if self.holding_object and task_class == "place_receptacle":
+            return self.holding_receptacle_search_decision(
+                analysis,
+                vision,
+                reason=f"{base_reason};candidate_not_action_ready",
+                candidate=candidate,
+            )
 
         if position_hint == "front-center" and self.can_safely_move_ahead(analysis):
             return Decision(
@@ -2413,6 +3326,8 @@ class PatrolRunner:
         if base_action(self.recent_actions[-1] if self.recent_actions else None) == "MoveBack":
             return False
         if self.recent_moveback_loop():
+            return False
+        if self.holding_object and self.held_move_action_blocked("MoveAhead"):
             return False
         return True
 
@@ -2953,7 +3868,27 @@ class PatrolRunner:
             or f"{expected_result_type}_failed"
         )
         return False, reason
+#机器人执行完动作后，不能只看有没有报错，还要更新状态机。
+    """
+    前面 decide_tidy_pickup_phase() / decide_tidy_place_phase() 负责决定：
 
+下一步是 pick-object / place-object / MoveAhead / RotateLeft
+
+而这个 update_service_state_after_action() 负责：tidy 状态机的动作后更新器。
+
+    比如 pick 成功：
+    holding_object = True
+    phase = VERIFY_HOLDING
+    然后进入 SEARCH_RECEPTACLE
+
+    代码里如果 decision.kind == "pick" 且成功，就设置 holding_object，然后从 VERIFY_HOLDING 进入 SEARCH_RECEPTACLE。
+
+    place 成功：
+    holding_object = False
+    记录完成了 object -> receptacle
+    清空 target/receptacle 锁定
+    phase 回到 SEARCH_PICKUP_TARGET
+    继续巡视"""
     def update_service_state_after_action(
         self,
         *,
@@ -3027,6 +3962,9 @@ class PatrolRunner:
                     self.service_state["receptacle_signature"] = None
                     self.service_state["receptacle_last_seen_step"] = None
                     self.service_state["receptacle_attempts"] = 0
+                    self.service_state["receptacle_action_hint"] = None
+                    self.service_state["receptacle_action_hint_until_step"] = None
+                    self.service_state["receptacle_last_position_hint"] = None
                     self.emit(
                         "service_subgoal_completed",
                         {
@@ -3047,8 +3985,27 @@ class PatrolRunner:
             return
 
         if decision.mode == "SERVICE" and decision.kind == "move":
+            if self.holding_object and not success and decision.action in MOVE_ACTIONS:
+                failure_text = " ".join(
+                    str(value or "")
+                    for value in (
+                        failure_reason,
+                        execution.get("result_type"),
+                        execution.get("error_message"),
+                        execution.get("message"),
+                    )
+                )
+                block_steps = 6 if "held" in failure_text.lower() else 4
+                self.block_held_move_action(
+                    decision.action,
+                    reason=failure_text.strip() or "service_move_failed_while_holding",
+                    steps=block_steps,
+                )
             self.service_state["phase_attempts"] = int(self.service_state.get("phase_attempts", 0) or 0) + 1
             self.service_state["holding_object"] = bool(self.holding_object)
+            if self.service_phase() == "APPROACH_RECEPTACLE" and decision.action in MOVE_ACTIONS:
+                self.service_state["receptacle_action_hint"] = None
+                self.service_state["receptacle_action_hint_until_step"] = None
             if self.service_phase() == "ALIGN_RECEPTACLE" and self.holding_object:
                 try:
                     receptacle_alignment_streak = int(
@@ -3091,10 +4048,40 @@ class PatrolRunner:
             role=role,
             result_type=result_type,
             failure_count=self.service_failures[key],
+            executor_action_hint=execution.get("executor_action_hint"),
+            interactable_current_pose=execution.get("interactable_current_pose"),
+            interactable_pose_count=execution.get("interactable_pose_count"),
+            interactable_distance_bucket=execution.get("interactable_distance_bucket"),
+            interactable_angle_bucket=execution.get("interactable_angle_bucket"),
             candidate=self.short_candidate(candidate),
         )
+        if role == "place" and isinstance(candidate, dict) and result_type in PLACE_COOLDOWN_ERRORS:
+            self.mark_surface_candidate_failed(
+                candidate,
+                result_type=result_type,
+                failed_candidate_id=str(execution.get("failed_candidate_id") or "") or None,
+            )
+            self.clear_service_lock(role=role, reason=f"place_surface_cooldown_after:{result_type}")
+            self.set_service_phase(
+                "SEARCH_RECEPTACLE",
+                reason=f"place_surface_cooldown_after:{result_type}",
+                candidate=None,
+            )
+            return
+        if role == "place" and isinstance(candidate, dict) and result_type in PLACE_APPROACH_ERRORS:
+            self.store_receptacle_action_hint(execution.get("executor_action_hint"), steps=2)
+            self.set_service_phase("APPROACH_RECEPTACLE", reason=f"place_needs_approach_after:{result_type}", candidate=candidate)
+            return
+        if role == "place" and isinstance(candidate, dict) and result_type in PLACE_RETRY_ERRORS:
+            self.service_state["receptacle_alignment_streak"] = 0
+            self.set_service_phase(
+                "ALIGN_RECEPTACLE",
+                reason=f"place_retry_same_receptacle_after:{result_type}",
+                candidate=candidate,
+            )
+            return
         if role == "place" and isinstance(candidate, dict) and result_type in PLACE_RETARGET_ERRORS:
-            self.suppress_service_candidate(candidate, reason=result_type)
+            self.suppress_service_candidate(candidate, reason=result_type, steps=6)
             self.clear_service_lock(role=role, reason=f"place_retarget_after:{result_type}")
             return
         if role == "pickup" and isinstance(candidate, dict) and result_type in PICKUP_RETARGET_ERRORS:
@@ -3153,7 +4140,12 @@ class PatrolRunner:
         repeated = self.last_view_signature == signature
         self.last_view_signature = signature
         return repeated
-
+    """
+    更新当前段的统计信息，比如：
+    这一段有没有看到垃圾？
+    有没有看到新方向？
+    有没有失败？
+    """
     def update_segment_stats(self, analysis: JsonDict) -> None:
         self.current_segment_stats["steps"] = int(self.current_segment_stats["steps"]) + 1
         if bool(analysis.get("direct_cleanable_detected", False)) or bool(
@@ -3319,6 +4311,8 @@ class PatrolRunner:
         if not candidate:
             return None
         summary = {
+            "id": candidate.get("id"),
+            "surface_candidate_id": candidate.get("surface_candidate_id"),
             "label": candidate.get("label"),
             "raw_label": candidate.get("raw_label"),
             "task_semantic_class": candidate.get("task_semantic_class"),
@@ -3327,12 +4321,36 @@ class PatrolRunner:
             "cleanable_now": candidate.get("cleanable_now"),
             "pickup_now": candidate.get("pickup_now"),
             "place_now": candidate.get("place_now"),
+            "visual_place_ready": candidate.get("visual_place_ready"),
+            "final_place_ready": candidate.get("final_place_ready"),
+            "failed_recently": candidate.get("failed_recently"),
+            "cooldown_remaining": candidate.get("cooldown_remaining"),
             "needs_alignment": candidate.get("needs_alignment"),
             "needs_approach": candidate.get("needs_approach"),
             "reachable": candidate.get("reachable"),
             "confidence": candidate.get("confidence"),
             "bbox": candidate.get("bbox"),
         }
+        for key in (
+            "front_edge_receptacle",
+            "broad_front_receptacle",
+            "visible_occupant_count",
+            "distance",
+            "ground_distance",
+            "height_m",
+            "distance_m",
+            "bearing_deg",
+            "score",
+            "actionability_reject_reason",
+            "rejection_reasons",
+            "region_type",
+            "region_area_px",
+            "region_area_ratio",
+            "floor_level_source",
+            "projected_height_warning",
+        ):
+            if key in candidate:
+                summary[key] = candidate.get(key)
         if isinstance(candidate.get("backend_validation"), dict):
             summary["backend_validation"] = candidate.get("backend_validation")
         return summary
