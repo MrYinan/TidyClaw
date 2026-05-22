@@ -1851,7 +1851,16 @@ def save_candidate_visualization(
             continue
         x1, y1, x2, y2 = [int(round(v)) for v in box]
         task_class = str(candidate.get("task_semantic_class") or "ignored_object")
-        color = colors.get(task_class, (220, 220, 220))
+        is_surface_region = str(candidate.get("surface_candidate_source") or "") == "depth_region_geometry"
+        if is_surface_region:
+            if candidate.get("final_place_ready") or candidate.get("place_now"):
+                color = (0, 220, 0)
+            elif candidate.get("visual_place_ready"):
+                color = (255, 120, 0)
+            else:
+                color = (0, 0, 255)
+        else:
+            color = colors.get(task_class, (220, 220, 220))
         cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
 
         label = str(candidate.get("raw_label") or candidate.get("label") or task_class)
@@ -1859,7 +1868,21 @@ def save_candidate_visualization(
             confidence = float(candidate.get("confidence", 0.0) or 0.0)
         except (TypeError, ValueError):
             confidence = 0.0
-        text = f"{label} {confidence:.2f}"
+        if is_surface_region:
+            reasons = [str(item) for item in candidate.get("rejection_reasons", []) if str(item)]
+            if candidate.get("failed_recently"):
+                reasons.insert(0, f"cooldown:{candidate.get('cooldown_remaining', 0)}")
+            if candidate.get("blocked") and not any(item.startswith("blocked") for item in reasons):
+                blocked_by = candidate.get("blocked_by") if isinstance(candidate.get("blocked_by"), list) else []
+                if blocked_by:
+                    reasons.insert(0, f"blocked:{blocked_by[0]}")
+                else:
+                    reasons.insert(0, "blocked")
+            status = "ready" if candidate.get("final_place_ready") or candidate.get("place_now") else "visual" if candidate.get("visual_place_ready") else "reject"
+            reason_text = ",".join(reasons[:2]) if reasons else status
+            text = f"{label} {status} {reason_text}"
+        else:
+            text = f"{label} {confidence:.2f}"
         text_w, text_h = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
         text_y = max(14, y1 - 4)
         cv2.rectangle(image, (x1, text_y - text_h - 4), (x1 + text_w + 4, text_y + 3), color, -1)
@@ -2384,6 +2407,7 @@ def analyze_image_with_model(
             f"ignored_or_obstacle_candidates={len(ignored_candidates)}",
             f"surface_candidates={len(surface_candidates)}",
             f"surface_region_count={len(surface_regions)}",
+            f"surface_region_visual_ready={len(visual_ready_surface_regions)}",
             f"yolo_iou={float(iou):.2f}",
             "raw_receptacle_place_now=disabled_depth_surface_required",
             "surface_place_distance=ground_distance_m",
@@ -2451,7 +2475,7 @@ def analyze_image_with_model(
         save_candidate_visualization(
             image_path=image_path,
             save_path=Path(save_vis),
-            candidates=service_candidates + ignored_candidates,
+            candidates=surface_region_candidates + service_candidates + ignored_candidates,
             notes=output_notes,
         )
     return output
