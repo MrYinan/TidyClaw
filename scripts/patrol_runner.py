@@ -1026,9 +1026,11 @@ class PatrolRunner:
         if task_class == "pickup_target":
             pools.append(analysis.get("best_pickup_candidate"))
         elif task_class == "place_receptacle":
+            pools.append(analysis.get("best_surface_candidate"))
             pools.append(analysis.get("best_receptacle_candidate"))
         pools.extend(analysis.get("service_candidates", []) or [])
         pools.extend(analysis.get("receptacle_candidates", []) or [])
+        pools.extend(analysis.get("surface_regions", []) or [])
 
         candidates: List[JsonDict] = []
         seen_keys = set()
@@ -1070,7 +1072,9 @@ class PatrolRunner:
         that receptacle instead of handing control to frontier exploration.
         """
         pools: List[Any] = [
+            analysis.get("best_surface_candidate"),
             analysis.get("best_receptacle_candidate"),
+            *(analysis.get("surface_regions", []) or []),
             *(analysis.get("receptacle_candidates", []) or []),
             *(analysis.get("service_candidates", []) or []),
         ]
@@ -1436,6 +1440,13 @@ class PatrolRunner:
         """Return True only when the visible receptacle looks close enough to try PutObject."""
         if str(candidate.get("task_semantic_class") or "") != "place_receptacle":
             return False
+        if str(candidate.get("surface_candidate_source") or "") == "depth_region_geometry":
+            self.annotate_surface_memory(candidate)
+            return bool(
+                truthy(candidate.get("visual_place_ready"))
+                and not truthy(candidate.get("failed_recently"))
+                and not truthy(candidate.get("blocked"))
+            )
         if truthy(candidate.get("needs_alignment")) or truthy(candidate.get("needs_approach")):
             return False
         if str(candidate.get("surface_candidate_source") or "") == "depth_geometry":
@@ -1565,6 +1576,9 @@ class PatrolRunner:
     def service_place_ready(self, candidate: JsonDict) -> bool:
         if str(candidate.get("position_hint") or "") != "front-center":
             return False
+        self.annotate_surface_memory(candidate)
+        if truthy(candidate.get("failed_recently")):
+            return False
         if not truthy(candidate.get("reachable")):
             return False
         confidence = float(candidate.get("confidence", 0.0) or 0.0)
@@ -1578,6 +1592,14 @@ class PatrolRunner:
             return False
         if not self.service_receptacle_visual_interaction_ready(candidate):
             return False
+        if str(candidate.get("surface_candidate_source") or "") == "depth_region_geometry":
+            executor_checks = candidate.get("executor_checks") if isinstance(candidate.get("executor_checks"), dict) else {}
+            return bool(
+                truthy(candidate.get("visual_place_ready"))
+                and truthy(candidate.get("final_place_ready"))
+                and truthy(candidate.get("place_now"))
+                and truthy(executor_checks.get("precheck_ok"))
+            )
         if str(candidate.get("surface_candidate_source") or "") == "depth_geometry":
             return bool(
                 truthy(candidate.get("place_now"))
@@ -1598,6 +1620,20 @@ class PatrolRunner:
             return True
         return confidence >= 0.70 and area_ratio >= 0.015
 
+    def service_place_precheck_ready(self, candidate: JsonDict) -> bool:
+        if str(candidate.get("surface_candidate_source") or "") != "depth_region_geometry":
+            return False
+        self.annotate_surface_memory(candidate)
+        if truthy(candidate.get("failed_recently")):
+            return False
+        if str(candidate.get("position_hint") or "") != "front-center":
+            return False
+        if truthy(candidate.get("needs_alignment")) or truthy(candidate.get("needs_approach")):
+            return False
+        if truthy(candidate.get("blocked")):
+            return False
+        return bool(truthy(candidate.get("visual_place_ready")) and truthy(candidate.get("reachable")))
+
     def max_receptacle_align_attempts(self) -> int:
         try:
             return max(1, int(os.getenv("ROBOT_MAX_RECEPTACLE_ALIGN_ATTEMPTS", "4")))
@@ -1607,6 +1643,8 @@ class PatrolRunner:
     def service_place_probe_ready(self, candidate: JsonDict) -> bool:
         """Allow one backend-grounded place probe after visual alignment stalls."""
         if str(candidate.get("task_semantic_class") or "") != "place_receptacle":
+            return False
+        if str(candidate.get("surface_candidate_source") or "") == "depth_region_geometry":
             return False
         if not truthy(candidate.get("reachable")):
             return False
@@ -2270,6 +2308,16 @@ class PatrolRunner:
         )
         self.emit_script_result("place_object", result)
         return result
+
+    def call_place_precheck(self, candidate: Optional[JsonDict] = None) -> ScriptResult:
+        args = ["--precheck-only", *self.interaction_args_for_candidate(candidate, role="place")]
+        result = run_script(
+            PLACE_SCRIPT,
+            args,
+            self.config.timeout_seconds,
+        )
+        self.emit_script_result("place_precheck", result)
+        return result
     """机器人手里有没有物体？
     如果已经拿着东西，就应该进入找放置点阶段。
     如果手里是空的，就不能继续放置阶段。
@@ -2768,6 +2816,56 @@ class PatrolRunner:
                     candidate,
                     base_reason="alfred_approach_receptacle_without_hint",
                 )
+
+        if self.service_place_precheck_ready(candidate):
+            precheck = self.call_place_precheck(candidate)
+            precheck_data = precheck.data if isinstance(precheck.data, dict) else {}
+            precheck_ok = bool(precheck.ok and precheck_data.get("precheck_ok"))
+            executor_checks = candidate.get("executor_checks") if isinstance(candidate.get("executor_checks"), dict) else {}
+            executor_checks = dict(executor_checks)
+            executor_checks.update(
+                {
+                    "precheck_supported": True,
+                    "precheck_ok": bool(precheck_ok),
+                    "reason": precheck_data.get("precheck_reason") or precheck_data.get("result_type"),
+                    "suggested_recovery": precheck_data.get("suggested_recovery"),
+                }
+            )
+            candidate["executor_checks"] = executor_checks
+            candidate["final_place_ready"] = bool(precheck_ok)
+            candidate["place_now"] = bool(precheck_ok)
+            self.emit(
+                "place_precheck_result",
+                {
+                    "candidate": self.short_candidate(candidate),
+                    "precheck_ok": bool(precheck_ok),
+                    "result_type": precheck_data.get("result_type"),
+                    "suggested_recovery": precheck_data.get("suggested_recovery"),
+                    "failed_candidate_id": precheck_data.get("failed_candidate_id"),
+                },
+            )
+            if precheck_ok and self.service_place_ready(candidate):
+                self.set_service_phase("PLACE_OBJECT", reason="surface_executor_precheck_ok", candidate=candidate)
+                return Decision(
+                    kind="place",
+                    action="place-object",
+                    mode="SERVICE",
+                    reason="alfred_subgoal_place_object;surface_precheck_ok",
+                    candidate=candidate,
+                )
+            result_type = str(precheck_data.get("result_type") or "place_precheck_failed")
+            self.mark_surface_candidate_failed(
+                candidate,
+                result_type=result_type,
+                failed_candidate_id=str(precheck_data.get("failed_candidate_id") or "") or None,
+            )
+            self.clear_service_lock(role="place", reason=f"place_precheck_failed:{result_type}")
+            return self.holding_receptacle_search_decision(
+                analysis,
+                vision,
+                reason=f"place_precheck_failed:{result_type}",
+                candidate=candidate,
+            )
 
         if self.service_place_ready(candidate):
             self.set_service_phase("PLACE_OBJECT", reason="receptacle_action_ready", candidate=candidate)
