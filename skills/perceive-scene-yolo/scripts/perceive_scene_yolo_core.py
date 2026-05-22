@@ -494,8 +494,15 @@ def candidate_sort_score(candidate: JsonDict, *, intent: str = "service") -> flo
     score = conf * 2.0 + min(area_ratio, 0.20) + center_bonus
     if candidate.get("context_only"):
         score -= 8.0
-    if candidate.get("surface_candidate_source") == "depth_geometry":
+    if candidate.get("surface_candidate_source") in {"depth_geometry", "depth_region_geometry"}:
         score += float(candidate.get("score", 0.0) or 0.0) * 2.0
+    if candidate.get("surface_candidate_source") == "depth_region_geometry":
+        if candidate.get("visual_place_ready"):
+            score += 2.0
+        if candidate.get("rejection_reasons"):
+            score -= 2.0
+        if candidate.get("blocked"):
+            score -= 4.0
 
     if intent == "pickup":
         if candidate.get("pickup_now"):
@@ -1561,11 +1568,13 @@ def generate_surface_candidates_for_receptacle(
     ideal_ground_distance = env_float("ROBOT_DEPTH_SURFACE_IDEAL_GROUND_DISTANCE_M", 0.75)
     ground_distance_score_span = env_float("ROBOT_DEPTH_SURFACE_GROUND_DISTANCE_SCORE_SPAN_M", 0.65)
     blockers = surface_blockers_for(parent, all_candidates)
-    candidates: List[JsonDict] = []
+    patches: List[JsonDict] = []
 
     for yy in range(y1_i, y2_i, cell):
         for xx in range(x1_i, x2_i, cell):
-            cell_depth = depth_frame[yy:min(yy + cell, y2_i), xx:min(xx + cell, x2_i)]
+            yy2 = min(yy + cell, y2_i)
+            xx2 = min(xx + cell, x2_i)
+            cell_depth = depth_frame[yy:yy2, xx:xx2]
             cell_valid = depth_valid_mask(cell_depth)
             total = int(cell_depth.size)
             valid_count = int(cell_valid.sum())
@@ -1594,58 +1603,74 @@ def generate_surface_candidates_for_receptacle(
             if height_m is not None and not (min_height <= height_m <= max_height):
                 continue
 
-            blocked_by = [
-                str(blocker.get("label") or blocker.get("raw_label") or "object")
-                for blocker in blockers
-                if pixel_in_candidate_bbox(cx, cy, blocker, margin=6.0)
-            ]
-            blocked = bool(blocked_by)
-            valid_score = min(1.0, valid_count / max(1, total))
-            smooth_score = max(0.0, 1.0 - min(1.0, iqr / max(0.001, max_iqr)))
-            if ground_distance_m is None:
-                distance_score = max(0.0, 1.0 - min(1.0, median_depth / max(0.001, max_distance)))
-            else:
-                distance_score = max(
-                    0.0,
-                    1.0 - min(
-                        1.0,
-                        abs(ground_distance_m - ideal_ground_distance)
-                        / max(0.001, ground_distance_score_span),
-                    ),
-                )
-            if height_m is None:
-                height_score = 0.55
-            else:
-                height_score = max(0.0, 1.0 - min(1.0, abs(height_m - ideal_height) / 0.65))
-            center_score = max(0.0, 1.0 - min(1.0, abs((cx / max(1, image_w)) - 0.5) / 0.5))
-            score = (
-                0.28 * valid_score
-                + 0.26 * smooth_score
-                + 0.18 * distance_score
-                + 0.20 * height_score
-                + 0.08 * center_score
-            )
-            if blocked:
-                score *= 0.35
-
-            candidates.append(
-                make_surface_candidate(
-                    parent=parent,
-                    center_x=cx,
-                    center_y=cy,
-                    box_w=float(cell),
-                    box_h=float(cell),
-                    image_w=image_w,
-                    image_h=image_h,
-                    depth_m=median_depth,
-                    height_m=height_m,
-                    score=score,
-                    blocked=blocked,
-                    blocked_by=blocked_by,
-                    camera=camera,
-                )
+            patches.append(
+                {
+                    "bbox": (float(xx), float(yy), float(xx2), float(yy2)),
+                    "grid": (int((yy - y1_i) // cell), int((xx - x1_i) // cell)),
+                    "center": (float(cx), float(cy)),
+                    "valid_ratio": valid_count / max(1, total),
+                    "median_depth": float(median_depth),
+                    "q10": float(q10),
+                    "q90": float(q90),
+                    "iqr": float(iqr),
+                    "height_m": height_m,
+                    "ground_distance_m": ground_distance_m,
+                }
             )
 
+    if not patches:
+        return []
+
+    by_grid = {tuple(patch["grid"]): index for index, patch in enumerate(patches)}
+    visited: set[int] = set()
+    clusters: List[List[JsonDict]] = []
+    max_cluster_height_delta = env_float("ROBOT_DEPTH_SURFACE_CLUSTER_MAX_HEIGHT_DELTA_M", 0.06)
+    max_cluster_depth_delta = env_float("ROBOT_DEPTH_SURFACE_CLUSTER_MAX_DEPTH_DELTA_M", 0.14)
+
+    def patch_continuous(a: JsonDict, b: JsonDict) -> bool:
+        a_h = a.get("height_m")
+        b_h = b.get("height_m")
+        if a_h is not None and b_h is not None and abs(float(a_h) - float(b_h)) > max_cluster_height_delta:
+            return False
+        return abs(float(a.get("median_depth", 0.0)) - float(b.get("median_depth", 0.0))) <= max_cluster_depth_delta
+
+    for index, patch in enumerate(patches):
+        if index in visited:
+            continue
+        cluster: List[JsonDict] = []
+        queue = [index]
+        visited.add(index)
+        while queue:
+            current_index = queue.pop(0)
+            current = patches[current_index]
+            cluster.append(current)
+            gy, gx = current["grid"]
+            for neighbor_key in ((gy - 1, gx), (gy + 1, gx), (gy, gx - 1), (gy, gx + 1)):
+                neighbor_index = by_grid.get(neighbor_key)
+                if neighbor_index is None or neighbor_index in visited:
+                    continue
+                neighbor = patches[neighbor_index]
+                if not patch_continuous(current, neighbor):
+                    continue
+                visited.add(neighbor_index)
+                queue.append(neighbor_index)
+        clusters.append(cluster)
+
+    candidates = [
+        region
+        for region in (
+            make_surface_region_candidate(
+                parent=parent,
+                patches=cluster,
+                blockers=blockers,
+                image_w=image_w,
+                image_h=image_h,
+                camera=camera,
+            )
+            for cluster in clusters
+        )
+        if region
+    ]
     candidates.sort(key=lambda item: float(item.get("score", 0.0) or 0.0), reverse=True)
     kept: List[JsonDict] = []
     min_sep = env_float("ROBOT_DEPTH_SURFACE_MIN_SEPARATION_PIXELS", 42.0)
@@ -1700,7 +1725,7 @@ def apply_depth_geometry(
     for candidate in original_candidates:
         if candidate.get("task_semantic_class") != "place_receptacle":
             continue
-        surface_candidates = generate_surface_candidates_for_receptacle(
+        surface_regions = generate_surface_candidates_for_receptacle(
             parent=candidate,
             depth_frame=depth_frame,
             camera=camera,
@@ -1708,19 +1733,20 @@ def apply_depth_geometry(
             image_w=image_w,
             image_h=image_h,
         )
-        if not surface_candidates:
+        if not surface_regions:
             continue
         candidate["context_only"] = True
-        candidate["context_reason"] = "depth_surface_candidates_generated"
+        candidate["context_reason"] = "depth_surface_regions_generated"
         candidate["place_now"] = False
         candidate["needs_alignment"] = False
         candidate["needs_approach"] = False
-        candidate["surface_candidates"] = surface_candidates
-        generated.extend([item for item in surface_candidates if not item.get("blocked")])
+        candidate["surface_regions"] = surface_regions
+        candidate["surface_candidates"] = surface_regions
+        generated.extend(surface_regions)
 
     if generated:
         candidates.extend(generated)
-    notes.append(f"depth_surface_candidates={len(generated)}")
+    notes.append(f"depth_surface_regions={len(generated)}")
     return generated
 
 
@@ -2295,6 +2321,12 @@ def analyze_image_with_model(
     pickup_candidates = [c for c in all_candidates if c.get("task_semantic_class") == "pickup_target"]
     receptacle_all = [c for c in all_candidates if c.get("task_semantic_class") == "place_receptacle"]
     active_receptacles = active_receptacle_candidates(receptacle_all)
+    surface_regions = [
+        c for c in all_candidates
+        if c.get("task_semantic_class") == "place_receptacle"
+        and c.get("surface_candidate_source") == "depth_region_geometry"
+    ]
+    visual_ready_surface_regions = [c for c in surface_regions if c.get("visual_place_ready")]
     placement_avoidance_candidates = build_placement_avoidance_candidates(all_candidates)
     trash_all = [c for c in all_candidates if c.get("task_semantic_class") == "cleanable_object"]
     ignored_all = [c for c in all_candidates if c.get("task_semantic_class") in {"ignored_object", "obstacle"}]
@@ -2302,6 +2334,7 @@ def analyze_image_with_model(
 
     best_pickup = best_candidate(pickup_candidates, intent="pickup")
     best_receptacle = best_candidate(active_receptacles, intent="receptacle")
+    best_surface = best_candidate(visual_ready_surface_regions or surface_regions, intent="receptacle")
     best_obstacle = best_candidate(obstacle_all, intent="obstacle")
 
     max_candidates = max(1, int(max_candidates))
@@ -2311,6 +2344,7 @@ def analyze_image_with_model(
         max_items=max_candidates,
     )
     receptacle_candidates = sorted_candidates(active_receptacles, intent="receptacle", max_items=max_candidates)
+    surface_region_candidates = sorted_candidates(surface_regions, intent="receptacle", max_items=max_candidates)
     trash_candidates = sorted_candidates(trash_all, intent="service", max_items=max_candidates)
     ignored_candidates = sorted_candidates(ignored_all, intent="obstacle", max_items=max_candidates)
     top_obstacle_candidates = sorted_candidates(obstacle_all, intent="obstacle", max_items=max_candidates)
@@ -2325,7 +2359,7 @@ def analyze_image_with_model(
     pickup_target_detected = bool(pickup_candidates)
     place_receptacle_detected = bool(receptacle_all)
     direct_pickup_detected = bool(best_pickup and best_pickup.get("pickup_now"))
-    direct_place_detected = bool(best_receptacle and best_receptacle.get("place_now"))
+    direct_place_detected = bool(best_surface and best_surface.get("place_now"))
     direct_cleanable_detected = any(c.get("cleanable_now") for c in trash_candidates)
     alignment_needed = any(c.get("needs_alignment") for c in service_candidates + trash_candidates)
     approach_needed = any(c.get("needs_approach") for c in service_candidates + trash_candidates)
@@ -2349,6 +2383,7 @@ def analyze_image_with_model(
             f"receptacle_candidates_merged={len(receptacle_all) - len(active_receptacles)}",
             f"ignored_or_obstacle_candidates={len(ignored_candidates)}",
             f"surface_candidates={len(surface_candidates)}",
+            f"surface_region_count={len(surface_regions)}",
             f"yolo_iou={float(iou):.2f}",
             "raw_receptacle_place_now=disabled_depth_surface_required",
             "surface_place_distance=ground_distance_m",
@@ -2378,10 +2413,12 @@ def analyze_image_with_model(
         "direct_place_detected": bool(direct_place_detected),
         "best_pickup_candidate": best_pickup,
         "best_receptacle_candidate": best_receptacle,
+        "best_surface_candidate": best_surface,
         "best_obstacle_candidate": best_obstacle,
         "service_candidates": service_candidates,
         "receptacle_candidates": receptacle_candidates,
         "surface_candidates": sorted_candidates(surface_candidates, intent="receptacle", max_items=max_candidates),
+        "surface_regions": surface_region_candidates,
         "placement_avoidance_candidates": placement_avoidance_candidates,
         "top_obstacle_candidates": top_obstacle_candidates,
 
@@ -2399,7 +2436,7 @@ def analyze_image_with_model(
         "occupancy": occupancy,
         "recommended_action": recommended_action(
             best_pickup_candidate=best_pickup,
-            best_receptacle_candidate=best_receptacle,
+            best_receptacle_candidate=best_surface or best_receptacle,
             direct_cleanable_detected=bool(direct_cleanable_detected),
             service_candidates=service_candidates,
             obstacle_ahead=bool(obstacle_ahead),
@@ -2408,6 +2445,7 @@ def analyze_image_with_model(
         "candidate_count": len(all_candidates),
         "reported_candidate_count": len(service_candidates) + len(ignored_candidates),
         "surface_candidate_count": len(surface_candidates),
+        "surface_region_count": len(surface_regions),
     }
     if save_vis:
         save_candidate_visualization(
