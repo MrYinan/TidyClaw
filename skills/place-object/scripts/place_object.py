@@ -29,6 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Require the backend executor to ground the supplied visual candidate.",
     )
+    parser.add_argument(
+        "--precheck-only",
+        action="store_true",
+        help="Run the online-safe executor precheck without executing PutObject.",
+    )
     return parser
 
 
@@ -44,11 +49,16 @@ def parse_candidate(raw: str | None) -> dict:
 
 def main() -> None:
     args = build_parser().parse_args()
-    url = f"{DEFAULT_BACKEND_URL.rstrip('/')}/place"
+    endpoint = "place-precheck" if bool(args.precheck_only) else "place"
+    url = f"{DEFAULT_BACKEND_URL.rstrip('/')}/{endpoint}"
     payload = {
         "visual_candidate": parse_candidate(args.candidate_json),
         "strict_visual_grounding": bool(args.strict_visual_grounding),
-        "interaction_contract": "visual_candidate_grounding_v1",
+        "interaction_contract": (
+            "visual_candidate_place_precheck_v1"
+            if bool(args.precheck_only)
+            else "visual_candidate_grounding_v1"
+        ),
     }
     try:
         response = requests.post(url, json=payload, timeout=10)

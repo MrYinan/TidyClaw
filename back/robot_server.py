@@ -273,6 +273,26 @@ def place():
         return json_error("error_place_service_failed", str(e), 500)
 
 
+@app.route("/place-precheck", methods=["POST"])
+def place_precheck():
+    """Online-safe dry precheck for a visual place candidate."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        payload = payload if isinstance(payload, dict) else {}
+        result = env.precheck_place_candidate(
+            visual_candidate=payload.get("visual_candidate"),
+            strict_visual_grounding=bool(payload.get("strict_visual_grounding", False)),
+        )
+        if bool_query("include_eval", default=False):
+            result = dict(result)
+            result["online_safe"] = False
+            result["usage_scope"] = "offline_evaluation_debug_only"
+            return jsonify(result)
+        return jsonify(sanitize_service_action_result(result, action_name="place_precheck"))
+    except Exception as e:
+        return json_error("error_place_precheck_service_failed", str(e), 500)
+
+
 @app.route("/inventory", methods=["GET"])
 def inventory():
     """Online-safe inventory state: whether the robot is holding an object."""

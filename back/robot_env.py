@@ -7,6 +7,7 @@ from io import BytesIO
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from ai2thor.controller import Controller
+import numpy as np
 from PIL import Image
 
 
@@ -57,9 +58,8 @@ class RobotEnvironment:
     """
 
     DEFAULT_CLEANABLE_PROXY_TYPES = (
-        "Apple",
         "Tomato",
-        "Potato"
+        "Apple"
     )
     DEFAULT_NON_FLOOR_PROXY_TYPES = (
         "Apple",
@@ -198,6 +198,7 @@ class RobotEnvironment:
             renderInstanceSegmentation=True,
             renderObjectImage=True,
             renderClassImage=True,
+            renderDepthImage=True,
         )
         self._initialize_rendering()
         self.last_event = self.controller.step(action="Pass")
@@ -224,6 +225,7 @@ class RobotEnvironment:
             "renderInstanceSegmentation": True,
             "renderObjectImage": True,
             "renderClassImage": True,
+            "renderDepthImage": True,
         }
 
     def _initialize_rendering(self) -> None:
@@ -241,6 +243,31 @@ class RobotEnvironment:
         img = self.get_first_person_view()
         buffered = BytesIO()
         img.save(buffered, format="JPEG")
+        return base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+    def get_depth_frame(self) -> Optional[np.ndarray]:
+        depth = getattr(self.last_event, "depth_frame", None)
+        if depth is None:
+            return None
+        try:
+            frame = np.asarray(depth, dtype=np.float32)
+        except Exception:
+            return None
+        if frame.ndim != 2 or frame.size == 0:
+            return None
+        return frame
+
+    def get_depth_frame_base64_npy(self) -> Optional[str]:
+        """Return the current depth frame as base64-encoded .npy bytes.
+
+        AI2-THOR depth values are metric distances in meters. Keeping the data
+        as float32 .npy avoids losing precision in the online geometry layer.
+        """
+        frame = self.get_depth_frame()
+        if frame is None:
+            return None
+        buffered = BytesIO()
+        np.save(buffered, frame.astype(np.float32, copy=False))
         return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
     def get_robot_state(self) -> JsonDict:
@@ -944,6 +971,7 @@ class RobotEnvironment:
     ) -> JsonDict:
         visual_candidate = self._normalize_visual_candidate(visual_candidate)
         visual_candidate_received = bool(visual_candidate)
+        failed_candidate_id = self._visual_candidate_id(visual_candidate)
         visual_receptacle_grounding: JsonDict = {}
         grounding_policy = (
             "metadata_hidden_visual_candidate"
@@ -1001,7 +1029,92 @@ class RobotEnvironment:
                     "visual_candidate_received": visual_candidate_received,
                     "visual_candidate_label": self._visual_candidate_label(visual_candidate),
                 }
+            visual_candidate_stats = self._visual_bbox_stats(visual_candidate)
+            grounding_interactable_guidance = self._object_interactable_navigation_guidance(grounded.get("objectId"))
             visual_receptacle_grounding = self._validate_visual_receptacle_grounding(visual_candidate, grounded)
+            if not bool(visual_receptacle_grounding.get("passed", False)):
+                front_edge_grounding_override = self._allow_front_edge_interactable_grounding_override(
+                    visual_candidate=visual_candidate,
+                    receptacle=grounded,
+                    grounding=visual_receptacle_grounding,
+                    interactable_guidance=grounding_interactable_guidance,
+                )
+                if front_edge_grounding_override.get("needs_approach"):
+                    return {
+                        "status": "error",
+                        "schema_version": 2,
+                        "result_type": "error_receptacle_too_far",
+                        "message": "The front-edge receptacle is visible, but the current robot pose is not an AI2-THOR interactable pose for it.",
+                        "holding_object": True,
+                        "visual_candidate": visual_candidate,
+                        "inventory": inventory,
+                        "candidates": candidates,
+                        "visual_receptacle_grounding": visual_receptacle_grounding,
+                        "visual_receptacle_grounding_passed": False,
+                        "visual_receptacle_grounding_result_type": visual_receptacle_grounding.get("result_type"),
+                        "visual_receptacle_target_instance_ratio": visual_receptacle_grounding.get("target_instance_ratio"),
+                        "visual_box_ambiguous": visual_receptacle_grounding.get("box_ambiguous"),
+                        "interactable_pose_guidance": grounding_interactable_guidance,
+                        "executor_action_hint": grounding_interactable_guidance.get("recommended_action"),
+                        "interactable_current_pose": bool(grounding_interactable_guidance.get("current_pose_interactable", False)),
+                        "interactable_pose_count": grounding_interactable_guidance.get("interactable_pose_count"),
+                        "interactable_distance_bucket": grounding_interactable_guidance.get("distance_bucket"),
+                        "interactable_angle_bucket": grounding_interactable_guidance.get("angle_bucket"),
+                        "grounding_policy": grounding_policy,
+                        "visual_grounding_required": bool(strict_visual_grounding),
+                        "visual_candidate_received": visual_candidate_received,
+                        "visual_candidate_label": self._visual_candidate_label(visual_candidate),
+                    }
+                if front_edge_grounding_override.get("passed"):
+                    visual_receptacle_grounding = {
+                        **visual_receptacle_grounding,
+                        "passed": True,
+                        "result_type": "visual_receptacle_front_edge_interactable_grounded",
+                        "message": "The front-edge receptacle box is accepted because the grounded AI2-THOR receptacle is interactable from the current pose.",
+                        "evidence_source": "front_edge_interactable_pose_override",
+                        "front_edge_interactable_override": True,
+                        "interactable_pose_count": grounding_interactable_guidance.get("interactable_pose_count"),
+                    }
+                else:
+                    return {
+                        "status": "error",
+                        "schema_version": 2,
+                        "result_type": str(
+                            visual_receptacle_grounding.get("result_type")
+                            or "error_visual_receptacle_not_grounded"
+                        ),
+                        "message": str(
+                            visual_receptacle_grounding.get("message")
+                            or "The visual receptacle candidate is not grounded on an actionable instance."
+                        ),
+                        "holding_object": True,
+                        "visual_candidate": visual_candidate,
+                        "inventory": inventory,
+                        "candidates": candidates,
+                        "visual_receptacle_grounding": visual_receptacle_grounding,
+                        "visual_receptacle_grounding_passed": False,
+                        "visual_receptacle_grounding_result_type": visual_receptacle_grounding.get("result_type"),
+                        "visual_receptacle_target_instance_ratio": visual_receptacle_grounding.get("target_instance_ratio"),
+                        "visual_box_ambiguous": visual_receptacle_grounding.get("box_ambiguous"),
+                        "interactable_pose_guidance": grounding_interactable_guidance,
+                        "executor_action_hint": grounding_interactable_guidance.get("recommended_action"),
+                        "interactable_current_pose": bool(grounding_interactable_guidance.get("current_pose_interactable", False))
+                        if grounding_interactable_guidance
+                        else None,
+                        "interactable_pose_count": grounding_interactable_guidance.get("interactable_pose_count")
+                        if grounding_interactable_guidance
+                        else None,
+                        "interactable_distance_bucket": grounding_interactable_guidance.get("distance_bucket")
+                        if grounding_interactable_guidance
+                        else None,
+                        "interactable_angle_bucket": grounding_interactable_guidance.get("angle_bucket")
+                        if grounding_interactable_guidance
+                        else None,
+                        "grounding_policy": grounding_policy,
+                        "visual_grounding_required": bool(strict_visual_grounding),
+                        "visual_candidate_received": visual_candidate_received,
+                        "visual_candidate_label": self._visual_candidate_label(visual_candidate),
+                    }
             if not bool(visual_receptacle_grounding.get("passed", False)):
                 return {
                     "status": "error",
@@ -1031,7 +1144,6 @@ class RobotEnvironment:
             grounded["visual_receptacle_grounding_passed"] = True
             grounded["visual_receptacle_grounding_result_type"] = visual_receptacle_grounding.get("result_type")
             grounded["visual_receptacle_target_instance_ratio"] = visual_receptacle_grounding.get("target_instance_ratio")
-            visual_candidate_stats = self._visual_bbox_stats(visual_candidate)
             if (
                 visual_receptacle_grounding.get("broad_front_receptacle")
                 or visual_candidate_stats.get("broad_front_receptacle")
@@ -1104,13 +1216,34 @@ class RobotEnvironment:
         event = None
         receptacle = eligible[0]
         attempts: List[JsonDict] = []
+        interactable_guidance: JsonDict = {}
         allow_wide_fallback = _env_bool("ROBOT_ALLOW_RECEPTACLE_WIDE_PLACE_FALLBACK", False)
         place_force_action = _env_bool("ROBOT_PLACE_FORCE_ACTION", False)
         allow_front_edge_object_fallback = _env_bool("ROBOT_PLACE_FRONT_EDGE_OBJECT_ID_FALLBACK", True)
         front_edge_force_action = _env_bool("ROBOT_PLACE_FRONT_EDGE_FORCE_ACTION", True)
+        precheck_interactable_pose = _env_bool("ROBOT_PLACE_PRECHECK_INTERACTABLE_POSE", True)
 
         for candidate in eligible:
             receptacle = candidate
+            candidate_guidance = self._object_interactable_navigation_guidance(candidate.get("objectId"))
+            if candidate_guidance:
+                interactable_guidance = candidate_guidance
+                attempts.append(
+                    {
+                        "mode": "receptacle_interactable_pose_precheck",
+                        "receptacle": candidate,
+                        "available": bool(candidate_guidance.get("available", False)),
+                        "current_pose_interactable": bool(candidate_guidance.get("current_pose_interactable", False)),
+                        "recommended_action": candidate_guidance.get("recommended_action"),
+                        "reason": candidate_guidance.get("reason"),
+                    }
+                )
+                if (
+                    precheck_interactable_pose
+                    and bool(candidate_guidance.get("available", False))
+                    and not bool(candidate_guidance.get("current_pose_interactable", False))
+                ):
+                    continue
             place_points = self._visual_place_points(visual_candidate, candidate)
             if place_points:
                 for point_index, (x_norm, y_norm) in enumerate(place_points, start=1):
@@ -1223,6 +1356,33 @@ class RobotEnvironment:
                 break
 
         if event is None:
+            if (
+                interactable_guidance
+                and bool(interactable_guidance.get("available", False))
+                and not bool(interactable_guidance.get("current_pose_interactable", False))
+            ):
+                return {
+                    "status": "error",
+                    "schema_version": 2,
+                    "result_type": "error_receptacle_too_far",
+                    "message": "The grounded receptacle is visible, but the current robot pose is not an AI2-THOR interactable pose for it.",
+                    "holding_object": True,
+                    "inventory": inventory,
+                    "candidates": candidates,
+                    "attempts": attempts,
+                    "interactable_pose_guidance": interactable_guidance,
+                    "executor_action_hint": interactable_guidance.get("recommended_action"),
+                    "interactable_current_pose": bool(interactable_guidance.get("current_pose_interactable", False)),
+                    "interactable_pose_count": interactable_guidance.get("interactable_pose_count"),
+                    "interactable_distance_bucket": interactable_guidance.get("distance_bucket"),
+                    "interactable_angle_bucket": interactable_guidance.get("angle_bucket"),
+                    "visual_candidate": visual_candidate,
+                    "grounding_policy": grounding_policy,
+                    "visual_grounding_required": bool(strict_visual_grounding),
+                    "visual_candidate_received": visual_candidate_received,
+                    "visual_candidate_label": self._visual_candidate_label(visual_candidate),
+                    "failed_candidate_id": failed_candidate_id,
+                }
             return {
                 "status": "error",
                 "schema_version": 2,
@@ -1271,6 +1431,12 @@ class RobotEnvironment:
             "object_reachable_from_agent": bool(placement_validation.get("object_reachable_from_agent", False)),
             "placement_distance_bucket": placement_validation.get("distance_bucket"),
             "placement_angle_bucket": placement_validation.get("angle_bucket"),
+            "interactable_pose_guidance": interactable_guidance,
+            "executor_action_hint": interactable_guidance.get("recommended_action") if interactable_guidance else None,
+            "interactable_current_pose": bool(interactable_guidance.get("current_pose_interactable", False)) if interactable_guidance else None,
+            "interactable_pose_count": interactable_guidance.get("interactable_pose_count") if interactable_guidance else None,
+            "interactable_distance_bucket": interactable_guidance.get("distance_bucket") if interactable_guidance else None,
+            "interactable_angle_bucket": interactable_guidance.get("angle_bucket") if interactable_guidance else None,
             "visual_receptacle_grounding": visual_receptacle_grounding,
             "visual_receptacle_grounding_passed": bool(visual_receptacle_grounding.get("passed", False)),
             "visual_receptacle_grounding_result_type": visual_receptacle_grounding.get("result_type"),
@@ -1284,6 +1450,226 @@ class RobotEnvironment:
             "visual_candidate_label": self._visual_candidate_label(visual_candidate),
         }
 
+    def precheck_place_candidate(
+        self,
+        visual_candidate: Optional[JsonDict] = None,
+        strict_visual_grounding: bool = False,
+    ) -> JsonDict:
+        """Online-safe dry check for whether the current pose can try PutObject."""
+        visual_candidate = self._normalize_visual_candidate(visual_candidate)
+        visual_candidate_received = bool(visual_candidate)
+        failed_candidate_id = self._visual_candidate_id(visual_candidate)
+        grounding_policy = (
+            "metadata_hidden_visual_candidate"
+            if visual_candidate_received or strict_visual_grounding
+            else "legacy_metadata_front_candidate"
+        )
+
+        def result(
+            *,
+            status: str,
+            result_type: str,
+            message: str,
+            precheck_ok: bool,
+            suggested_recovery: Optional[str] = None,
+            **extra: Any,
+        ) -> JsonDict:
+            payload: JsonDict = {
+                "status": status,
+                "schema_version": 2,
+                "result_type": result_type,
+                "message": message,
+                "precheck_supported": True,
+                "precheck_ok": bool(precheck_ok),
+                "precheck_reason": result_type,
+                "suggested_recovery": suggested_recovery,
+                "failed_candidate_id": failed_candidate_id,
+                "grounding_policy": grounding_policy,
+                "visual_grounding_required": bool(strict_visual_grounding),
+                "visual_candidate_received": visual_candidate_received,
+                "visual_candidate_label": self._visual_candidate_label(visual_candidate),
+                "failed_candidate_id": failed_candidate_id,
+            }
+            payload.update(extra)
+            return payload
+
+        inventory = self.get_inventory_state()
+        if not bool(inventory.get("holding_object", False)):
+            return result(
+                status="error",
+                result_type="error_no_held_object",
+                message="Robot is not holding an object.",
+                precheck_ok=False,
+                suggested_recovery="search_pickup_target",
+                holding_object=False,
+                inventory=inventory,
+            )
+
+        candidates = self._get_visible_receptacle_candidates()
+        if not candidates:
+            return result(
+                status="error",
+                result_type="error_no_receptacle_in_front",
+                message="No visible place receptacle is currently eligible.",
+                precheck_ok=False,
+                suggested_recovery="search_receptacle",
+                holding_object=True,
+                inventory=inventory,
+                candidates=[],
+            )
+
+        visual_receptacle_grounding: JsonDict = {}
+        if visual_candidate_received or strict_visual_grounding:
+            grounded = self._ground_visual_service_candidate(
+                candidates,
+                visual_candidate=visual_candidate,
+                task_semantic_class="place_receptacle",
+            )
+            if grounded is None:
+                return result(
+                    status="error",
+                    result_type="error_visual_receptacle_not_grounded",
+                    message="The executor could not ground the visual receptacle candidate to a visible AI2-THOR object.",
+                    precheck_ok=False,
+                    suggested_recovery="search_receptacle",
+                    holding_object=True,
+                    inventory=inventory,
+                    candidates=candidates,
+                )
+            guidance = self._object_interactable_navigation_guidance(grounded.get("objectId"))
+            visual_receptacle_grounding = self._validate_visual_receptacle_grounding(visual_candidate, grounded)
+            if not bool(visual_receptacle_grounding.get("passed", False)):
+                override = self._allow_front_edge_interactable_grounding_override(
+                    visual_candidate=visual_candidate,
+                    receptacle=grounded,
+                    grounding=visual_receptacle_grounding,
+                    interactable_guidance=guidance,
+                )
+                if override.get("passed"):
+                    visual_receptacle_grounding = {
+                        **visual_receptacle_grounding,
+                        "passed": True,
+                        "result_type": "visual_receptacle_front_edge_interactable_grounded",
+                    }
+                else:
+                    suggested = guidance.get("recommended_action") if isinstance(guidance, dict) else None
+                    return result(
+                        status="error",
+                        result_type=str(
+                            visual_receptacle_grounding.get("result_type")
+                            or "error_visual_receptacle_not_grounded"
+                        ),
+                        message=str(
+                            visual_receptacle_grounding.get("message")
+                            or "The visual receptacle candidate is not grounded on an actionable instance."
+                        ),
+                        precheck_ok=False,
+                        suggested_recovery=str(suggested or "search_receptacle"),
+                        holding_object=True,
+                        inventory=inventory,
+                        visual_receptacle_grounding=visual_receptacle_grounding,
+                        visual_receptacle_grounding_passed=False,
+                        visual_receptacle_grounding_result_type=visual_receptacle_grounding.get("result_type"),
+                        visual_box_ambiguous=visual_receptacle_grounding.get("box_ambiguous"),
+                        executor_action_hint=guidance.get("recommended_action") if isinstance(guidance, dict) else None,
+                        interactable_current_pose=bool(guidance.get("current_pose_interactable", False))
+                        if isinstance(guidance, dict)
+                        else None,
+                        interactable_pose_count=guidance.get("interactable_pose_count") if isinstance(guidance, dict) else None,
+                        interactable_distance_bucket=guidance.get("distance_bucket") if isinstance(guidance, dict) else None,
+                        interactable_angle_bucket=guidance.get("angle_bucket") if isinstance(guidance, dict) else None,
+                    )
+            grounded["visual_receptacle_grounding_passed"] = True
+            grounded["visual_receptacle_grounding_result_type"] = visual_receptacle_grounding.get("result_type")
+            candidates = [grounded]
+
+        eligible = [c for c in candidates if c.get("place_rule_passed")]
+        if not eligible:
+            result_type = self._infer_place_reject_type(candidates)
+            return result(
+                status="error",
+                result_type=result_type,
+                message="Visible receptacles do not satisfy front/near/receptacle constraints.",
+                precheck_ok=False,
+                suggested_recovery="align" if result_type == "error_receptacle_not_centered" else "approach",
+                holding_object=True,
+                inventory=inventory,
+                candidates=candidates,
+            )
+
+        eligible.sort(
+            key=lambda c: (
+                0 if c.get("visual_front_edge_place_ready") else 1,
+                0 if c.get("visual_front_center_override") else 1,
+                c.get("ground_distance", float("inf")),
+            )
+        )
+        attempts: List[JsonDict] = []
+        for candidate in eligible:
+            guidance = self._object_interactable_navigation_guidance(candidate.get("objectId"))
+            if (
+                _env_bool("ROBOT_PLACE_PRECHECK_INTERACTABLE_POSE", True)
+                and bool(guidance.get("available", False))
+                and not bool(guidance.get("current_pose_interactable", False))
+            ):
+                attempts.append(
+                    {
+                        "mode": "receptacle_interactable_pose_precheck",
+                        "available": bool(guidance.get("available", False)),
+                        "current_pose_interactable": False,
+                        "recommended_action": guidance.get("recommended_action"),
+                        "reason": guidance.get("reason"),
+                    }
+                )
+                continue
+            place_points = self._visual_place_points(visual_candidate, candidate)
+            attempts.append(
+                {
+                    "mode": "screen_xy_near_visual_candidate",
+                    "point_count": len(place_points),
+                    "interactable_current_pose": bool(guidance.get("current_pose_interactable", False))
+                    if guidance
+                    else None,
+                }
+            )
+            if place_points:
+                return result(
+                    status="success",
+                    result_type="place_precheck_ok",
+                    message="Visual surface candidate has a grounded receptacle and controlled screen placement point.",
+                    precheck_ok=True,
+                    suggested_recovery=None,
+                    holding_object=True,
+                    inventory=inventory,
+                    visual_receptacle_grounding=visual_receptacle_grounding,
+                    visual_receptacle_grounding_passed=bool(visual_receptacle_grounding.get("passed", False)),
+                    visual_receptacle_grounding_result_type=visual_receptacle_grounding.get("result_type"),
+                    placement_attempt_count=len(place_points),
+                    placement_attempt_modes=["screen_xy_near_visual_candidate"],
+                    interactable_current_pose=bool(guidance.get("current_pose_interactable", False)) if guidance else None,
+                    interactable_pose_count=guidance.get("interactable_pose_count") if guidance else None,
+                    interactable_distance_bucket=guidance.get("distance_bucket") if guidance else None,
+                    interactable_angle_bucket=guidance.get("angle_bucket") if guidance else None,
+                )
+
+        suggested = None
+        for attempt in attempts:
+            if attempt.get("recommended_action"):
+                suggested = str(attempt.get("recommended_action"))
+                break
+        return result(
+            status="error",
+            result_type="error_place_no_reachable_point",
+            message="No controlled reachable placement point is available for this surface candidate.",
+            precheck_ok=False,
+            suggested_recovery=suggested or "search_receptacle",
+            holding_object=True,
+            inventory=inventory,
+            attempts=attempts,
+            placement_attempt_count=0,
+            placement_attempt_modes=["screen_xy_near_visual_candidate"],
+        )
+
     def _normalize_visual_candidate(self, candidate: Optional[JsonDict]) -> JsonDict:
         if not isinstance(candidate, dict):
             return {}
@@ -1291,15 +1677,41 @@ class RobotEnvironment:
         for key in (
             "schema_version",
             "role",
+            "id",
+            "surface_candidate_id",
             "label",
             "raw_label",
             "task_semantic_class",
+            "region_type",
+            "region_bbox",
+            "region_area_px",
+            "region_area_ratio",
+            "parent_object",
+            "parent_label",
+            "source",
+            "surface_candidate_source",
             "confidence",
             "position_hint",
             "surface_hint",
+            "floor_level_source",
+            "projected_height_warning",
+            "context_only",
+            "context_reason",
+            "blocked",
+            "score",
+            "height",
+            "distance",
+            "ground_distance",
+            "height_m",
+            "distance_m",
+            "bearing_deg",
             "reachable",
             "pickup_now",
             "place_now",
+            "visual_place_ready",
+            "final_place_ready",
+            "failed_recently",
+            "cooldown_remaining",
             "needs_alignment",
             "needs_approach",
             "is_floor_level",
@@ -1313,10 +1725,30 @@ class RobotEnvironment:
         ):
             if key in candidate:
                 safe[key] = candidate.get(key)
-        for key in ("bbox", "center", "interaction_point", "geometry"):
+        for key in (
+            "bbox",
+            "center",
+            "interaction_point",
+            "geometry",
+            "depth",
+            "center_3d",
+            "parent_bbox",
+            "region_bbox",
+            "geometry_checks",
+            "occupancy_checks",
+            "memory_checks",
+            "executor_checks",
+        ):
             value = candidate.get(key)
             if isinstance(value, dict):
                 safe[key] = dict(value)
+        for key in ("visible_occupants", "placement_avoidance_candidates", "blocked_by", "affordance", "rejection_reasons"):
+            value = candidate.get(key)
+            if isinstance(value, list):
+                if key in {"blocked_by", "affordance", "rejection_reasons"}:
+                    safe[key] = [str(item) for item in value]
+                else:
+                    safe[key] = [dict(item) for item in value if isinstance(item, dict)]
         return safe
 
     def _visual_candidate_label(self, candidate: JsonDict) -> Optional[str]:
@@ -1324,6 +1756,15 @@ class RobotEnvironment:
             return None
         label = candidate.get("raw_label") or candidate.get("label")
         return str(label) if label else None
+
+    def _visual_candidate_id(self, candidate: JsonDict) -> Optional[str]:
+        if not isinstance(candidate, dict):
+            return None
+        for key in ("failed_candidate_id", "surface_candidate_id", "id"):
+            value = candidate.get(key)
+            if value:
+                return str(value)
+        return None
 
     def _label_token(self, value: Any) -> str:
         text = str(value or "").lower()
@@ -1794,6 +2235,52 @@ class RobotEnvironment:
             "interaction_point": {"x": round(place_point[0], 3), "y": round(place_point[1], 3)},
             **stats,
             **evidence,
+        }
+
+    def _allow_front_edge_interactable_grounding_override(
+        self,
+        *,
+        visual_candidate: JsonDict,
+        receptacle: JsonDict,
+        grounding: JsonDict,
+        interactable_guidance: JsonDict,
+    ) -> JsonDict:
+        """Bridge YOLO front-edge boxes with AI2-THOR interactable-pose grounding.
+
+        CounterTop front edges often occupy a visible, reachable screen strip
+        whose instance mask does not overlap the selected tabletop object well.
+        ALFRED-style execution should trust the simulator's interactable pose
+        check more than that mask failure, but only for front-edge receptacles.
+        """
+        if not _env_bool("ROBOT_PLACE_FRONT_EDGE_INTERACTABLE_OVERRIDE", True):
+            return {"passed": False, "reason": "front_edge_interactable_override_disabled"}
+
+        result_type = str(grounding.get("result_type") or "")
+        if result_type not in {
+            "error_visual_receptacle_instance_mismatch",
+            "error_visual_receptacle_not_grounded",
+        }:
+            return {"passed": False, "reason": "non_overridable_grounding_failure"}
+
+        stats = self._visual_bbox_stats(visual_candidate)
+        if not bool(stats.get("front_edge_receptacle") or stats.get("broad_front_receptacle")):
+            return {"passed": False, "reason": "not_front_edge_receptacle"}
+        if not bool(receptacle.get("allowed_place_receptacle") and receptacle.get("receptacle")):
+            return {"passed": False, "reason": "not_actionable_receptacle"}
+        if not bool(interactable_guidance.get("available", False)):
+            return {"passed": False, "reason": "interactable_pose_unavailable"}
+
+        if not bool(interactable_guidance.get("current_pose_interactable", False)):
+            action = str(interactable_guidance.get("recommended_action") or "")
+            return {
+                "passed": False,
+                "needs_approach": action in {"MoveAhead", "MoveBack", "RotateLeft", "RotateRight"},
+                "reason": "front_edge_receptacle_needs_interactable_pose",
+            }
+
+        return {
+            "passed": True,
+            "reason": "front_edge_receptacle_current_pose_interactable",
         }
 
     def _ground_visual_service_candidate(
@@ -2302,14 +2789,87 @@ class RobotEnvironment:
             return "side"
         return "outside-front"
 
+    def _visual_avoidance_boxes(self, visual_candidate: JsonDict) -> List[Tuple[str, Tuple[float, float, float, float]]]:
+        boxes: List[Tuple[str, Tuple[float, float, float, float]]] = []
+        seen: Set[Tuple[int, int, int, int, str]] = set()
+        for key in ("visible_occupants", "placement_avoidance_candidates"):
+            items = visual_candidate.get(key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                bbox = self._visual_bbox(item)
+                if bbox is None:
+                    continue
+                label = str(item.get("raw_label") or item.get("label") or "object")
+                x1, y1, x2, y2 = bbox
+                key_tuple = (
+                    int(round(x1)),
+                    int(round(y1)),
+                    int(round(x2)),
+                    int(round(y2)),
+                    label.lower(),
+                )
+                if key_tuple in seen:
+                    continue
+                seen.add(key_tuple)
+                boxes.append((label, bbox))
+        return boxes
+
+    def _visual_place_point_blocked(self, visual_candidate: JsonDict, x_norm: float, y_norm: float) -> bool:
+        boxes = self._visual_avoidance_boxes(visual_candidate)
+        if not boxes:
+            return False
+        px = min(0.99, max(0.0, float(x_norm))) * max(1.0, float(self.width))
+        py = min(0.99, max(0.0, float(y_norm))) * max(1.0, float(self.height))
+        margin_x = _env_float("ROBOT_PLACE_AVOIDANCE_MARGIN_X_PIXELS", 20.0)
+        margin_y = _env_float("ROBOT_PLACE_AVOIDANCE_MARGIN_Y_PIXELS", 16.0)
+        for _, bbox in boxes:
+            x1, y1, x2, y2 = bbox
+            if (x1 - margin_x) <= px <= (x2 + margin_x) and (y1 - margin_y) <= py <= (y2 + margin_y):
+                return True
+        return False
+
+    def _visual_place_clearance_score(self, visual_candidate: JsonDict, x_norm: float, y_norm: float) -> float:
+        """Return clearance from real avoidance boxes, or -1 if inside one.
+
+        The normal point filter uses a safety margin around visible objects. If
+        that margin removes every sampled point on a cluttered tabletop, use this
+        stricter score as a fallback: never place inside an object's actual box,
+        but allow trying the farthest gap between objects.
+        """
+        boxes = self._visual_avoidance_boxes(visual_candidate)
+        if not boxes:
+            return float("inf")
+        px = min(0.99, max(0.0, float(x_norm))) * max(1.0, float(self.width))
+        py = min(0.99, max(0.0, float(y_norm))) * max(1.0, float(self.height))
+        best = float("inf")
+        for _, bbox in boxes:
+            x1, y1, x2, y2 = bbox
+            if x1 <= px <= x2 and y1 <= py <= y2:
+                return -1.0
+            dx = max(x1 - px, 0.0, px - x2)
+            dy = max(y1 - py, 0.0, py - y2)
+            best = min(best, math.hypot(dx, dy))
+        return best
+
     def _visual_place_points(self, visual_candidate: JsonDict, receptacle: JsonDict) -> List[Tuple[float, float]]:
         points: List[Tuple[float, float]] = []
+        relaxed_points: List[Tuple[float, float, float]] = []
         seen: Set[Tuple[int, int]] = set()
+        relaxed_seen: Set[Tuple[int, int]] = set()
 
         def add_point(x_norm: float, y_norm: float) -> None:
             x_clamped = min(0.95, max(0.05, float(x_norm)))
             y_clamped = min(0.95, max(0.05, float(y_norm)))
             key = (int(round(x_clamped * 1000)), int(round(y_clamped * 1000)))
+            if self._visual_place_point_blocked(visual_candidate, x_clamped, y_clamped):
+                score = self._visual_place_clearance_score(visual_candidate, x_clamped, y_clamped)
+                if score >= 0.0 and key not in relaxed_seen:
+                    relaxed_seen.add(key)
+                    relaxed_points.append((score, x_clamped, y_clamped))
+                return
             if key in seen:
                 return
             seen.add(key)
@@ -2335,14 +2895,14 @@ class RobotEnvironment:
                 0.62 if broad_front else 0.88,
             )
             if broad_front:
-                y_ratios = [base_y_ratio, 0.46, 0.54, 0.62, 0.70, 0.78]
-                x_ratios = [0.50, 0.42, 0.58]
+                y_ratios = [base_y_ratio, 0.42, 0.50, 0.58, 0.66, 0.74, 0.82]
+                x_ratios = [0.50, 0.35, 0.65, 0.25, 0.75, 0.45, 0.55]
                 y_min, y_max = 0.32, 0.88
             else:
-                y_ratios = [base_y_ratio, 0.78, 0.88]
-                x_ratios = [0.50]
+                y_ratios = [base_y_ratio, 0.72, 0.82, 0.90]
+                x_ratios = [0.50, 0.40, 0.60]
                 y_min, y_max = 0.50, 0.95
-            max_points = max(1, int(_env_float("ROBOT_PLACE_VISUAL_MAX_POINTS", 12.0)))
+            max_points = max(1, int(_env_float("ROBOT_PLACE_VISUAL_MAX_POINTS", 28.0 if broad_front else 12.0)))
             for y_ratio in y_ratios:
                 y_ratio = min(y_max, max(y_min, float(y_ratio)))
                 for x_ratio in x_ratios:
@@ -2357,9 +2917,28 @@ class RobotEnvironment:
             width = max(1.0, float(self.width))
             height = max(1.0, float(self.height))
             add_point(visual_point[0] / width, visual_point[1] / height)
+        if not points and relaxed_points:
+            max_relaxed = max(1, int(_env_float("ROBOT_PLACE_RELAXED_VISUAL_MAX_POINTS", 8.0)))
+            for _, x_norm, y_norm in sorted(relaxed_points, key=lambda item: item[0], reverse=True)[:max_relaxed]:
+                key = (int(round(x_norm * 1000)), int(round(y_norm * 1000)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                points.append((x_norm, y_norm))
         return points
 
     def _visual_place_point(self, visual_candidate: JsonDict, receptacle: JsonDict) -> Optional[Tuple[float, float]]:
+        if visual_candidate.get("surface_candidate_source") == "depth_geometry":
+            point = self._visual_point({"interaction_point": visual_candidate.get("interaction_point")})
+            if point is not None:
+                width = max(1.0, float(self.width))
+                height = max(1.0, float(self.height))
+                px, py = point
+                return (
+                    min(0.95, max(0.05, px / width)),
+                    min(0.95, max(0.05, py / height)),
+                )
+
         instance_evidence = self._instance_bbox_evidence(
             target_object_id=receptacle.get("objectId"),
             visual_candidate=visual_candidate,
@@ -2531,6 +3110,157 @@ class RobotEnvironment:
             "reason": "current_pose_interactable" if matched_pose is not None else "current_pose_not_in_interactable_poses",
             "interactable_pose_count": len(poses),
             "matched_pose": matched_pose,
+        }
+
+    def _object_interactable_navigation_guidance(self, object_id: Any) -> JsonDict:
+        """Return an online-safe action hint toward an AI2-THOR interactable pose."""
+        if not object_id:
+            return {
+                "available": False,
+                "current_pose_interactable": False,
+                "reason": "missing_object_id",
+                "interactable_pose_count": 0,
+                "recommended_action": None,
+            }
+
+        try:
+            event = self.controller.step(action="GetInteractablePoses", objectId=str(object_id))
+        except Exception as exc:
+            return {
+                "available": False,
+                "current_pose_interactable": False,
+                "reason": "get_interactable_poses_exception",
+                "error_message": str(exc),
+                "interactable_pose_count": 0,
+                "recommended_action": None,
+            }
+        self.last_event = event
+
+        metadata = event.metadata if hasattr(event, "metadata") and isinstance(event.metadata, dict) else {}
+        if not bool(metadata.get("lastActionSuccess", False)):
+            return {
+                "available": False,
+                "current_pose_interactable": False,
+                "reason": "get_interactable_poses_failed",
+                "error_message": metadata.get("errorMessage", ""),
+                "interactable_pose_count": 0,
+                "recommended_action": None,
+            }
+
+        poses = metadata.get("actionReturn") or []
+        poses = poses if isinstance(poses, list) else []
+        agent = metadata.get("agent") if isinstance(metadata.get("agent"), dict) else {}
+        matched_pose = self._match_current_agent_interactable_pose(agent, poses)
+        if matched_pose is not None:
+            return {
+                "available": True,
+                "current_pose_interactable": True,
+                "reason": "current_pose_interactable",
+                "interactable_pose_count": len(poses),
+                "recommended_action": None,
+                "distance_bucket": "near",
+                "angle_bucket": "front-center",
+            }
+
+        nearest = self._nearest_interactable_pose(agent, poses)
+        if nearest is None:
+            return {
+                "available": bool(poses),
+                "current_pose_interactable": False,
+                "reason": "no_usable_interactable_pose",
+                "interactable_pose_count": len(poses),
+                "recommended_action": None,
+            }
+
+        return self._interactable_pose_action_hint(agent, nearest, len(poses))
+
+    def _nearest_interactable_pose(self, agent: JsonDict, poses: List[JsonDict]) -> Optional[JsonDict]:
+        position = agent.get("position") if isinstance(agent.get("position"), dict) else {}
+        rotation = agent.get("rotation") if isinstance(agent.get("rotation"), dict) else {}
+        try:
+            agent_x = float(position.get("x"))
+            agent_z = float(position.get("z"))
+            agent_rot = float(rotation.get("y", 0.0)) % 360.0
+        except (TypeError, ValueError):
+            return None
+
+        def angle_delta(a: float, b: float) -> float:
+            return (a - b + 180.0) % 360.0 - 180.0
+
+        best: Optional[Tuple[float, JsonDict]] = None
+        for pose in poses:
+            if not isinstance(pose, dict):
+                continue
+            try:
+                pose_x = float(pose.get("x"))
+                pose_z = float(pose.get("z"))
+                pose_rot = float(pose.get("rotation", agent_rot)) % 360.0
+            except (TypeError, ValueError):
+                continue
+            distance = math.hypot(pose_x - agent_x, pose_z - agent_z)
+            rot_penalty = abs(angle_delta(pose_rot, agent_rot)) / 180.0
+            score = distance + 0.08 * rot_penalty
+            if best is None or score < best[0]:
+                best = (score, pose)
+        return dict(best[1]) if best is not None else None
+
+    def _interactable_pose_action_hint(self, agent: JsonDict, pose: JsonDict, pose_count: int) -> JsonDict:
+        position = agent.get("position") if isinstance(agent.get("position"), dict) else {}
+        rotation = agent.get("rotation") if isinstance(agent.get("rotation"), dict) else {}
+        try:
+            agent_x = float(position.get("x"))
+            agent_z = float(position.get("z"))
+            agent_rot = float(rotation.get("y", 0.0)) % 360.0
+            pose_x = float(pose.get("x"))
+            pose_z = float(pose.get("z"))
+            pose_rot = float(pose.get("rotation", agent_rot)) % 360.0
+        except (TypeError, ValueError):
+            return {
+                "available": False,
+                "current_pose_interactable": False,
+                "reason": "invalid_interactable_pose",
+                "interactable_pose_count": pose_count,
+                "recommended_action": None,
+            }
+
+        def signed_delta(a: float, b: float) -> float:
+            return (a - b + 180.0) % 360.0 - 180.0
+
+        dx = pose_x - agent_x
+        dz = pose_z - agent_z
+        distance = math.hypot(dx, dz)
+        target_angle = math.degrees(math.atan2(dx, dz)) % 360.0
+        move_delta = signed_delta(target_angle, agent_rot)
+        rot_delta = signed_delta(pose_rot, agent_rot)
+        pos_tol = _env_float("ROBOT_INTERACTABLE_POSE_APPROACH_TOL", 0.08)
+        align_tol = _env_float("ROBOT_INTERACTABLE_POSE_ALIGN_TOL_DEG", 10.0)
+        forward_cone = _env_float("ROBOT_INTERACTABLE_POSE_FORWARD_CONE_DEG", 25.0)
+
+        if distance > pos_tol:
+            if abs(move_delta) > forward_cone:
+                action = "RotateLeft" if move_delta < 0 else "RotateRight"
+                reason = "turn_toward_nearest_interactable_pose"
+            else:
+                action = "MoveAhead"
+                reason = "approach_nearest_interactable_pose"
+            angle_abs = abs(move_delta)
+        elif abs(rot_delta) > align_tol:
+            action = "RotateLeft" if rot_delta < 0 else "RotateRight"
+            reason = "align_to_nearest_interactable_pose"
+            angle_abs = abs(rot_delta)
+        else:
+            action = None
+            reason = "nearest_pose_requires_unavailable_camera_or_stance_adjustment"
+            angle_abs = 0.0
+
+        return {
+            "available": True,
+            "current_pose_interactable": False,
+            "reason": reason,
+            "interactable_pose_count": pose_count,
+            "recommended_action": action,
+            "distance_bucket": self._distance_bucket(distance),
+            "angle_bucket": self._angle_bucket(angle_abs),
         }
 
     def _match_current_agent_interactable_pose(
