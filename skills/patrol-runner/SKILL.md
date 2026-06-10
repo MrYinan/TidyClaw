@@ -1,98 +1,94 @@
 ---
 name: patrol-runner
-description: Start, continue, inspect, or stop the single-room household service patrol runner.
-metadata:
-  {
-    "openclaw":
-      {
-        "emoji": "patrol",
-        "requires": { "bins": ["python3"] }
-      }
-  }
+description: 启动、继续、查看或停止单房间家庭服务巡视 runner。
+disable-model-invocation: true
+metadata: {"openclaw":{"emoji":"patrol","requires":{"bins":["python3"]}}}
 ---
 
-# Household Service Patrol Runner
+# 家庭服务巡视 Runner
 
-This skill is the OpenClaw entry point for `scripts/patrol_runner.py`.
+该 skill 是 OpenClaw 调用 `scripts/patrol_runner.py` 的正式入口。
 
-It schedules the existing skills in a closed loop:
+它会把已有技能串成一个闭环：
 
 ```text
-get-vision -> perceive/analyze scene -> decide -> move/pick/place/clean -> verify -> navigation-memory -> state-manager
+get-vision -> perceive/analyze scene -> local RGB-D costmap -> semantic/A* navigation -> decide -> move/pick/place/clean -> verify -> navigation-memory -> state-manager
 ```
 
-## When To Use
+也就是：
 
-Use this skill when the user asks for:
-
-- current-room service patrol
-- automatic tidy mode
-- household-object pickup/place tasks
-- continuous room inspection
-- legacy cleaning patrol
-
-Do not use it for a single manual movement, one image capture, or one isolated scene analysis.
-
-## Modes
-
-Legacy cleaning:
-
-```powershell
-python skills\patrol-runner\scripts\patrol_runner_skill.py --command run --max-steps 200 --task-mode clean
+```text
+先感知 -> 再结构化分析 -> 再决策 -> 执行一个物理动作 -> 验证结果 -> 更新导航记忆和任务状态
 ```
 
-Household service / tidy:
+## 什么时候使用
+
+用户提出以下需求时，使用该 skill：
+
+- 当前房间服务巡视
+- 自动 tidy 整理模式
+- 家庭物体拾取/放置任务
+- 连续房间检查
+- 兼容旧版清扫巡视
+
+不要把它用于单次手动移动、单次拍照或单张图片分析。那些场景应分别使用 `move-robot`、`get-vision` 或感知 skill。
+
+## 模式
+
+
+家庭服务整理模式：
 
 ```powershell
 python skills\patrol-runner\scripts\patrol_runner_skill.py --command run --max-steps 200 --task-mode tidy
 ```
 
-Detached background service patrol:
+后台启动服务巡视：
 
 ```powershell
 python skills\patrol-runner\scripts\patrol_runner_skill.py --command start --max-steps 200 --task-mode tidy
 ```
 
-Status/report:
+查看状态或报告：
 
 ```powershell
 python skills\patrol-runner\scripts\patrol_runner_skill.py --command status
 python skills\patrol-runner\scripts\patrol_runner_skill.py --command report
 ```
 
-Stop:
+停止巡视：
 
 ```powershell
 python skills\patrol-runner\scripts\patrol_runner_skill.py --command stop --reason user_stop
 ```
 
-## Tidy Semantics
+## tidy 语义
 
-`tidy` mode is not a one-shot pickup/place task. It is a room patrol that can complete multiple service subgoals.
+`tidy` 不是一次性的“捡起并放下”动作，而是一个可以连续完成多个服务子任务的房间巡视模式。
 
-One service subgoal:
+一个服务子任务的流程是：
 
 ```text
-find pickup target
--> align/approach
--> pick
--> find receptacle
--> align/approach
--> place
--> record objects_placed and service_tasks_completed
--> continue patrol
+寻找可拾取目标
+-> 对齐/靠近
+-> 拾取
+-> 寻找可放置目标
+-> 对齐/靠近
+-> 放置
+-> 记录 objects_placed 和 service_tasks_completed
+-> 继续巡视
 ```
 
-Important:
+重要规则：
 
-- `place-object` success does not mark the room complete.
-- The runner continues until room-completion, max-step, recover-failed, or user-stop conditions.
-- A just-placed object is temporarily suppressed so the robot does not immediately pick it up again.
-- Tidy pickup defaults to `--pickup-surface-policy floor-only`; tabletop/elevated pickup candidates require an explicit `--pickup-surface-policy any-surface` debug run.
+- `place-object` 成功只表示一个整理子任务完成，不表示房间完成。
+- runner 会继续运行，直到满足房间完成、达到 max-step、recover failed 或用户停止条件。
+- 刚放置成功的物体会被短期抑制，避免机器人马上又把它捡起来。
+- tidy 默认拾取策略是 `--pickup-surface-policy floor-only`。
+- 桌面、台面、架子等 elevated 候选，只有在明确调试 `--pickup-surface-policy any-surface` 时才进入 pickup 子任务。
 
-## Runtime Contract
+## 运行返回
 
-Successful `--command run` returns:
+`--command run` 成功返回：
 
 - `status = success`
 - `result_type = patrol_runner_run_finished`
@@ -103,22 +99,34 @@ Successful `--command run` returns:
 - `notify_user`
 - `user_message`
 
-Successful `--command status` returns:
+`--command status` 成功返回：
 
-- background process state
-- state-manager validation
-- should-continue result
-- current report
-- service task progress when available
+- 后台 runner 进程状态
+- state-manager 校验结果
+- 是否应该继续运行
+- 当前报告
+- 可用时包含 service task 进度
 
-## Agent Rule
+## Agent 规则
 
-When the user asks for continuous patrol, automatic tidy, or service-room inspection, call this skill rather than manually looping inside chat context.
+当用户要求连续巡视、自动整理或当前房间服务检查时，应调用该 skill，而不是在聊天上下文里手工循环调用多个单步技能。
 
-When only a short debug run is needed, direct runner invocation is acceptable:
+短段调试可以直接调用底层 runner：
 
 ```powershell
 python scripts\patrol_runner.py --start --segment-steps 20 --max-steps 80 --perception-backend yolo --task-mode tidy --interaction-grounding metadata-hidden --verbose
 ```
 
-Do not report a short segment as a completed room unless `room_complete=true`.
+不要把一个短段执行结果汇报成房间完成，除非状态明确满足：
+
+```text
+room_complete = true
+```
+
+
+## Local RGB-D navigation safety
+
+`patrol_runner.py` updates `memory/navigation-costmap.json` before every movement decision.
+The costmap masks held-object overlay depth, expands the footprint while carrying an object,
+and validates `MoveAhead`, `MoveBack`, `MoveLeft`, `MoveRight`, `RotateLeft`, and `RotateRight`.
+`LookUp` / `LookDown` remain camera-only active-perception actions.

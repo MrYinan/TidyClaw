@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "name": "execute-option",
+  "role": "validated-option-executor",
+  "status": "experimental-stable-contract",
+  "abstraction_level": "option-execution",
+  "description": "Executes one option_id selected from robot_cleaner_decision_context_v1 after local validation.",
+  "required_inputs": [
+    "memory/decision-context.json"
+  ],
+  "scripts": [
+    "scripts/execute_option.py",
+    "../../scripts/execute_option.py"
+  ],
+  "accepted_selection_schema": {
+    "selected_option_id": "string",
+    "brief_reason": "string"
+  },
+  "supported_option_prefixes": [
+    "observe:",
+    "move:",
+    "pick:",
+    "place:",
+    "clean:",
+    "done:"
+  ],
+  "public_contract": {
+    "selected_option_must_exist": true,
+    "executor_validates": true,
+    "one_physical_action_per_call": true,
+    "blocks_physical_actions_on_consistency_warnings_by_default": true
+  },
+  "future_mcp_tool": "robot_cleaner__execute_option"
+}

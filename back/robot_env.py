@@ -12,6 +12,12 @@ from PIL import Image
 
 
 JsonDict = Dict[str, Any]
+EXPLICIT_SURFACE_PLACE_SOURCES = {
+    "depth_region_geometry",
+    "pointcloud_plane",
+    "pointcloud_plane_completion",
+    "pointcloud_plane_grid_completion",
+}
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -203,6 +209,9 @@ class RobotEnvironment:
         self._initialize_rendering()
         self.last_event = self.controller.step(action="Pass")
 
+        if _env_bool("ROBOT_REMOVE_ORIGINAL_OBJECTS_ON_LOAD", True):
+            self.remove_original_objects_on_load()
+
         if self.mode == "debug":
             self.teleport_to_debug_pose()
 
@@ -320,7 +329,7 @@ class RobotEnvironment:
             "robot": self.get_robot_state(),
             "task_class_schema": {
                 "pickup_target": "visible household object that can be picked up or tidied",
-                "place_receptacle": "visible support/container candidate for PutObject",
+                "place_receptacle": "visible support/container candidate for placement",
                 "obstacle": "large object or geometry that constrains movement",
                 "cleanable_object": "legacy cleanable floor proxy used by the clean skill",
                 "ignored_object": "visible object that is not relevant to the current task",
@@ -384,6 +393,9 @@ class RobotEnvironment:
         self.controller.reset(scene=self.scene)
         self._initialize_rendering()
         self.last_event = self.controller.step(action="Pass")
+
+        if _env_bool("ROBOT_REMOVE_ORIGINAL_OBJECTS_ON_LOAD", True):
+            self.remove_original_objects_on_load()
 
         if initial_pose:
             self.teleport_agent(initial_pose)
@@ -508,6 +520,67 @@ class RobotEnvironment:
     def spawn_trash_in_front(self, distance: float = 0.6) -> JsonDict:
         return self.spawn_task_object(kind="floor_trash", layout="front-center", distance=distance)
 
+    def remove_original_objects_on_load(self) -> JsonDict:
+        """Hide unwanted original AI2-THOR scene objects after scene load/reset.
+
+        Instead of RemoveFromScene, move them underground. This is usually more
+        stable for startup cleanup in AI2-THOR.
+        """
+        remove_types = _env_list("ROBOT_REMOVE_ORIGINAL_OBJECT_TYPES", ("Bread", "CoffeeMachine", "Toaster"))
+
+        removed: List[JsonDict] = []
+        skipped: List[JsonDict] = []
+
+        self.last_event = self.controller.step(action="Pass")
+        objects = list(self.last_event.metadata.get("objects", []))
+
+        for obj in objects:
+            obj_type = str(obj.get("objectType") or "")
+            obj_id = str(obj.get("objectId") or "")
+
+            if obj_type not in remove_types:
+                continue
+            if not obj_id:
+                continue
+
+            print(f"[scene_cleanup] hiding original object: {obj_id}", flush=True)
+
+            event = self.controller.step(
+                action="TeleportObject",
+                objectId=obj_id,
+                position={"x": 0.0, "y": -10.0, "z": 0.0},
+                rotation={"x": 0.0, "y": 0.0, "z": 0.0},
+                forceAction=True,
+            )
+
+            record = {
+                "objectId": obj_id,
+                "objectType": obj_type,
+                "lastActionSuccess": bool(event.metadata.get("lastActionSuccess", False)),
+                "error_message": event.metadata.get("errorMessage", ""),
+                "method": "teleport_underground",
+            }
+
+            if record["lastActionSuccess"]:
+                removed.append(record)
+            else:
+                skipped.append(record)
+
+        self.last_event = self.controller.step(action="Pass")
+
+        result = {
+            "status": "success",
+            "schema_version": 2,
+            "result_type": "original_scene_objects_hidden",
+            "remove_types": sorted(remove_types),
+            "removed_count": len(removed),
+            "removed": removed,
+            "skipped_count": len(skipped),
+            "skipped": skipped,
+        }
+        print(f"[scene_cleanup] {result}", flush=True)
+        return result
+
     def spawn_task_object(
         self,
         *,
@@ -610,7 +683,7 @@ class RobotEnvironment:
     # ------------------------------------------------------------------
 
     def execute_action(self, action_name: str, **kwargs: Any) -> JsonDict:
-        valid_actions = {"MoveAhead", "MoveBack", "RotateLeft", "RotateRight"}
+        valid_actions = {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight", "RotateLeft", "RotateRight", "LookUp", "LookDown"}
         if action_name not in valid_actions:
             return {
                 "status": "error",
@@ -1145,8 +1218,11 @@ class RobotEnvironment:
             grounded["visual_receptacle_grounding_result_type"] = visual_receptacle_grounding.get("result_type")
             grounded["visual_receptacle_target_instance_ratio"] = visual_receptacle_grounding.get("target_instance_ratio")
             if (
-                visual_receptacle_grounding.get("broad_front_receptacle")
-                or visual_candidate_stats.get("broad_front_receptacle")
+                not self._is_explicit_surface_place_candidate(visual_candidate)
+                and (
+                    visual_receptacle_grounding.get("broad_front_receptacle")
+                    or visual_candidate_stats.get("broad_front_receptacle")
+                )
             ):
                 interaction_point = visual_receptacle_grounding.get("interaction_point")
                 front_edge_visual_ready = bool(
@@ -1166,6 +1242,11 @@ class RobotEnvironment:
                     and grounded.get("receptacle")
                     and (front_edge_visual_ready or grounded.get("is_near_place"))
                 )
+            self._apply_grounded_surface_place_rule(
+                visual_candidate=visual_candidate,
+                receptacle=grounded,
+                grounding=visual_receptacle_grounding,
+            )
             candidates = [grounded]
 
         eligible = [c for c in candidates if c.get("place_rule_passed")]
@@ -1217,11 +1298,15 @@ class RobotEnvironment:
         receptacle = eligible[0]
         attempts: List[JsonDict] = []
         interactable_guidance: JsonDict = {}
-        allow_wide_fallback = _env_bool("ROBOT_ALLOW_RECEPTACLE_WIDE_PLACE_FALLBACK", False)
         place_force_action = _env_bool("ROBOT_PLACE_FORCE_ACTION", False)
-        allow_front_edge_object_fallback = _env_bool("ROBOT_PLACE_FRONT_EDGE_OBJECT_ID_FALLBACK", True)
-        front_edge_force_action = _env_bool("ROBOT_PLACE_FRONT_EDGE_FORCE_ACTION", True)
         precheck_interactable_pose = _env_bool("ROBOT_PLACE_PRECHECK_INTERACTABLE_POSE", True)
+        grid_clearance_contract = self._has_grid_clearance_contract(visual_candidate)
+        exact_grid_target_required = self._grid_exact_target_required(visual_candidate)
+        executed_exact_target: Optional[JsonDict] = None
+        exact_resolution_detail: JsonDict = {}
+        placement_execution_mode = (
+            "world_point_exact" if exact_grid_target_required else "screen_xy_near_visual_candidate"
+        )
 
         for candidate in eligible:
             receptacle = candidate
@@ -1244,6 +1329,55 @@ class RobotEnvironment:
                     and not bool(candidate_guidance.get("current_pose_interactable", False))
                 ):
                     continue
+            if exact_grid_target_required:
+                exact_targets, exact_resolution_detail = self._resolve_grid_exact_targets(
+                    visual_candidate,
+                    candidate,
+                )
+                attempts.append(
+                    {
+                        "mode": "world_point_exact_target_resolution",
+                        "receptacle": candidate,
+                        **exact_resolution_detail,
+                    }
+                )
+                for target_index, target in enumerate(exact_targets, start=1):
+                    try:
+                        event = self.controller.step(
+                            action="PlaceObjectAtPoint",
+                            objectId=held_object_id,
+                            position=target["action_world_target"],
+                        )
+                        attempts.append(
+                            {
+                                "mode": "world_point_exact",
+                                "receptacle": candidate,
+                                "point_index": target_index,
+                                "point_count": len(exact_targets),
+                                "resolution_error_m": target.get("resolution_error_m"),
+                                "lastActionSuccess": bool(event.metadata.get("lastActionSuccess", False)),
+                                "error_message": event.metadata.get("errorMessage", ""),
+                            }
+                        )
+                        if bool(event.metadata.get("lastActionSuccess", False)):
+                            executed_exact_target = target
+                            placement_execution_mode = "world_point_exact"
+                            break
+                    except Exception as exc:
+                        event = None
+                        attempts.append(
+                            {
+                                "mode": "world_point_exact",
+                                "receptacle": candidate,
+                                "point_index": target_index,
+                                "point_count": len(exact_targets),
+                                "lastActionSuccess": False,
+                                "error_message": str(exc),
+                            }
+                        )
+                if event is not None and bool(event.metadata.get("lastActionSuccess", False)):
+                    break
+                continue
             place_points = self._visual_place_points(visual_candidate, candidate)
             if place_points:
                 for point_index, (x_norm, y_norm) in enumerate(place_points, start=1):
@@ -1295,66 +1429,6 @@ class RobotEnvironment:
                     }
                 )
 
-            front_edge_candidate = bool(
-                candidate.get("visual_front_edge_place_ready")
-                or candidate.get("visual_front_center_override")
-                or self._visual_bbox_stats(visual_candidate).get("front_edge_receptacle")
-            )
-            if allow_front_edge_object_fallback and front_edge_candidate:
-                try:
-                    event = self.controller.step(
-                        action="PutObject",
-                        objectId=held_object_id,
-                        receptacleObjectId=candidate["objectId"],
-                        forceAction=front_edge_force_action,
-                        placeStationary=True,
-                    )
-                    attempts.append(
-                        {
-                            "mode": "alfred_receptacle_object_id_front_edge_fallback",
-                            "receptacle": candidate,
-                            "forceAction": bool(front_edge_force_action),
-                            "lastActionSuccess": bool(event.metadata.get("lastActionSuccess", False)),
-                            "error_message": event.metadata.get("errorMessage", ""),
-                        }
-                    )
-                    if bool(event.metadata.get("lastActionSuccess", False)):
-                        break
-                except Exception as exc:
-                    event = None
-                    attempts.append(
-                        {
-                            "mode": "alfred_receptacle_object_id_front_edge_fallback",
-                            "receptacle": candidate,
-                            "lastActionSuccess": False,
-                            "error_message": str(exc),
-                        }
-                    )
-
-            if not allow_wide_fallback:
-                continue
-
-            # Legacy fallback: this lets AI2-THOR choose a legal point on the
-            # whole receptacle. It is disabled by default because it can put the
-            # object on a far/back part of a large tabletop.
-            event = self.controller.step(
-                action="PutObject",
-                objectId=candidate["objectId"],
-                forceAction=place_force_action,
-                placeStationary=True,
-            )
-            attempts.append(
-                {
-                    "mode": "receptacle_object_id_wide_fallback",
-                    "receptacle": candidate,
-                    "forceAction": bool(place_force_action),
-                    "lastActionSuccess": bool(event.metadata.get("lastActionSuccess", False)),
-                    "error_message": event.metadata.get("errorMessage", ""),
-                }
-            )
-            if bool(event.metadata.get("lastActionSuccess", False)):
-                break
-
         if event is None:
             if (
                 interactable_guidance
@@ -1364,8 +1438,8 @@ class RobotEnvironment:
                 return {
                     "status": "error",
                     "schema_version": 2,
-                    "result_type": "error_receptacle_too_far",
-                    "message": "The grounded receptacle is visible, but the current robot pose is not an AI2-THOR interactable pose for it.",
+                    "result_type": "error_place_pose_not_interactable",
+                    "message": "The grounded receptacle is visible, but the current robot pose cannot execute placement on it.",
                     "holding_object": True,
                     "inventory": inventory,
                     "candidates": candidates,
@@ -1381,13 +1455,51 @@ class RobotEnvironment:
                     "visual_grounding_required": bool(strict_visual_grounding),
                     "visual_candidate_received": visual_candidate_received,
                     "visual_candidate_label": self._visual_candidate_label(visual_candidate),
+                    "candidate_id": failed_candidate_id,
                     "failed_candidate_id": failed_candidate_id,
+                    "placement_point_source": (
+                        "pointcloud_plane_local_grid" if grid_clearance_contract else "executor_visual_clearance"
+                    ),
+                    "placement_clearance_contract_applied": bool(grid_clearance_contract),
+                    "placement_failure_stage": "actuator_pose",
+                    "placement_execution_mode": placement_execution_mode,
+                    "placement_target_required": bool(exact_grid_target_required),
                 }
+            if exact_grid_target_required:
+                return {
+                    "status": "error",
+                    "schema_version": 2,
+                    "result_type": "error_place_exact_target_unavailable",
+                    "message": "No simulator-legal exact placement point remained near the RGB-D selected target.",
+                    "holding_object": True,
+                    "inventory": inventory,
+                    "candidates": candidates,
+                    "attempts": attempts,
+                    "visual_candidate": visual_candidate,
+                    "grounding_policy": grounding_policy,
+                    "visual_grounding_required": bool(strict_visual_grounding),
+                    "visual_candidate_received": visual_candidate_received,
+                    "visual_candidate_label": self._visual_candidate_label(visual_candidate),
+                    "candidate_id": failed_candidate_id,
+                    "failed_candidate_id": failed_candidate_id,
+                    "placement_point_source": "pointcloud_plane_local_grid",
+                    "placement_clearance_contract_applied": True,
+                    "placement_failure_stage": "exact_target_resolution",
+                    "placement_execution_mode": "world_point_exact",
+                    "placement_target_required": True,
+                    "placement_target_resolution_error_m": exact_resolution_detail.get("best_resolution_error_m"),
+                    "placement_target_resolution_tolerance_m": exact_resolution_detail.get("max_resolution_error_m"),
+                }
+            result_type = "error_place_point_clearance" if grid_clearance_contract else "error_place_no_reachable_point"
             return {
                 "status": "error",
                 "schema_version": 2,
-                "result_type": "error_place_no_reachable_point",
-                "message": "No controlled reachable placement point was available.",
+                "result_type": result_type,
+                "message": (
+                    "No point from the pointcloud placement safety contract remained executable."
+                    if grid_clearance_contract
+                    else "No controlled reachable placement point was available."
+                ),
                 "holding_object": True,
                 "inventory": inventory,
                 "candidates": candidates,
@@ -1397,6 +1509,19 @@ class RobotEnvironment:
                 "visual_grounding_required": bool(strict_visual_grounding),
                 "visual_candidate_received": visual_candidate_received,
                 "visual_candidate_label": self._visual_candidate_label(visual_candidate),
+                "candidate_id": failed_candidate_id,
+                "failed_candidate_id": failed_candidate_id,
+                "placement_point_source": (
+                    "pointcloud_plane_local_grid" if grid_clearance_contract else "executor_visual_clearance"
+                ),
+                "placement_clearance_contract_applied": bool(grid_clearance_contract),
+                "placement_failure_stage": (
+                    "pointcloud_safe_points_exhausted"
+                    if grid_clearance_contract
+                    else "executor_visual_point_search"
+                ),
+                "placement_execution_mode": placement_execution_mode,
+                "placement_target_required": bool(exact_grid_target_required),
             }
         action_success = bool(event.metadata.get("lastActionSuccess", False))
         error_message = event.metadata.get("errorMessage", "")
@@ -1408,6 +1533,12 @@ class RobotEnvironment:
             receptacle=receptacle,
             action_success=action_success,
             inventory_empty=inventory_empty,
+            expected_surface_world_target=(
+                executed_exact_target.get("surface_world_target")
+                if isinstance(executed_exact_target, dict)
+                else None
+            ),
+            exact_target_required=bool(executed_exact_target),
         )
         success = action_success and inventory_empty and bool(placement_validation.get("placement_verified", False))
         result_type = "place_executed" if success else str(placement_validation.get("result_type") or "error_place_failed")
@@ -1416,7 +1547,11 @@ class RobotEnvironment:
             "schema_version": 2,
             "result_type": result_type,
             "message": (
-                "Place executed and verified reachable."
+                (
+                    "Place executed and verified at the selected RGB-D target."
+                    if executed_exact_target
+                    else "Place executed and verified reachable."
+                )
                 if success
                 else str(placement_validation.get("message") or "Place action failed or placement could not be verified.")
             ),
@@ -1448,6 +1583,30 @@ class RobotEnvironment:
             "visual_grounding_required": bool(strict_visual_grounding),
             "visual_candidate_received": visual_candidate_received,
             "visual_candidate_label": self._visual_candidate_label(visual_candidate),
+            "placement_point_source": (
+                "pointcloud_plane_local_grid" if grid_clearance_contract else "executor_visual_clearance"
+            ),
+            "placement_clearance_contract_applied": bool(grid_clearance_contract),
+            "placement_execution_mode": placement_execution_mode,
+            "placement_target_required": bool(exact_grid_target_required),
+            "placement_target_verified": bool(placement_validation.get("placement_target_verified", False)),
+            "placement_target_error_m": placement_validation.get("placement_target_error_m"),
+            "placement_target_tolerance_m": placement_validation.get("placement_target_tolerance_m"),
+            "placement_target_resolution_error_m": (
+                executed_exact_target.get("resolution_error_m")
+                if isinstance(executed_exact_target, dict)
+                else exact_resolution_detail.get("best_resolution_error_m")
+            ),
+            "placement_target_resolution_tolerance_m": exact_resolution_detail.get("max_resolution_error_m"),
+            "placement_failure_stage": (
+                None
+                if success
+                else "exact_target_validation"
+                if executed_exact_target
+                else "exact_world_point_action"
+                if exact_grid_target_required
+                else None
+            ),
         }
 
     def precheck_place_candidate(
@@ -1455,7 +1614,7 @@ class RobotEnvironment:
         visual_candidate: Optional[JsonDict] = None,
         strict_visual_grounding: bool = False,
     ) -> JsonDict:
-        """Online-safe dry check for whether the current pose can try PutObject."""
+        """Online-safe dry check for whether the current pose can execute placement."""
         visual_candidate = self._normalize_visual_candidate(visual_candidate)
         visual_candidate_received = bool(visual_candidate)
         failed_candidate_id = self._visual_candidate_id(visual_candidate)
@@ -1483,6 +1642,7 @@ class RobotEnvironment:
                 "precheck_ok": bool(precheck_ok),
                 "precheck_reason": result_type,
                 "suggested_recovery": suggested_recovery,
+                "candidate_id": failed_candidate_id,
                 "failed_candidate_id": failed_candidate_id,
                 "grounding_policy": grounding_policy,
                 "visual_grounding_required": bool(strict_visual_grounding),
@@ -1581,6 +1741,11 @@ class RobotEnvironment:
                     )
             grounded["visual_receptacle_grounding_passed"] = True
             grounded["visual_receptacle_grounding_result_type"] = visual_receptacle_grounding.get("result_type")
+            self._apply_grounded_surface_place_rule(
+                visual_candidate=visual_candidate,
+                receptacle=grounded,
+                grounding=visual_receptacle_grounding,
+            )
             candidates = [grounded]
 
         eligible = [c for c in candidates if c.get("place_rule_passed")]
@@ -1605,6 +1770,9 @@ class RobotEnvironment:
             )
         )
         attempts: List[JsonDict] = []
+        grid_clearance_contract = self._has_grid_clearance_contract(visual_candidate)
+        exact_grid_target_required = self._grid_exact_target_required(visual_candidate)
+        exact_resolution_detail: JsonDict = {}
         for candidate in eligible:
             guidance = self._object_interactable_navigation_guidance(candidate.get("objectId"))
             if (
@@ -1621,6 +1789,43 @@ class RobotEnvironment:
                         "reason": guidance.get("reason"),
                     }
                 )
+                continue
+            if exact_grid_target_required:
+                exact_targets, exact_resolution_detail = self._resolve_grid_exact_targets(
+                    visual_candidate,
+                    candidate,
+                )
+                attempts.append(
+                    {
+                        "mode": "world_point_exact_target_resolution",
+                        **exact_resolution_detail,
+                    }
+                )
+                if exact_targets:
+                    return result(
+                        status="success",
+                        result_type="place_precheck_ok",
+                        message="Visual surface candidate has a grounded receptacle and an exact world placement target.",
+                        precheck_ok=True,
+                        suggested_recovery=None,
+                        holding_object=True,
+                        inventory=inventory,
+                        visual_receptacle_grounding=visual_receptacle_grounding,
+                        visual_receptacle_grounding_passed=bool(visual_receptacle_grounding.get("passed", False)),
+                        visual_receptacle_grounding_result_type=visual_receptacle_grounding.get("result_type"),
+                        placement_attempt_count=len(exact_targets),
+                        placement_attempt_modes=["world_point_exact"],
+                        placement_point_source="pointcloud_plane_local_grid",
+                        placement_clearance_contract_applied=True,
+                        placement_execution_mode="world_point_exact",
+                        placement_target_required=True,
+                        placement_target_resolution_error_m=exact_targets[0].get("resolution_error_m"),
+                        placement_target_resolution_tolerance_m=exact_resolution_detail.get("max_resolution_error_m"),
+                        interactable_current_pose=bool(guidance.get("current_pose_interactable", False)) if guidance else None,
+                        interactable_pose_count=guidance.get("interactable_pose_count") if guidance else None,
+                        interactable_distance_bucket=guidance.get("distance_bucket") if guidance else None,
+                        interactable_angle_bucket=guidance.get("angle_bucket") if guidance else None,
+                    )
                 continue
             place_points = self._visual_place_points(visual_candidate, candidate)
             attempts.append(
@@ -1646,6 +1851,10 @@ class RobotEnvironment:
                     visual_receptacle_grounding_result_type=visual_receptacle_grounding.get("result_type"),
                     placement_attempt_count=len(place_points),
                     placement_attempt_modes=["screen_xy_near_visual_candidate"],
+                    placement_point_source=(
+                        "pointcloud_plane_local_grid" if grid_clearance_contract else "executor_visual_clearance"
+                    ),
+                    placement_clearance_contract_applied=bool(grid_clearance_contract),
                     interactable_current_pose=bool(guidance.get("current_pose_interactable", False)) if guidance else None,
                     interactable_pose_count=guidance.get("interactable_pose_count") if guidance else None,
                     interactable_distance_bucket=guidance.get("distance_bucket") if guidance else None,
@@ -1657,10 +1866,33 @@ class RobotEnvironment:
             if attempt.get("recommended_action"):
                 suggested = str(attempt.get("recommended_action"))
                 break
+        pose_rejected = any(
+            attempt.get("mode") == "receptacle_interactable_pose_precheck"
+            and attempt.get("available")
+            and not attempt.get("current_pose_interactable")
+            for attempt in attempts
+        )
+        point_evaluated = any(attempt.get("mode") == "screen_xy_near_visual_candidate" for attempt in attempts)
+        if pose_rejected and not point_evaluated:
+            result_type = "error_place_pose_not_interactable"
+            failure_stage = "actuator_pose"
+            message = "The grounded receptacle is not interactable from the current robot pose."
+        elif exact_grid_target_required:
+            result_type = "error_place_exact_target_unavailable"
+            failure_stage = "exact_target_resolution"
+            message = "No simulator-legal exact placement point is close enough to the RGB-D selected target."
+        elif grid_clearance_contract:
+            result_type = "error_place_point_clearance"
+            failure_stage = "pointcloud_safe_points_exhausted"
+            message = "No point from the pointcloud placement safety contract is available for execution."
+        else:
+            result_type = "error_place_no_reachable_point"
+            failure_stage = "executor_visual_point_search"
+            message = "No controlled reachable placement point is available for this surface candidate."
         return result(
             status="error",
-            result_type="error_place_no_reachable_point",
-            message="No controlled reachable placement point is available for this surface candidate.",
+            result_type=result_type,
+            message=message,
             precheck_ok=False,
             suggested_recovery=suggested or "search_receptacle",
             holding_object=True,
@@ -1668,6 +1900,16 @@ class RobotEnvironment:
             attempts=attempts,
             placement_attempt_count=0,
             placement_attempt_modes=["screen_xy_near_visual_candidate"],
+            placement_point_source=(
+                "pointcloud_plane_local_grid" if grid_clearance_contract else "executor_visual_clearance"
+            ),
+            placement_clearance_contract_applied=bool(grid_clearance_contract),
+            precheck_failure_stage=failure_stage,
+            executor_action_hint=suggested,
+            placement_execution_mode="world_point_exact" if exact_grid_target_required else "screen_xy_near_visual_candidate",
+            placement_target_required=bool(exact_grid_target_required),
+            placement_target_resolution_error_m=exact_resolution_detail.get("best_resolution_error_m"),
+            placement_target_resolution_tolerance_m=exact_resolution_detail.get("max_resolution_error_m"),
         )
 
     def _normalize_visual_candidate(self, candidate: Optional[JsonDict]) -> JsonDict:
@@ -1709,6 +1951,7 @@ class RobotEnvironment:
             "pickup_now",
             "place_now",
             "visual_place_ready",
+            "affordance_ready",
             "final_place_ready",
             "failed_recently",
             "cooldown_remaining",
@@ -1738,11 +1981,13 @@ class RobotEnvironment:
             "occupancy_checks",
             "memory_checks",
             "executor_checks",
+            "free_space_completion",
+            "placement_safety_contract",
         ):
             value = candidate.get(key)
             if isinstance(value, dict):
                 safe[key] = dict(value)
-        for key in ("visible_occupants", "placement_avoidance_candidates", "blocked_by", "affordance", "rejection_reasons"):
+        for key in ("visible_occupants", "placement_avoidance_candidates", "placement_points", "blocked_by", "affordance", "rejection_reasons"):
             value = candidate.get(key)
             if isinstance(value, list):
                 if key in {"blocked_by", "affordance", "rejection_reasons"}:
@@ -2114,6 +2359,7 @@ class RobotEnvironment:
 
     def _validate_visual_receptacle_grounding(self, visual_candidate: JsonDict, receptacle: JsonDict) -> JsonDict:
         stats = self._visual_bbox_stats(visual_candidate)
+        explicit_surface_point = self._is_explicit_surface_place_candidate(visual_candidate)
         place_point = self._visual_place_point(visual_candidate, receptacle)
         if place_point is None:
             return {
@@ -2127,7 +2373,11 @@ class RobotEnvironment:
             target_object_id=receptacle.get("objectId"),
             visual_candidate=visual_candidate,
         )
-        if stats.get("broad_front_receptacle") and bbox_evidence.get("segmentation_available"):
+        if (
+            not explicit_surface_point
+            and stats.get("broad_front_receptacle")
+            and bbox_evidence.get("segmentation_available")
+        ):
             ratio_env_name = (
                 "ROBOT_PLACE_FRONT_EDGE_BBOX_MIN_RATIO"
                 if stats.get("front_edge_receptacle")
@@ -2188,7 +2438,11 @@ class RobotEnvironment:
                     **stats,
                     **evidence,
                 }
-            if stats.get("box_ambiguous") and target_ratio < ambiguous_min_ratio:
+            if (
+                not explicit_surface_point
+                and stats.get("box_ambiguous")
+                and target_ratio < ambiguous_min_ratio
+            ):
                 return {
                     "passed": False,
                     "result_type": "error_visual_receptacle_ambiguous",
@@ -2207,7 +2461,7 @@ class RobotEnvironment:
                 **evidence,
             }
 
-        if stats.get("box_ambiguous"):
+        if stats.get("box_ambiguous") and not explicit_surface_point:
             return {
                 "passed": False,
                 "result_type": "error_visual_receptacle_ambiguous",
@@ -2254,6 +2508,8 @@ class RobotEnvironment:
         """
         if not _env_bool("ROBOT_PLACE_FRONT_EDGE_INTERACTABLE_OVERRIDE", True):
             return {"passed": False, "reason": "front_edge_interactable_override_disabled"}
+        if self._is_explicit_surface_place_candidate(visual_candidate):
+            return {"passed": False, "reason": "surface_point_requires_point_grounding"}
 
         result_type = str(grounding.get("result_type") or "")
         if result_type not in {
@@ -2274,7 +2530,7 @@ class RobotEnvironment:
             action = str(interactable_guidance.get("recommended_action") or "")
             return {
                 "passed": False,
-                "needs_approach": action in {"MoveAhead", "MoveBack", "RotateLeft", "RotateRight"},
+                "needs_approach": action in {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight", "RotateLeft", "RotateRight"},
                 "reason": "front_edge_receptacle_needs_interactable_pose",
             }
 
@@ -2282,6 +2538,56 @@ class RobotEnvironment:
             "passed": True,
             "reason": "front_edge_receptacle_current_pose_interactable",
         }
+
+    def _is_explicit_surface_place_candidate(self, visual_candidate: JsonDict) -> bool:
+        """Return whether placement is already expressed as a checked surface point."""
+        if str(visual_candidate.get("surface_candidate_source") or "") not in EXPLICIT_SURFACE_PLACE_SOURCES:
+            return False
+        if not bool(visual_candidate.get("visual_place_ready")):
+            return False
+        if not bool(visual_candidate.get("affordance_ready")):
+            return False
+        if visual_candidate.get("rejection_reasons"):
+            return False
+        if bool(visual_candidate.get("blocked")) or not bool(visual_candidate.get("reachable")):
+            return False
+        point = visual_candidate.get("interaction_point")
+        if not isinstance(point, dict):
+            return False
+        try:
+            x = float(point.get("x"))
+            y = float(point.get("y"))
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(x) and math.isfinite(y)
+
+    def _apply_grounded_surface_place_rule(
+        self,
+        *,
+        visual_candidate: JsonDict,
+        receptacle: JsonDict,
+        grounding: JsonDict,
+    ) -> None:
+        """Use a grounded free-space point instead of the receptacle centroid.
+
+        Large countertops can have an off-center metadata centroid while a
+        locally free, reachable screen point is valid. The subsequent
+        interactable-pose and visual-point checks remain authoritative.
+        """
+        if not self._is_explicit_surface_place_candidate(visual_candidate):
+            return
+        if str(grounding.get("result_type") or "") not in {
+            "visual_receptacle_instance_grounded",
+            "visual_receptacle_bbox_grounded",
+            "visual_receptacle_bbox_instance_grounded",
+        }:
+            return
+        receptacle["visual_surface_interaction_point_ready"] = True
+        receptacle["visual_place_rule_source"] = "grounded_surface_interaction_point"
+        receptacle["place_rule_passed"] = bool(
+            receptacle.get("allowed_place_receptacle")
+            and receptacle.get("receptacle")
+        )
 
     def _ground_visual_service_candidate(
         self,
@@ -2303,6 +2609,7 @@ class RobotEnvironment:
         broad_front_receptacle = bool(
             task_semantic_class == "place_receptacle"
             and visual_stats.get("broad_front_receptacle")
+            and not self._is_explicit_surface_place_candidate(visual_candidate)
         )
 
         scored: List[Tuple[float, JsonDict]] = []
@@ -2789,6 +3096,252 @@ class RobotEnvironment:
             return "side"
         return "outside-front"
 
+    def _has_grid_clearance_contract(self, visual_candidate: JsonDict) -> bool:
+        """Return whether point clearance was fully evaluated in the RGB-D grid."""
+        if str(visual_candidate.get("surface_candidate_source") or "") != "pointcloud_plane_grid_completion":
+            return False
+        if not self._is_explicit_surface_place_candidate(visual_candidate):
+            return False
+        contract = (
+            visual_candidate.get("placement_safety_contract")
+            if isinstance(visual_candidate.get("placement_safety_contract"), dict)
+            else {}
+        )
+        completion = (
+            visual_candidate.get("free_space_completion")
+            if isinstance(visual_candidate.get("free_space_completion"), dict)
+            else {}
+        )
+        checks = visual_candidate.get("geometry_checks") if isinstance(visual_candidate.get("geometry_checks"), dict) else {}
+        occupancy = (
+            visual_candidate.get("occupancy_checks")
+            if isinstance(visual_candidate.get("occupancy_checks"), dict)
+            else {}
+        )
+        return bool(
+            contract.get("version") == "plane_local_grid_v1"
+            and contract.get("clearance_owner") == "pointcloud_plane_local_grid"
+            and contract.get("grid_occupancy_clear")
+            and contract.get("grid_edge_eroded")
+            and completion.get("mode") == "plane_local_2d_grid"
+            and checks.get("grid_occupancy_clear")
+            and checks.get("grid_edge_eroded")
+            and checks.get("distance_ok")
+            and occupancy.get("free_space_grid_completion")
+            and not occupancy.get("blocked")
+        )
+
+    def _grid_exact_target_required(self, visual_candidate: JsonDict) -> bool:
+        """Return whether a metric free-space point must be executed as a world target."""
+        return self._has_grid_clearance_contract(visual_candidate)
+
+    def _camera_relative_surface_target_to_world(
+        self,
+        center_3d: JsonDict,
+        visual_candidate: JsonDict,
+    ) -> Optional[JsonDict]:
+        """Transform an RGB-D surface target into AI2-THOR world coordinates.
+
+        Perception reports x as camera-right, y as height above the observed
+        floor and z as ground-forward. The actuator uses the current agent
+        pose only to express the perception-selected point in world space.
+        """
+        contract = (
+            visual_candidate.get("placement_safety_contract")
+            if isinstance(visual_candidate.get("placement_safety_contract"), dict)
+            else {}
+        )
+        frame = str(
+            contract.get("target_coordinate_frame")
+            or "camera_relative_x_right_y_height_z_forward"
+        )
+        if frame != "camera_relative_x_right_y_height_z_forward":
+            return None
+        agent = self.last_event.metadata.get("agent") if isinstance(self.last_event.metadata, dict) else {}
+        position = agent.get("position") if isinstance(agent, dict) and isinstance(agent.get("position"), dict) else {}
+        rotation = agent.get("rotation") if isinstance(agent, dict) and isinstance(agent.get("rotation"), dict) else {}
+        try:
+            lateral = float(center_3d.get("x"))
+            height_from_floor = float(center_3d.get("y"))
+            forward = float(center_3d.get("ground_forward_m", center_3d.get("z")))
+            agent_x = float(position.get("x"))
+            agent_y = float(position.get("y"))
+            agent_z = float(position.get("z"))
+            agent_rotation_y = float(rotation.get("y", 0.0))
+            camera_height_m = float(
+                contract.get(
+                    "camera_height_m",
+                    _env_float("ROBOT_CAMERA_HEIGHT_M", agent_y),
+                )
+            )
+        except (TypeError, ValueError):
+            return None
+        values = (
+            lateral,
+            height_from_floor,
+            forward,
+            agent_x,
+            agent_y,
+            agent_z,
+            agent_rotation_y,
+            camera_height_m,
+        )
+        if not all(math.isfinite(value) for value in values):
+            return None
+        radians = math.radians(agent_rotation_y)
+        forward_x, forward_z = math.sin(radians), math.cos(radians)
+        right_x, right_z = math.cos(radians), -math.sin(radians)
+        floor_world_y = agent_y - camera_height_m
+        return {
+            "x": round(agent_x + forward * forward_x + lateral * right_x, 4),
+            "y": round(floor_world_y + height_from_floor, 4),
+            "z": round(agent_z + forward * forward_z + lateral * right_z, 4),
+        }
+
+    def _grid_contract_world_targets(self, visual_candidate: JsonDict) -> List[JsonDict]:
+        """Return ranked perception-selected world targets for exact execution."""
+        if not self._grid_exact_target_required(visual_candidate):
+            return []
+        raw_points = visual_candidate.get("placement_points")
+        items = raw_points if isinstance(raw_points, list) else [visual_candidate.get("interaction_point")]
+        targets: List[JsonDict] = []
+        for index, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                continue
+            center_3d = item.get("center_3d") if isinstance(item.get("center_3d"), dict) else None
+            if center_3d is None:
+                continue
+            world_target = self._camera_relative_surface_target_to_world(center_3d, visual_candidate)
+            if world_target is None:
+                continue
+            try:
+                rank = int(item.get("rank", index) or index)
+            except (TypeError, ValueError):
+                rank = index
+            targets.append({"rank": rank, "surface_world_target": world_target})
+        targets.sort(key=lambda item: int(item.get("rank", 0) or 0))
+        return targets
+
+    def _resolve_grid_exact_targets(
+        self,
+        visual_candidate: JsonDict,
+        receptacle: JsonDict,
+    ) -> Tuple[List[JsonDict], JsonDict]:
+        """Snap RGB-D targets to simulator-legal positions near the same surface cell."""
+        requested = self._grid_contract_world_targets(visual_candidate)
+        detail: JsonDict = {
+            "requested_target_count": len(requested),
+            "resolved_target_count": 0,
+            "mode": "world_point_exact",
+        }
+        if not requested:
+            detail["reason"] = "missing_metric_grid_targets"
+            return [], detail
+        receptacle_id = receptacle.get("objectId")
+        if not receptacle_id:
+            detail["reason"] = "missing_grounded_receptacle_id"
+            return [], detail
+        try:
+            event = self.controller.step(
+                action="GetSpawnCoordinatesAboveReceptacle",
+                objectId=str(receptacle_id),
+                anywhere=True,
+            )
+        except Exception as exc:
+            detail["reason"] = "spawn_coordinate_query_exception"
+            detail["error_message"] = str(exc)
+            return [], detail
+        self.last_event = event
+        metadata = event.metadata if hasattr(event, "metadata") and isinstance(event.metadata, dict) else {}
+        if not bool(metadata.get("lastActionSuccess", False)):
+            detail["reason"] = "spawn_coordinate_query_failed"
+            detail["error_message"] = metadata.get("errorMessage", "")
+            return [], detail
+        coordinates = metadata.get("actionReturn") or []
+        coordinates = coordinates if isinstance(coordinates, list) else []
+        legal_positions: List[JsonDict] = []
+        for position in coordinates:
+            if not isinstance(position, dict):
+                continue
+            try:
+                values = {axis: float(position.get(axis)) for axis in ("x", "y", "z")}
+            except (TypeError, ValueError):
+                continue
+            if all(math.isfinite(value) for value in values.values()):
+                legal_positions.append(values)
+        detail["legal_target_count"] = len(legal_positions)
+        if not legal_positions:
+            detail["reason"] = "no_legal_spawn_coordinates"
+            return [], detail
+
+        max_error = max(0.0, _env_float("ROBOT_PLACE_EXACT_RESOLVE_MAX_ERROR_M", 0.10))
+        resolved: List[JsonDict] = []
+        used: Set[Tuple[int, int, int]] = set()
+        for item in requested:
+            requested_position = item["surface_world_target"]
+            nearest = min(
+                legal_positions,
+                key=lambda position: math.hypot(
+                    float(position["x"]) - float(requested_position["x"]),
+                    float(position["z"]) - float(requested_position["z"]),
+                ),
+            )
+            error_m = math.hypot(
+                float(nearest["x"]) - float(requested_position["x"]),
+                float(nearest["z"]) - float(requested_position["z"]),
+            )
+            key = (
+                int(round(float(nearest["x"]) * 10000)),
+                int(round(float(nearest["y"]) * 10000)),
+                int(round(float(nearest["z"]) * 10000)),
+            )
+            if error_m > max_error or key in used:
+                continue
+            used.add(key)
+            resolved.append(
+                {
+                    "rank": item.get("rank"),
+                    "surface_world_target": requested_position,
+                    "action_world_target": {
+                        axis: round(float(nearest[axis]), 4)
+                        for axis in ("x", "y", "z")
+                    },
+                    "resolution_error_m": round(float(error_m), 4),
+                }
+            )
+        detail["resolved_target_count"] = len(resolved)
+        detail["max_resolution_error_m"] = round(float(max_error), 4)
+        if resolved:
+            detail["best_resolution_error_m"] = resolved[0]["resolution_error_m"]
+            detail["reason"] = "exact_targets_resolved"
+        else:
+            detail["reason"] = "no_legal_coordinate_near_selected_grid_point"
+        return resolved, detail
+
+    def _grid_contract_place_points(self, visual_candidate: JsonDict) -> List[Tuple[float, float]]:
+        if not self._has_grid_clearance_contract(visual_candidate):
+            return []
+        raw_points = visual_candidate.get("placement_points")
+        items = raw_points if isinstance(raw_points, list) else [visual_candidate.get("interaction_point")]
+        points: List[Tuple[float, float]] = []
+        seen: Set[Tuple[int, int]] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                px = float(item.get("x"))
+                py = float(item.get("y"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(px) or not math.isfinite(py):
+                continue
+            key = (int(round(px)), int(round(py)))
+            if key in seen:
+                continue
+            seen.add(key)
+            points.append((px / max(1.0, float(self.width)), py / max(1.0, float(self.height))))
+        return points
+
     def _visual_avoidance_boxes(self, visual_candidate: JsonDict) -> List[Tuple[str, Tuple[float, float, float, float]]]:
         boxes: List[Tuple[str, Tuple[float, float, float, float]]] = []
         seen: Set[Tuple[int, int, int, int, str]] = set()
@@ -2860,11 +3413,18 @@ class RobotEnvironment:
         seen: Set[Tuple[int, int]] = set()
         relaxed_seen: Set[Tuple[int, int]] = set()
 
-        def add_point(x_norm: float, y_norm: float) -> None:
+        def add_point(x_norm: float, y_norm: float, *, apply_image_avoidance: bool = True) -> None:
             x_clamped = min(0.95, max(0.05, float(x_norm)))
             y_clamped = min(0.95, max(0.05, float(y_norm)))
             key = (int(round(x_clamped * 1000)), int(round(y_clamped * 1000)))
-            if self._visual_place_point_blocked(visual_candidate, x_clamped, y_clamped):
+            if not apply_image_avoidance and self._visual_place_clearance_score(
+                visual_candidate, x_clamped, y_clamped
+            ) < 0.0:
+                # A grid contract owns inflated clearance, but an execution
+                # point visibly inside an occupied object is a hard
+                # contradiction and must never be sent to PutObject.
+                return
+            if apply_image_avoidance and self._visual_place_point_blocked(visual_candidate, x_clamped, y_clamped):
                 score = self._visual_place_clearance_score(visual_candidate, x_clamped, y_clamped)
                 if score >= 0.0 and key not in relaxed_seen:
                     relaxed_seen.add(key)
@@ -2875,9 +3435,24 @@ class RobotEnvironment:
             seen.add(key)
             points.append((x_clamped, y_clamped))
 
+        grid_points = self._grid_contract_place_points(visual_candidate)
+        if grid_points:
+            for x_norm, y_norm in grid_points:
+                # Pointcloud grid candidates already include the metric obstacle
+                # dilation and support-edge erosion contract. Reapplying a
+                # separate image-box margin here would create two conflicting
+                # collision models for the same placement point. Actual-box
+                # intersection is still rejected by add_point above.
+                add_point(x_norm, y_norm, apply_image_avoidance=False)
+            return points
+
         preferred_point = self._visual_place_point(visual_candidate, receptacle)
         if preferred_point is not None:
             add_point(preferred_point[0], preferred_point[1])
+        if visual_candidate.get("surface_candidate_source") == "pointcloud_plane_grid_completion":
+            # The bbox is the envelope of an irregular free component, not a
+            # region from which additional placement points may be sampled.
+            return points
 
         bbox = self._visual_bbox(visual_candidate)
         if bbox is None:
@@ -2928,7 +3503,13 @@ class RobotEnvironment:
         return points
 
     def _visual_place_point(self, visual_candidate: JsonDict, receptacle: JsonDict) -> Optional[Tuple[float, float]]:
-        if visual_candidate.get("surface_candidate_source") == "depth_geometry":
+        if visual_candidate.get("surface_candidate_source") in {
+            "depth_geometry",
+            "depth_region_geometry",
+            "pointcloud_plane",
+            "pointcloud_plane_completion",
+            "pointcloud_plane_grid_completion",
+        }:
             point = self._visual_point({"interaction_point": visual_candidate.get("interaction_point")})
             if point is not None:
                 width = max(1.0, float(self.width))
@@ -2986,6 +3567,8 @@ class RobotEnvironment:
         receptacle: JsonDict,
         action_success: bool,
         inventory_empty: bool,
+        expected_surface_world_target: Optional[JsonDict] = None,
+        exact_target_required: bool = False,
     ) -> JsonDict:
         if not action_success:
             return {
@@ -2996,6 +3579,7 @@ class RobotEnvironment:
                 "object_reachable_from_agent": False,
                 "distance_bucket": "unknown",
                 "angle_bucket": "unknown",
+                "placement_target_verified": False,
             }
         if not inventory_empty:
             return {
@@ -3006,6 +3590,7 @@ class RobotEnvironment:
                 "object_reachable_from_agent": False,
                 "distance_bucket": "unknown",
                 "angle_bucket": "unknown",
+                "placement_target_verified": False,
             }
 
         placed_object = self._find_object_by_id(held_object_id)
@@ -3013,11 +3598,12 @@ class RobotEnvironment:
             return {
                 "placement_verified": False,
                 "result_type": "error_place_object_missing_after_action",
-                "message": "Placed object could not be found after PutObject.",
+                "message": "Placed object could not be found after the placement action.",
                 "object_on_target_receptacle": False,
                 "object_reachable_from_agent": False,
                 "distance_bucket": "unknown",
                 "angle_bucket": "unknown",
+                "placement_target_verified": False,
             }
 
         receptacle_after = self._find_object_by_id(str(receptacle.get("objectId") or "")) or receptacle
@@ -3030,9 +3616,32 @@ class RobotEnvironment:
         interactable = self._object_interactable_from_current_pose(held_object_id)
         interactable_reachable = bool(interactable.get("interactable_from_current_pose", False))
         reachable = bool(geometry_reachable or interactable_reachable)
+        target_tolerance_m = max(
+            0.0,
+            _env_float(
+                "ROBOT_PLACE_VERIFY_TARGET_MAX_ERROR_M",
+                _env_float("ROBOT_PLACE_EXACT_RESOLVE_MAX_ERROR_M", 0.10),
+            ),
+        )
+        placement_target_error_m: Optional[float] = None
+        placement_target_verified = not bool(exact_target_required)
+        if exact_target_required and isinstance(expected_surface_world_target, dict):
+            object_position = placed_object.get("position") if isinstance(placed_object.get("position"), dict) else {}
+            try:
+                placement_target_error_m = math.hypot(
+                    float(object_position.get("x")) - float(expected_surface_world_target.get("x")),
+                    float(object_position.get("z")) - float(expected_surface_world_target.get("z")),
+                )
+            except (TypeError, ValueError):
+                placement_target_error_m = None
+            placement_target_verified = bool(
+                placement_target_error_m is not None
+                and math.isfinite(placement_target_error_m)
+                and placement_target_error_m <= target_tolerance_m
+            )
 
         validation: JsonDict = {
-            "placement_verified": bool(on_receptacle and reachable),
+            "placement_verified": bool(on_receptacle and reachable and placement_target_verified),
             "object_on_target_receptacle": bool(on_receptacle),
             "object_reachable_from_agent": bool(reachable),
             "object_geometry_reachable_from_agent": bool(geometry_reachable),
@@ -3042,6 +3651,14 @@ class RobotEnvironment:
             "angle_bucket": self._angle_bucket(angle_abs),
             "max_distance_m": round(max_distance, 3),
             "max_angle_deg": round(max_angle, 1),
+            "placement_target_required": bool(exact_target_required),
+            "placement_target_verified": bool(placement_target_verified),
+            "placement_target_error_m": (
+                round(float(placement_target_error_m), 4)
+                if placement_target_error_m is not None
+                else None
+            ),
+            "placement_target_tolerance_m": round(float(target_tolerance_m), 4),
             "placed_object": self._summarize_service_object(placed_object, task_semantic_class="placed_object"),
             "receptacle_after": self._summarize_service_object(receptacle_after, task_semantic_class="place_receptacle"),
         }
@@ -3059,11 +3676,22 @@ class RobotEnvironment:
                     "message": "Place action succeeded, but the final object position is outside the reachable front placement zone.",
                 }
             )
+        elif not placement_target_verified:
+            validation.update(
+                {
+                    "result_type": "error_place_target_deviation",
+                    "message": "Place action succeeded, but the final object position is outside the selected RGB-D target tolerance.",
+                }
+            )
         else:
             validation.update(
                 {
-                    "result_type": "place_verified_reachable",
-                    "message": "Placed object is on the target receptacle and still reachable/interactable from the current robot pose.",
+                    "result_type": "place_verified_exact_target" if exact_target_required else "place_verified_reachable",
+                    "message": (
+                        "Placed object is on the target receptacle within the selected RGB-D target tolerance."
+                        if exact_target_required
+                        else "Placed object is on the target receptacle and still reachable/interactable from the current robot pose."
+                    ),
                 }
             )
         return validation
@@ -3371,4 +3999,8 @@ class RobotEnvironment:
             abs(float(before_rot.get(k, 0.0)) - float(after_rot.get(k, 0.0))) > 1e-4
             for k in ("x", "y", "z")
         )
-        return pos_changed or rot_changed
+        horizon_changed = abs(
+            float(before.get("cameraHorizon", 0.0) or 0.0)
+            - float(after.get("cameraHorizon", 0.0) or 0.0)
+        ) > 1e-4
+        return pos_changed or rot_changed or horizon_changed

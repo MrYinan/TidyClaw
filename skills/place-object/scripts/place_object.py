@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--precheck-only",
         action="store_true",
-        help="Run the online-safe executor precheck without executing PutObject.",
+        help="Run the online-safe executor precheck without executing placement.",
     )
     return parser
 

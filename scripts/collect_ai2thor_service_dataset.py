@@ -42,7 +42,7 @@ DEFAULT_CLASSES = [
     "Cabinet",
     "Bed",
 ]
-MOVE_ACTIONS = ["RotateLeft", "RotateRight", "MoveAhead", "LookDown", "LookUp"]
+MOVE_ACTIONS = ["RotateLeft", "RotateRight", "MoveAhead", "MoveBack", "MoveLeft", "MoveRight", "LookDown", "LookUp"]
 
 
 @dataclass

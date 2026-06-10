@@ -48,7 +48,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET_ROOT = REPO_ROOT / "datasets" / "trash_ai2thor_v2"
 DEFAULT_BASE_URL = "http://127.0.0.1:5000"
 DEFAULT_CLASSES = ["cleanable_floor_trash", "non_floor_object", "obstacle"]
-VALID_ACTIONS = ["MoveAhead", "MoveBack", "RotateLeft", "RotateRight"]
+VALID_ACTIONS = ["MoveAhead", "MoveBack", "MoveLeft", "MoveRight", "RotateLeft", "RotateRight", "LookUp", "LookDown"]
 
 
 @dataclass
@@ -159,7 +159,7 @@ def sample_action(policy: str, actions: Sequence[str], index: int, rng: random.R
         action = actions[index % len(actions)]
         return action if action in VALID_ACTIONS else None
     if policy == "random":
-        pool = list(actions) if actions else ["RotateLeft", "RotateRight", "MoveAhead"]
+        pool = list(actions) if actions else ["RotateLeft", "RotateRight", "MoveAhead", "MoveLeft", "MoveRight", "LookDown", "LookUp"]
         pool = [a for a in pool if a in VALID_ACTIONS]
         return rng.choice(pool) if pool else None
     raise ValueError(f"unknown action policy: {policy}")
@@ -384,7 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
     parser.add_argument("--action-policy", choices=["none", "pass", "rotate", "random", "scripted"], default="random")
-    parser.add_argument("--actions", default="RotateLeft,RotateRight,MoveAhead,MoveAhead")
+    parser.add_argument("--actions", default="RotateLeft,RotateRight,MoveAhead,MoveLeft,MoveRight,LookDown,LookUp")
     parser.add_argument("--move-after-capture", action="store_true", default=True)
     parser.add_argument("--no-move-after-capture", action="store_false", dest="move_after_capture")
     parser.add_argument("--reset-before", action="store_true")

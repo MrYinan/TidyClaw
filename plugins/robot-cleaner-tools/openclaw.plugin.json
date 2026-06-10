@@ -1,0 +1,34 @@
+{
+  "id": "robot-cleaner-tools",
+  "name": "Robot Cleaner Tools",
+  "description": "Stable OpenClaw tools for the household service robot agent.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "description": "Base URL for the local Robot Cleaner tool bridge service."
+      },
+      "timeoutMs": {
+        "type": "number",
+        "description": "Maximum backend script runtime in milliseconds.",
+        "minimum": 1000,
+        "maximum": 600000
+      }
+    },
+    "additionalProperties": false
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "robot_cleaner_prepare_decision_turn",
+      "robot_cleaner_execute_option",
+      "robot_cleaner_status",
+      "robot_cleaner_report",
+      "robot_cleaner_stop"
+    ]
+  }
+}

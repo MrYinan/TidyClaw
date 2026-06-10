@@ -41,6 +41,13 @@ def print_json(data: JsonDict) -> None:
     print(json.dumps(data, ensure_ascii=False))
 
 
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def hidden_startupinfo() -> Optional[subprocess.STARTUPINFO]:
     if os.name != "nt":
         return None
@@ -346,6 +353,14 @@ def build_runner_args(args: argparse.Namespace, *, continuous: bool) -> List[str
         command.extend(["--pickup-surface-policy", str(args.pickup_surface_policy)])
     if args.pickup_target_labels:
         command.extend(["--pickup-target-labels", str(args.pickup_target_labels)])
+    if args.performance_profile:
+        command.extend(["--performance-profile", str(args.performance_profile)])
+    if args.object_memory_update_interval is not None:
+        command.extend(["--object-memory-update-interval", str(args.object_memory_update_interval)])
+    if args.semantic_map_update_interval is not None:
+        command.extend(["--semantic-map-update-interval", str(args.semantic_map_update_interval)])
+    if args.log_detail:
+        command.extend(["--log-detail", str(args.log_detail)])
     if args.dry_run:
         command.append("--dry-run")
     if args.verbose:
@@ -692,6 +707,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--pickup-target-labels",
         default=os.getenv("ROBOT_PICKUP_TARGET_LABELS", ""),
         help="Optional comma-separated pickup label allowlist passed to scripts/patrol_runner.py.",
+    )
+    parser.add_argument(
+        "--performance-profile",
+        choices=["balanced", "full"],
+        default=os.getenv("ROBOT_PERFORMANCE_PROFILE", "balanced"),
+        help="Runtime cost profile passed to scripts/patrol_runner.py.",
+    )
+    parser.add_argument(
+        "--object-memory-update-interval",
+        type=int,
+        default=env_int("ROBOT_OBJECT_MEMORY_UPDATE_INTERVAL", 3),
+        help="Idle exploration object-memory update interval passed to scripts/patrol_runner.py.",
+    )
+    parser.add_argument(
+        "--semantic-map-update-interval",
+        type=int,
+        default=env_int("ROBOT_SEMANTIC_MAP_UPDATE_INTERVAL", 3),
+        help="Idle exploration semantic-map update interval passed to scripts/patrol_runner.py.",
+    )
+    parser.add_argument(
+        "--log-detail",
+        choices=["summary", "full"],
+        default=os.getenv("ROBOT_PATROL_LOG_DETAIL", "summary"),
+        help="Verbose script-result detail passed to scripts/patrol_runner.py.",
     )
     parser.add_argument(
         "--run-timeout",

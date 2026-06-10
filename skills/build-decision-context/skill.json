@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "name": "build-decision-context",
+  "role": "public-agent-view-builder",
+  "status": "experimental-stable-contract",
+  "abstraction_level": "decision-context",
+  "description": "Compresses current perception, task state, navigation memory, and object memory into a bounded public JSON context for OpenClaw/LLM option selection.",
+  "required_inputs": [
+    "memory/mission-state.json",
+    "memory/room-state.json",
+    "memory/patrol-state.json",
+    "memory/service-task-state.json",
+    "memory/navigation-costmap.json",
+    "memory/position-map.json",
+    "memory/object-memory.json",
+    "memory/yolo-current-rgbd.json"
+  ],
+  "optional_inputs": [
+    "memory/global-plan.json"
+  ],
+  "scripts": [
+    "scripts/build_decision_context.py",
+    "../../scripts/decision_context_builder.py"
+  ],
+  "outputs": [
+    "robot_cleaner_decision_context_v1"
+  ],
+  "public_contract": {
+    "model_selects": "option_id",
+    "executor_validates": true,
+    "full_maps_excluded": true,
+    "full_memory_history_excluded": true
+  },
+  "future_mcp_tools": [
+    "robot_cleaner__get_decision_context",
+    "robot_cleaner__execute_option",
+    "robot_cleaner__done_probe"
+  ]
+}

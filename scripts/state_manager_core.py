@@ -90,17 +90,37 @@ def atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
-        for attempt in range(8):
+        replaced = False
+        last_replace_error: Optional[PermissionError] = None
+        for attempt in range(20):
             try:
                 os.replace(tmp_name, path)
+                replaced = True
                 break
+            except PermissionError as exc:
+                last_replace_error = exc
+                if attempt >= 19:
+                    break
+                time.sleep(min(0.5, 0.05 * (attempt + 1)))
+        if not replaced:
+            try:
+                with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                    handle.write(text)
+                replaced = True
             except PermissionError:
-                if attempt >= 7:
-                    raise
-                time.sleep(0.05 * (attempt + 1))
+                if last_replace_error is not None:
+                    raise last_replace_error
+                raise
     finally:
         if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+            try:
+                os.unlink(tmp_name)
+            except PermissionError:
+                # On Windows, antivirus/indexers can hold a just-written temp
+                # file briefly. Leaving a dot-prefixed temp behind is safer
+                # than failing the patrol loop after the real write already
+                # failed or succeeded.
+                pass
 
 
 def default_patrol(max_steps: int = DEFAULT_MAX_STEPS) -> Dict[str, Any]:

@@ -1,6 +1,6 @@
 ---
 name: pick-object
-description: Pick up a visible front-center household service object through the backend /pick actuator.
+description: 通过后端 /pick 执行器拾取视野前方居中的可见家庭服务物体。
 metadata:
   {
     "openclaw": {
@@ -10,29 +10,26 @@ metadata:
   }
 ---
 
-# Pick Object
+# 拾取物体
 
-Use this skill after fresh RGB perception indicates a reachable front-center
-`pickup_target`.
+当最新 RGB 感知结果表明前方居中存在可达的 `pickup_target` 时，使用本技能。
 
-Run:
+执行：
 
 ```bash
 python skills/pick-object/scripts/pick_object.py
 ```
 
-The skill calls `POST /pick`. The backend may use simulator metadata internally
-to execute `PickupObject`, but the default response is online-safe and does not
-expose `objectId`, exact position, or raw metadata.
+本技能会调用 `POST /pick`。后端内部可能使用模拟器 metadata 来执行 `PickupObject`，但默认响应是在线安全的，不暴露 `objectId`、精确位置或原始 metadata。
 
-Success fields:
+成功字段：
 
 - `status = "success"`
 - `result_type = "pickup_executed"`
 - `lastActionSuccess`
 - `holding_object = true`
 
-Failure result types include:
+可能的失败 `result_type` 包括：
 
 - `error_no_pickup_target_in_front`
 - `error_pickup_target_not_centered`

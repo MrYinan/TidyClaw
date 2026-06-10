@@ -4,13 +4,11 @@
 # dependencies = ["requests"]
 # ///
 
-"""Capture the current RGB-only observation from the backend.
+"""Capture the current RGB/RGB-D observation from the backend.
 
-V2 contract:
-- call GET /observation, not /vision;
-- save the RGB frame locally and pass only image_path/action feedback onward;
-- do not expose AI2-THOR pose, object metadata, depth, or segmentation to the
-  online Agent chain.
+The online chain receives local file paths rather than heavy base64 payloads:
+`image_path` for RGB and, when available, `depth_path` for a float32 `.npy`
+depth frame in meters. Object metadata and instance masks are still excluded.
 """
 
 from __future__ import annotations
@@ -37,42 +35,74 @@ def strip_data_url_prefix(base64_str: str) -> str:
     return base64_str
 
 
-def write_image_bytes(image_bytes: bytes, preferred_dir: str) -> str:
+def write_frame_bytes(
+    frame_bytes: bytes,
+    preferred_dir: str,
+    *,
+    stable_name: str,
+    timestamp_prefix: str,
+    suffix: str,
+) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     candidates = []
 
     preferred = Path(preferred_dir)
-    candidates.append(preferred / "openclaw_robot_vision.jpg")
-    candidates.append(preferred / f"openclaw_robot_vision_{timestamp}.jpg")
+    candidates.append(preferred / stable_name)
+    candidates.append(preferred / f"{timestamp_prefix}_{timestamp}{suffix}")
 
     repo_root = Path(__file__).resolve().parents[3]
     fallback_dir = repo_root / "memory" / "vision-captures"
-    candidates.append(fallback_dir / f"openclaw_robot_vision_{timestamp}.jpg")
+    candidates.append(fallback_dir / f"{timestamp_prefix}_{timestamp}{suffix}")
 
     last_error: Exception | None = None
     for path in candidates:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("wb") as f:
-                f.write(image_bytes)
+                f.write(frame_bytes)
             return str(path)
         except OSError as exc:
             last_error = exc
             continue
 
-    raise RuntimeError(f"无法保存视觉图像: {last_error}")
+    raise RuntimeError(f"无法保存观测帧: {last_error}")
 
 
-def online_safe_payload(data: JsonDict, image_path: str) -> JsonDict:
-    """Drop heavy image data and enforce the RGB-only payload shape."""
+def write_image_bytes(image_bytes: bytes, preferred_dir: str) -> str:
+    return write_frame_bytes(
+        image_bytes,
+        preferred_dir,
+        stable_name="openclaw_robot_vision.jpg",
+        timestamp_prefix="openclaw_robot_vision",
+        suffix=".jpg",
+    )
+
+
+def write_depth_bytes(depth_bytes: bytes, preferred_dir: str) -> str:
+    return write_frame_bytes(
+        depth_bytes,
+        preferred_dir,
+        stable_name="openclaw_robot_depth.npy",
+        timestamp_prefix="openclaw_robot_depth",
+        suffix=".npy",
+    )
+
+
+def online_safe_payload(data: JsonDict, image_path: str, depth_path: str | None = None) -> JsonDict:
+    """Drop heavy frame data and return local paths for downstream perception."""
     feedback = data.get("last_action_feedback") if isinstance(data.get("last_action_feedback"), dict) else {}
-    return {
+    payload: JsonDict = {
         "status": data.get("status", "success"),
-        "schema_version": data.get("schema_version", 2),
-        "result_type": "vision_captured_rgb_only",
-        "observation_contract": data.get("observation_contract", "rgb_only_action_feedback_v2"),
+        "schema_version": data.get("schema_version", 3),
+        "result_type": "vision_captured_rgbd" if depth_path else "vision_captured_rgb_only",
+        "observation_contract": data.get(
+            "observation_contract",
+            "rgbd_action_feedback_v3" if depth_path else "rgb_only_action_feedback_v2",
+        ),
         "online_safe": True,
         "image_path": image_path,
+        "depth": data.get("depth") if isinstance(data.get("depth"), dict) else None,
+        "camera": data.get("camera") if isinstance(data.get("camera"), dict) else None,
         "scene": data.get("scene"),
         "last_action_feedback": {
             "action": feedback.get("action", data.get("last_action")),
@@ -83,6 +113,9 @@ def online_safe_payload(data: JsonDict, image_path: str) -> JsonDict:
         "last_action_success": data.get("last_action_success"),
         "last_action_error": data.get("last_action_error", ""),
     }
+    if depth_path:
+        payload["depth_path"] = depth_path
+    return payload
 
 
 def main() -> None:
@@ -106,7 +139,7 @@ def main() -> None:
                     {
                         "status": "error",
                         "result_type": "error_empty_observation_image",
-                        "message": "/observation 没有返回 vision_base64。",
+                        "message": "/observation did not return vision_base64.",
                     },
                     ensure_ascii=False,
                 )
@@ -115,16 +148,23 @@ def main() -> None:
 
         image_bytes = base64.b64decode(strip_data_url_prefix(base64_str))
         image_path = write_image_bytes(image_bytes, DEFAULT_SAVE_DIR)
-        print(json.dumps(online_safe_payload(data, image_path), ensure_ascii=False))
 
-    except requests.exceptions.ConnectionError as e:
-        print(json.dumps({"status": "error", "result_type": "error_vision_service_unavailable", "message": str(e)}, ensure_ascii=False))
+        depth_path = None
+        depth_base64 = str(data.get("depth_base64") or "")
+        if depth_base64:
+            depth_bytes = base64.b64decode(strip_data_url_prefix(depth_base64))
+            depth_path = write_depth_bytes(depth_bytes, DEFAULT_SAVE_DIR)
+
+        print(json.dumps(online_safe_payload(data, image_path, depth_path), ensure_ascii=False))
+
+    except requests.exceptions.ConnectionError as exc:
+        print(json.dumps({"status": "error", "result_type": "error_vision_service_unavailable", "message": str(exc)}, ensure_ascii=False))
         sys.exit(1)
-    except requests.exceptions.Timeout as e:
-        print(json.dumps({"status": "error", "result_type": "error_vision_timeout", "message": str(e)}, ensure_ascii=False))
+    except requests.exceptions.Timeout as exc:
+        print(json.dumps({"status": "error", "result_type": "error_vision_timeout", "message": str(exc)}, ensure_ascii=False))
         sys.exit(1)
-    except Exception as e:
-        print(json.dumps({"status": "error", "result_type": "error_vision_unknown", "message": f"视觉抓取失败: {str(e)}"}, ensure_ascii=False))
+    except Exception as exc:
+        print(json.dumps({"status": "error", "result_type": "error_vision_unknown", "message": f"视觉抓取失败: {str(exc)}"}, ensure_ascii=False))
         sys.exit(1)
 
 

@@ -26,6 +26,13 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from pickup_floor_geometry import (
+    analyze_pickup_floor_contact,
+    depth_convention as pickup_depth_convention,
+    estimate_local_floor_plane,
+    project_pixel_to_robot_3d,
+)
+
 
 JsonDict = Dict[str, Any]
 
@@ -153,7 +160,6 @@ SURFACE_PARENT_LABELS = {
     "coffeetable",
     "side_table",
     "sidetable",
-    "sink",
 }
 
 SURFACE_BLOCKING_LABELS = {
@@ -163,6 +169,40 @@ SURFACE_BLOCKING_LABELS = {
     "dishwasher",
     "cabinet",
     "drawer",
+}
+
+POINTCLOUD_SURFACE_SOURCE = "pointcloud_plane"
+POINTCLOUD_COMPLETION_SURFACE_SOURCE = "pointcloud_plane_completion"
+POINTCLOUD_GRID_COMPLETION_SURFACE_SOURCE = "pointcloud_plane_grid_completion"
+DEPTH_REGION_SURFACE_SOURCE = "depth_region_geometry"
+LEGACY_DEPTH_SURFACE_SOURCE = "depth_geometry"
+SURFACE_REGION_SOURCES = {
+    POINTCLOUD_SURFACE_SOURCE,
+    POINTCLOUD_COMPLETION_SURFACE_SOURCE,
+    POINTCLOUD_GRID_COMPLETION_SURFACE_SOURCE,
+    DEPTH_REGION_SURFACE_SOURCE,
+}
+SURFACE_CANDIDATE_SOURCES = {
+    POINTCLOUD_SURFACE_SOURCE,
+    POINTCLOUD_COMPLETION_SURFACE_SOURCE,
+    POINTCLOUD_GRID_COMPLETION_SURFACE_SOURCE,
+    DEPTH_REGION_SURFACE_SOURCE,
+    LEGACY_DEPTH_SURFACE_SOURCE,
+}
+
+HELD_FOOD_LABELS = {"apple", "banana", "lettuce", "orange", "potato", "tomato"}
+HELD_PICKUP_LABELS = HELD_FOOD_LABELS | {
+    "book",
+    "bottle",
+    "bowl",
+    "cup",
+    "kettle",
+    "mug",
+    "pan",
+    "plate",
+    "pot",
+    "remote",
+    "remote_control",
 }
 
 
@@ -494,11 +534,14 @@ def candidate_sort_score(candidate: JsonDict, *, intent: str = "service") -> flo
     score = conf * 2.0 + min(area_ratio, 0.20) + center_bonus
     if candidate.get("context_only"):
         score -= 8.0
-    if candidate.get("surface_candidate_source") in {"depth_geometry", "depth_region_geometry"}:
+    surface_source = str(candidate.get("surface_candidate_source") or "")
+    if surface_source in SURFACE_CANDIDATE_SOURCES:
         score += float(candidate.get("score", 0.0) or 0.0) * 2.0
-    if candidate.get("surface_candidate_source") == "depth_region_geometry":
+    if surface_source in SURFACE_REGION_SOURCES:
         if candidate.get("visual_place_ready"):
             score += 2.0
+        if surface_source in {POINTCLOUD_SURFACE_SOURCE, POINTCLOUD_COMPLETION_SURFACE_SOURCE, POINTCLOUD_GRID_COMPLETION_SURFACE_SOURCE} and candidate.get("affordance_ready"):
+            score += 1.0
         if candidate.get("rejection_reasons"):
             score -= 2.0
         if candidate.get("blocked"):
@@ -520,10 +563,11 @@ def candidate_sort_score(candidate: JsonDict, *, intent: str = "service") -> flo
     elif intent == "receptacle":
         if candidate.get("place_now"):
             score += 4.0
-        if candidate.get("needs_alignment"):
-            score += 0.8
-        if candidate.get("needs_approach"):
-            score += 0.4
+        if not candidate.get("visual_place_ready"):
+            if candidate.get("needs_alignment"):
+                score += 0.8
+            if candidate.get("needs_approach"):
+                score += 0.4
         if candidate.get("task_semantic_class") != "place_receptacle":
             score -= 10.0
     elif intent == "obstacle":
@@ -630,13 +674,16 @@ def load_depth_frame(depth_path: str, *, image_w: int, image_h: int, notes: List
 
 
 def parse_camera_info(camera_info: Any, *, image_w: int, image_h: int) -> JsonDict:
+    parse_error = ""
     if isinstance(camera_info, str) and camera_info.strip():
         try:
             loaded = json.loads(camera_info)
             camera_info = loaded if isinstance(loaded, dict) else {}
         except json.JSONDecodeError:
+            parse_error = "json_decode_error"
             camera_info = {}
     if not isinstance(camera_info, dict):
+        parse_error = parse_error or "not_dict"
         camera_info = {}
 
     try:
@@ -653,7 +700,7 @@ def parse_camera_info(camera_info: Any, *, image_w: int, image_h: int) -> JsonDi
         except (TypeError, ValueError):
             return float(default)
 
-    return {
+    parsed = {
         "width": int(number("width", image_w)),
         "height": int(number("height", image_h)),
         "fx": number("fx", fallback_focal),
@@ -663,7 +710,18 @@ def parse_camera_info(camera_info: Any, *, image_w: int, image_h: int) -> JsonDi
         "fov_deg": fov_deg,
         "camera_horizon_deg": number("camera_horizon_deg", number("cameraHorizon", 0.0)),
         "camera_height_m": number("camera_height_m", env_float("ROBOT_CAMERA_HEIGHT_M", 0.9)),
+        # Keep the historical projection mode as the compatibility default, but
+        # make the convention explicit so it can be calibrated without silently
+        # changing every point-cloud threshold.
+        "depth_convention": str(
+            camera_info.get("depth_convention")
+            or os.getenv("ROBOT_DEPTH_CONVENTION", "optical_axis_z")
+            or "optical_axis_z"
+        ).strip().lower(),
     }
+    if parse_error:
+        parsed["_parse_error"] = parse_error
+    return parsed
 
 
 def depth_valid_mask(depth: Any) -> Any:
@@ -673,30 +731,23 @@ def depth_valid_mask(depth: Any) -> Any:
 
 
 def project_pixel_to_3d(u: float, v: float, depth_m: float, camera: JsonDict) -> JsonDict:
-    fx = max(1e-6, float(camera.get("fx", 1.0) or 1.0))
-    fy = max(1e-6, float(camera.get("fy", fx) or fx))
-    cx = float(camera.get("cx", 0.0) or 0.0)
-    cy = float(camera.get("cy", 0.0) or 0.0)
-    x_cam = (float(u) - cx) * float(depth_m) / fx
-    y_cam_up = -(float(v) - cy) * float(depth_m) / fy
-    z_cam = float(depth_m)
+    """Project one RGB-D sample using an explicit, calibratable convention.
 
-    pitch = math.radians(float(camera.get("camera_horizon_deg", 0.0) or 0.0))
-    camera_height = float(camera.get("camera_height_m", 0.9) or 0.9)
-    height_from_floor = camera_height + y_cam_up * math.cos(pitch) - z_cam * math.sin(pitch)
-    ground_forward_m = y_cam_up * math.sin(pitch) + z_cam * math.cos(pitch)
-    ground_distance_m = math.hypot(x_cam, ground_forward_m)
+    The implementation lives in ``pickup_floor_geometry`` so floor-contact
+    classification, point-cloud surfaces, and legacy depth candidates share the
+    same metric transform.
+    """
 
-    return {
-        "x": round(x_cam, 4),
-        "y": round(height_from_floor, 4),
-        "z": round(z_cam, 4),
-        "ground_forward_m": round(ground_forward_m, 4),
-        "ground_distance_m": round(ground_distance_m, 4),
-    }
+    return project_pixel_to_robot_3d(u, v, depth_m, camera)
 
 
-def candidate_depth_summary(candidate: JsonDict, depth_frame: Any, camera: JsonDict) -> Optional[JsonDict]:
+def candidate_depth_summary(
+    candidate: JsonDict,
+    depth_frame: Any,
+    camera: JsonDict,
+    *,
+    floor_plane: Optional[JsonDict] = None,
+) -> Optional[JsonDict]:
     import numpy as np  # type: ignore
 
     box = bbox_pixel_tuple(candidate)
@@ -731,7 +782,7 @@ def candidate_depth_summary(candidate: JsonDict, depth_frame: Any, camera: JsonD
 
     median_depth = float(np.median(values))
     point_3d = project_pixel_to_3d(cx, cy, median_depth, camera)
-    return {
+    result: JsonDict = {
         "available": True,
         "unit": "meter",
         "valid_ratio": round(valid_count / max(1, total), 4),
@@ -744,7 +795,17 @@ def candidate_depth_summary(candidate: JsonDict, depth_frame: Any, camera: JsonD
         "ground_distance_m": point_3d.get("ground_distance_m"),
         "ground_forward_m": point_3d.get("ground_forward_m"),
         "center_3d": point_3d,
+        "depth_convention": pickup_depth_convention(camera),
     }
+    if str(candidate.get("task_semantic_class") or "") in {"pickup_target", "cleanable_object"}:
+        result["floor_contact"] = analyze_pickup_floor_contact(
+            depth_frame,
+            camera,
+            (x1, y1, x2, y2),
+            floor_plane=floor_plane,
+            projector=project_pixel_to_3d,
+        )
+    return result
 
 
 def depth_number(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -814,6 +875,202 @@ def candidate_bearing_deg(candidate: JsonDict) -> Optional[float]:
     return math.degrees(math.atan2(x, z))
 
 
+def normalize_label_tokens(labels: Optional[Iterable[Any]]) -> List[str]:
+    tokens: List[str] = []
+    for label in labels or []:
+        for part in str(label or "").split(","):
+            token = normalize_label(part)
+            if token and token not in tokens:
+                tokens.append(token)
+    return tokens
+
+
+def candidate_label_matches(candidate: JsonDict, labels: Iterable[str]) -> bool:
+    held = {normalize_label(label) for label in labels if normalize_label(label)}
+    held_compact = {label.replace("_", "") for label in held}
+    if not held:
+        return False
+    candidate_tokens = {
+        normalize_label(candidate.get("label")),
+        normalize_label(candidate.get("raw_label")),
+    }
+    candidate_compact = {label.replace("_", "") for label in candidate_tokens if label}
+    return bool((candidate_tokens & held) or (candidate_compact & held_compact))
+
+
+def held_object_family_for_labels(labels: Iterable[str]) -> str:
+    tokens = {normalize_label(label) for label in labels if normalize_label(label)}
+    if tokens & HELD_FOOD_LABELS:
+        return "food"
+    if tokens & HELD_PICKUP_LABELS:
+        return "pickup_target"
+    return "unknown"
+
+
+def candidate_family(candidate: JsonDict) -> str:
+    label = normalize_label(candidate.get("label") or candidate.get("raw_label"))
+    if label in HELD_FOOD_LABELS:
+        return "food"
+    if str(candidate.get("task_semantic_class") or "") == "pickup_target" or label in HELD_PICKUP_LABELS:
+        return "pickup_target"
+    return "unknown"
+
+
+def candidate_foreground_overlay_score(candidate: JsonDict) -> Tuple[bool, JsonDict]:
+    geometry = candidate.get("geometry") if isinstance(candidate.get("geometry"), dict) else {}
+    cx_ratio = depth_number(geometry.get("cx_ratio"), 0.5) or 0.5
+    cy_ratio = depth_number(geometry.get("cy_ratio"), candidate.get("center_y_ratio")) or 0.5
+    bottom_y_ratio = depth_number(geometry.get("bottom_y_ratio"), candidate.get("bottom_y_ratio")) or 0.0
+    area_ratio = depth_number(candidate.get("area_ratio"), geometry.get("area_ratio")) or 0.0
+    distance_m = candidate_ground_distance(candidate)
+    if distance_m is None:
+        distance_m = candidate_depth_distance(candidate)
+    center_tolerance = env_float(
+        "ROBOT_HELD_OBJECT_FOREGROUND_CENTER_TOLERANCE",
+        env_float("ROBOT_HELD_OBJECT_IGNORE_CENTER_TOLERANCE", 0.28),
+    )
+    center_ok = abs(cx_ratio - 0.5) <= center_tolerance
+    lower_center_ok = bool(
+        center_ok
+        and cy_ratio >= env_float("ROBOT_HELD_OBJECT_FOREGROUND_MIN_CENTER_Y_RATIO", 0.55)
+        and bottom_y_ratio >= env_float("ROBOT_HELD_OBJECT_FOREGROUND_MIN_BOTTOM_RATIO", 0.65)
+    )
+    close_ok = bool(
+        distance_m is not None
+        and center_ok
+        and distance_m <= env_float("ROBOT_HELD_OBJECT_FOREGROUND_MAX_GROUND_DISTANCE", 0.55)
+    )
+    large_ok = area_ratio >= env_float("ROBOT_HELD_OBJECT_FOREGROUND_MIN_AREA_RATIO", 0.003)
+    overlay = bool(center_ok and large_ok and (close_ok or lower_center_ok))
+    return overlay, {
+        "cx_ratio": round(float(cx_ratio), 4),
+        "cy_ratio": round(float(cy_ratio), 4),
+        "bottom_y_ratio": round(float(bottom_y_ratio), 4),
+        "area_ratio": round(float(area_ratio), 6),
+        "distance_m": round(float(distance_m), 4) if distance_m is not None else None,
+        "center_tolerance": round(float(center_tolerance), 4),
+        "center_ok": bool(center_ok),
+        "lower_center_ok": bool(lower_center_ok),
+        "close_ok": bool(close_ok),
+        "large_ok": bool(large_ok),
+    }
+
+
+def candidate_likely_held_object(
+    candidate: JsonDict,
+    held_object_labels: Iterable[str],
+    held_object_family: Optional[str] = None,
+) -> bool:
+    if str(candidate.get("task_semantic_class") or "") != "pickup_target":
+        return False
+
+    overlay, detail = candidate_foreground_overlay_score(candidate)
+    if not overlay:
+        return False
+    held_labels = normalize_label_tokens(held_object_labels)
+    held_family = normalize_label(held_object_family or "") or held_object_family_for_labels(held_labels)
+    label_match = candidate_label_matches(candidate, held_labels)
+    family = candidate_family(candidate)
+    family_match = bool(
+        held_family == "pickup_target"
+        or (held_family == "food" and family == "food")
+        or (held_family == family and held_family != "unknown")
+    )
+    if label_match or family_match or env_bool("ROBOT_HELD_OBJECT_IGNORE_ANY_FOREGROUND_PICKUP", False):
+        candidate["likely_held_object_overlay"] = True
+        candidate["held_object_overlay_checks"] = detail
+        candidate["held_object_family_match"] = bool(family_match)
+        return True
+    return False
+
+
+def filter_held_object_blockers(
+    candidates: Iterable[JsonDict],
+    *,
+    holding_object: bool,
+    held_object_labels: Iterable[str],
+    held_object_family: Optional[str] = None,
+) -> Tuple[List[JsonDict], int]:
+    held_labels = normalize_label_tokens(held_object_labels)
+    filtered: List[JsonDict] = []
+    ignored = 0
+    for candidate in candidates:
+        if (
+            holding_object
+            and env_bool("ROBOT_HELD_OBJECT_BLOCKER_IGNORE_ENABLED", True)
+            and isinstance(candidate, dict)
+            and candidate_likely_held_object(candidate, held_labels, held_object_family)
+        ):
+            candidate["held_object_candidate"] = True
+            candidate["ignored_as_held_object_blocker"] = True
+            ignored += 1
+            continue
+        filtered.append(candidate)
+    return filtered, ignored
+
+
+def mark_held_object_overlays(
+    candidates: Iterable[JsonDict],
+    *,
+    holding_object: bool,
+    held_object_labels: Iterable[str],
+    held_object_family: Optional[str] = None,
+) -> List[JsonDict]:
+    if not holding_object or not env_bool("ROBOT_HELD_OBJECT_BLOCKER_IGNORE_ENABLED", True):
+        return []
+    held_labels = normalize_label_tokens(held_object_labels)
+    overlays: List[JsonDict] = []
+    seen = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        if candidate_likely_held_object(candidate, held_labels, held_object_family):
+            candidate["held_object_candidate"] = True
+            candidate["ignored_as_held_object_blocker"] = True
+            candidate["likely_held_object_overlay"] = True
+            key = (
+                normalize_label(candidate.get("label") or candidate.get("raw_label")),
+                str(candidate.get("bbox")),
+            )
+            if key not in seen:
+                seen.add(key)
+                overlays.append(candidate)
+    return overlays
+
+
+def infer_held_object_labels_from_candidates(candidates: Iterable[JsonDict]) -> List[str]:
+    scored: List[Tuple[float, str]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        if str(candidate.get("task_semantic_class") or "") != "pickup_target":
+            continue
+        geometry = candidate.get("geometry") if isinstance(candidate.get("geometry"), dict) else {}
+        cx_ratio = depth_number(geometry.get("cx_ratio"), 0.5) or 0.5
+        bottom_y_ratio = depth_number(geometry.get("bottom_y_ratio"), candidate.get("bottom_y_ratio")) or 0.0
+        area_ratio = depth_number(candidate.get("area_ratio"), geometry.get("area_ratio")) or 0.0
+        if abs(cx_ratio - 0.5) > env_float("ROBOT_HELD_OBJECT_INFER_CENTER_TOLERANCE", 0.28):
+            continue
+        if bottom_y_ratio < env_float("ROBOT_HELD_OBJECT_INFER_MIN_BOTTOM_RATIO", 0.65):
+            continue
+        if area_ratio < env_float("ROBOT_HELD_OBJECT_INFER_MIN_AREA_RATIO", 0.003):
+            continue
+        label = normalize_label(candidate.get("label") or candidate.get("raw_label") or "")
+        if not label:
+            continue
+        score = (
+            area_ratio * 10.0
+            + bottom_y_ratio
+            + max(0.0, 0.5 - abs(cx_ratio - 0.5)) * 2.0
+            + float(candidate.get("confidence", 0.0) or 0.0)
+        )
+        scored.append((score, label))
+    if not scored:
+        return []
+    scored.sort(reverse=True)
+    return [scored[0][1]]
+
+
 def apply_depth_actionability(candidate: JsonDict) -> None:
     """Use metric depth for action hints that used to be estimated from bbox size."""
     task_class = str(candidate.get("task_semantic_class") or "")
@@ -858,7 +1115,24 @@ def apply_depth_actionability(candidate: JsonDict) -> None:
     support_max_h = env_float("ROBOT_DEPTH_SUPPORT_MAX_HEIGHT_M", 1.25)
     floor_like_by_height = bool(height_m is not None and floor_min_h <= height_m <= floor_max_h)
     floor_like_by_bottom_band = False
-    floor_level_source = "height_band" if floor_like_by_height else None
+    depth_payload = candidate.get("depth") if isinstance(candidate.get("depth"), dict) else {}
+    floor_contact = depth_payload.get("floor_contact") if isinstance(depth_payload.get("floor_contact"), dict) else {}
+    contact_support_height = depth_number(floor_contact.get("support_height_m"))
+    contact_max_support_height = env_float("ROBOT_DEPTH_FLOOR_CONTACT_MAX_SUPPORT_HEIGHT_M", 0.16)
+    raw_floor_like_by_contact = bool(floor_contact.get("contact_floor_like"))
+    floor_like_by_contact = bool(
+        raw_floor_like_by_contact
+        and (contact_support_height is None or contact_support_height <= contact_max_support_height)
+    )
+    floor_level_source = "rgbd_floor_plane_contact" if floor_like_by_contact else None
+    if floor_contact:
+        candidate["floor_contact_geometry"] = dict(floor_contact)
+        candidate["bottom_contact_3d"] = floor_contact.get("bottom_contact_3d")
+        candidate["floor_plane_residual_m"] = floor_contact.get("floor_plane_residual_m")
+        candidate["floor_contact_confidence"] = floor_contact.get("confidence")
+        if raw_floor_like_by_contact and not floor_like_by_contact:
+            candidate["floor_contact_rejected_reason"] = "support_height_above_floor_band"
+            candidate["floor_contact_max_support_height_m"] = round(float(contact_max_support_height), 4)
 
     geometry_bottom = depth_number(geometry.get("bottom_y_ratio"))
     candidate_bottom = depth_number(candidate.get("bottom_y_ratio"))
@@ -866,14 +1140,12 @@ def apply_depth_actionability(candidate: JsonDict) -> None:
     if bottom_y_ratio is None:
         bottom_y_ratio = 0.0
 
-    # A single projected center can fall below the floor when camera pitch/FOV or
-    # object-center depth is imperfect. For floor pickup targets, keep the
-    # standard height band as primary evidence, but allow a conservative
-    # bottom-of-image + ground-distance fallback.
+    # A single projected center is weak evidence: it may hit the object side,
+    # table surface, or background. For floor-only pickup targets, require
+    # bottom contact or a conservative bottom-band ground-distance fallback.
     if (
         task_class == "pickup_target"
         and env_bool("ROBOT_DEPTH_PICKUP_FLOOR_FALLBACK_ENABLED", True)
-        and not floor_like_by_height
     ):
         fallback_min_bottom = env_float(
             "ROBOT_DEPTH_PICKUP_FLOOR_FALLBACK_MIN_BOTTOM_RATIO",
@@ -893,14 +1165,24 @@ def apply_depth_actionability(candidate: JsonDict) -> None:
         if floor_like_by_bottom_band:
             floor_level_source = "bottom_band_ground_distance_fallback"
 
-    floor_like = bool(floor_like_by_height or floor_like_by_bottom_band)
+    height_band_decisive = bool(task_class != "pickup_target" and floor_like_by_height)
+    if height_band_decisive and floor_level_source is None:
+        floor_level_source = "height_band"
+
+    floor_like = bool(floor_like_by_contact or floor_like_by_bottom_band or height_band_decisive)
     support_like = bool(height_m is not None and support_min_h <= height_m <= support_max_h)
 
     if task_class in {"pickup_target", "cleanable_object"}:
         candidate["is_floor_level"] = bool(floor_like)
         candidate["surface_hint"] = "floor" if floor_like else "surface_or_elevated"
-        candidate["floor_level_source"] = floor_level_source or "height_out_of_floor_band"
-        if floor_like_by_bottom_band:
+        candidate["height_band_floor_like"] = bool(floor_like_by_height)
+        candidate["height_band_floor_like_used"] = bool(height_band_decisive)
+        candidate["floor_level_source"] = floor_level_source or (
+            "height_band_weak" if floor_like_by_height else "height_out_of_floor_band"
+        )
+        if floor_like_by_contact and not floor_like_by_height:
+            candidate["projected_height_warning"] = "center_height_out_of_floor_band_but_rgbd_bottom_contact_is_floor_like"
+        elif floor_like_by_bottom_band:
             candidate["projected_height_warning"] = "height_out_of_floor_band_but_bottom_band_ground_distance_floor_like"
 
     if task_class == "pickup_target":
@@ -953,14 +1235,30 @@ def pixel_in_candidate_bbox(px: float, py: float, candidate: JsonDict, *, margin
     return (x1 - margin) <= px <= (x2 + margin) and (y1 - margin) <= py <= (y2 + margin)
 
 
-def surface_blockers_for(parent: JsonDict, candidates: List[JsonDict]) -> List[JsonDict]:
+def surface_blockers_for(
+    parent: JsonDict,
+    candidates: List[JsonDict],
+    *,
+    holding_object: bool = False,
+    held_object_labels: Optional[Iterable[str]] = None,
+    held_object_family: Optional[str] = None,
+) -> List[JsonDict]:
     blockers: List[JsonDict] = []
     parent_box = bbox_pixel_tuple(parent)
     if parent_box is None:
         return blockers
     px1, py1, px2, py2 = parent_box
+    held_labels = normalize_label_tokens(held_object_labels)
     for candidate in candidates:
         if candidate is parent:
+            continue
+        if (
+            holding_object
+            and env_bool("ROBOT_HELD_OBJECT_BLOCKER_IGNORE_ENABLED", True)
+            and candidate_likely_held_object(candidate, held_labels, held_object_family)
+        ):
+            candidate["held_object_candidate"] = True
+            candidate["ignored_as_held_object_blocker"] = True
             continue
         label = normalize_label(candidate.get("label") or candidate.get("raw_label") or "")
         task_class = str(candidate.get("task_semantic_class") or "")
@@ -1040,6 +1338,41 @@ def surface_region_blockers(
     return blocked_by
 
 
+def summarize_surface_rejections(surface_regions: Iterable[JsonDict]) -> JsonDict:
+    summary: Dict[str, int] = {
+        "too_small": 0,
+        "too_close": 0,
+        "too_far": 0,
+        "height_out_of_range": 0,
+        "depth_unstable": 0,
+        "thin_region": 0,
+        "single_row_region": 0,
+        "touches_image_edge": 0,
+        "touches_parent_edge": 0,
+        "blocked": 0,
+        "failed_recently": 0,
+    }
+    for region in surface_regions:
+        if not isinstance(region, dict):
+            continue
+        reasons = list(region.get("rejection_reasons") or [])
+        memory_checks = region.get("memory_checks") if isinstance(region.get("memory_checks"), dict) else {}
+        if region.get("failed_recently") or memory_checks.get("failed_recently"):
+            reasons.append("failed_recently")
+        for reason in reasons:
+            token = str(reason or "")
+            if token.startswith("blocked"):
+                key = "blocked"
+            elif token.startswith("cooldown"):
+                key = "failed_recently"
+            else:
+                key = token
+            if key not in summary:
+                summary[key] = 0
+            summary[key] += 1
+    return summary
+
+
 def make_surface_region_candidate(
     *,
     parent: JsonDict,
@@ -1064,6 +1397,19 @@ def make_surface_region_candidate(
     area_ratio = area_px / max(1.0, float(image_w * image_h))
     center_x = (x1 + x2) / 2.0
     center_y = (y1 + y2) / 2.0
+    patch_count = len(patches)
+    grid_rows = {
+        int(patch.get("grid", (0, 0))[0])
+        for patch in patches
+        if isinstance(patch.get("grid"), tuple)
+    }
+    grid_cols = {
+        int(patch.get("grid", (0, 0))[1])
+        for patch in patches
+        if isinstance(patch.get("grid"), tuple)
+    }
+    patch_rows = len(grid_rows) if grid_rows else 1
+    patch_cols = len(grid_cols) if grid_cols else 1
 
     depths = [float(patch["median_depth"]) for patch in patches]
     heights = [
@@ -1081,7 +1427,24 @@ def make_surface_region_candidate(
     depth_span = depth_q90 - depth_q10
     median_depth = float(np.median(depths))
     height_m = float(np.median(heights)) if heights else None
-    height_std = float(np.std(heights)) if len(heights) > 1 else 0.0
+    center_height_std = float(np.std(heights)) if len(heights) > 1 else 0.0
+    local_height_stds = [
+        float(patch.get("height_std", 0.0) or 0.0)
+        for patch in patches
+        if math.isfinite(float(patch.get("height_std", 0.0) or 0.0))
+    ]
+    local_height_std = max(local_height_stds, default=0.0)
+    height_std = max(center_height_std, local_height_std)
+    dominant_support_heights = [
+        float(patch.get("dominant_support_height_m"))
+        for patch in patches
+        if patch.get("dominant_support_height_m") is not None
+    ]
+    dominant_support_height_m = (
+        float(np.median(dominant_support_heights))
+        if dominant_support_heights
+        else height_m
+    )
     center_3d = project_pixel_to_3d(center_x, center_y, median_depth, camera)
     center_ground_distance = depth_number(center_3d.get("ground_distance_m"))
     if ground_distances:
@@ -1107,6 +1470,10 @@ def make_surface_region_candidate(
     min_w = env_float("ROBOT_DEPTH_SURFACE_REGION_MIN_W_PIXELS", 45.0)
     min_h = env_float("ROBOT_DEPTH_SURFACE_REGION_MIN_H_PIXELS", 35.0)
     min_area_ratio = env_float("ROBOT_DEPTH_SURFACE_REGION_MIN_AREA_RATIO", 0.004)
+    min_patch_count = max(1, env_int("ROBOT_DEPTH_SURFACE_REGION_MIN_PATCH_COUNT", 4))
+    min_patch_rows = max(1, env_int("ROBOT_DEPTH_SURFACE_REGION_MIN_PATCH_ROWS", 2))
+    min_patch_cols = max(1, env_int("ROBOT_DEPTH_SURFACE_REGION_MIN_PATCH_COLS", 2))
+    max_aspect_ratio = env_float("ROBOT_DEPTH_SURFACE_REGION_MAX_ASPECT_RATIO", 5.0)
     min_distance = env_float("ROBOT_DEPTH_SURFACE_REGION_MIN_DISTANCE_M", 0.55)
     max_distance = env_float("ROBOT_DEPTH_SURFACE_REGION_MAX_DISTANCE_M", 1.50)
     min_height = env_float("ROBOT_DEPTH_SURFACE_REGION_MIN_HEIGHT_M", 0.55)
@@ -1115,6 +1482,12 @@ def make_surface_region_candidate(
     max_height_std = env_float("ROBOT_DEPTH_SURFACE_REGION_MAX_HEIGHT_STD_M", 0.05)
 
     area_ok = bool(width >= min_w and height >= min_h and area_ratio >= min_area_ratio)
+    single_row_region = bool(patch_rows < min_patch_rows)
+    single_col_region = bool(patch_cols < min_patch_cols)
+    patch_count_ok = bool(patch_count >= min_patch_count)
+    patch_grid_ok = bool(patch_count_ok and not single_row_region and not single_col_region)
+    aspect_ratio = max(width, height) / max(1.0, min(width, height))
+    thin_region = bool(width < min_w or height < min_h or aspect_ratio > max_aspect_ratio)
     distance_ok = bool(min_distance <= distance_m <= max_distance)
     height_ok = bool(height_m is not None and min_height <= float(height_m) <= max_height)
     image_edge_ok = bool(
@@ -1138,6 +1511,14 @@ def make_surface_region_candidate(
     rejection_reasons: List[str] = []
     if not area_ok:
         rejection_reasons.append("too_small")
+    if thin_region:
+        rejection_reasons.append("thin_region")
+    if single_row_region:
+        rejection_reasons.append("single_row_region")
+    if single_col_region:
+        rejection_reasons.append("single_col_region")
+    if not patch_count_ok:
+        rejection_reasons.append("too_few_patches")
     if distance_m < min_distance:
         rejection_reasons.append("too_close")
     elif distance_m > max_distance:
@@ -1157,6 +1538,8 @@ def make_surface_region_candidate(
 
     visual_place_ready = bool(
         area_ok
+        and patch_grid_ok
+        and not thin_region
         and distance_ok
         and height_ok
         and edge_ok
@@ -1168,8 +1551,16 @@ def make_surface_region_candidate(
     height_score = 0.0 if height_m is None else max(0.0, 1.0 - min(1.0, abs(float(height_m) - 0.85) / 0.45))
     distance_score = max(0.0, 1.0 - min(1.0, abs(distance_m - 0.95) / 0.65))
     area_score = min(1.0, area_ratio / max(0.001, min_area_ratio * 4.0))
+    shape_score = min(1.0, patch_count / max(1.0, float(min_patch_count) * 2.0))
     center_score = max(0.0, 1.0 - min(1.0, abs((center_x / max(1.0, image_w)) - 0.5) / 0.5))
-    score = 0.26 * area_score + 0.24 * depth_score + 0.20 * height_score + 0.18 * distance_score + 0.12 * center_score
+    score = (
+        0.22 * area_score
+        + 0.20 * depth_score
+        + 0.18 * height_score
+        + 0.16 * distance_score
+        + 0.12 * shape_score
+        + 0.12 * center_score
+    )
     if not visual_place_ready:
         score *= 0.45
     if blocked:
@@ -1185,10 +1576,24 @@ def make_surface_region_candidate(
         "edge_ok": bool(edge_ok),
         "depth_stable": bool(depth_stable),
         "normal_like_horizontal": bool(normal_like_horizontal),
+        "patch_count_ok": bool(patch_count_ok),
+        "patch_grid_ok": bool(patch_grid_ok),
+        "thin_region": bool(thin_region),
+        "single_row_region": bool(single_row_region),
+        "single_col_region": bool(single_col_region),
+        "patch_count": int(patch_count),
+        "patch_rows": int(patch_rows),
+        "patch_cols": int(patch_cols),
+        "aspect_ratio": round(float(aspect_ratio), 4),
         "region_w": round(float(width), 3),
         "region_h": round(float(height), 3),
         "depth_span_m": round(float(depth_span), 4),
         "height_std_m": round(float(height_std), 4),
+        "center_height_std_m": round(float(center_height_std), 4),
+        "local_height_std_m": round(float(local_height_std), 4),
+        "dominant_support_height_m": round(float(dominant_support_height_m), 4)
+        if dominant_support_height_m is not None
+        else None,
         "image_edge_ok": bool(image_edge_ok),
         "parent_edge_ok": bool(parent_edge_ok),
     }
@@ -1230,9 +1635,15 @@ def make_surface_region_candidate(
         "area_ratio": round(float(area_ratio), 6),
         "region_area_px": int(round(area_px)),
         "region_area_ratio": round(float(area_ratio), 6),
+        "patch_count": int(patch_count),
+        "patch_rows": int(patch_rows),
+        "patch_cols": int(patch_cols),
         "center_y_ratio": round(float(center_y / max(1.0, image_h)), 3),
         "bottom_y_ratio": round(float(y2 / max(1.0, image_h)), 3),
         "height_m": round(float(height_m), 4) if height_m is not None else None,
+        "dominant_support_height_m": round(float(dominant_support_height_m), 4)
+        if dominant_support_height_m is not None
+        else None,
         "distance_m": round(float(distance_m), 4),
         "depth_m": round(float(median_depth), 4),
         "bearing_deg": round(float(bearing_deg), 3),
@@ -1249,6 +1660,9 @@ def make_surface_region_candidate(
             "ground_forward_m": center_3d.get("ground_forward_m"),
             "ground_distance_m": round(float(distance_m), 4),
             "height_m": round(float(height_m), 4) if height_m is not None else None,
+            "dominant_support_height_m": round(float(dominant_support_height_m), 4)
+            if dominant_support_height_m is not None
+            else None,
             "height_std_m": round(float(height_std), 4),
             "depth_span_m": round(float(depth_span), 4),
         },
@@ -1530,6 +1944,9 @@ def generate_surface_candidates_for_receptacle(
     all_candidates: List[JsonDict],
     image_w: int,
     image_h: int,
+    holding_object: bool = False,
+    held_object_labels: Optional[Iterable[str]] = None,
+    held_object_family: Optional[str] = None,
 ) -> List[JsonDict]:
     import numpy as np  # type: ignore
 
@@ -1538,6 +1955,8 @@ def generate_surface_candidates_for_receptacle(
         return []
     label = normalize_label(parent.get("label") or parent.get("raw_label") or "")
     if label not in SURFACE_PARENT_LABELS:
+        return []
+    if label in {"sink", "stove"}:
         return []
 
     x1, y1, x2, y2 = parent_box
@@ -1558,6 +1977,10 @@ def generate_surface_candidates_for_receptacle(
     max_iqr = env_float("ROBOT_DEPTH_SURFACE_MAX_IQR_M", 0.18)
     min_height = env_float("ROBOT_DEPTH_SURFACE_MIN_HEIGHT_M", 0.35)
     max_height = env_float("ROBOT_DEPTH_SURFACE_MAX_HEIGHT_M", 1.25)
+    support_min_height = env_float("ROBOT_DEPTH_SURFACE_REGION_MIN_HEIGHT_M", 0.55)
+    support_max_height = env_float("ROBOT_DEPTH_SURFACE_REGION_MAX_HEIGHT_M", 1.15)
+    support_band_width = env_float("ROBOT_DEPTH_SURFACE_HEIGHT_BAND_WIDTH_M", 0.08)
+    support_band_tolerance = env_float("ROBOT_DEPTH_SURFACE_HEIGHT_BAND_TOLERANCE_M", 0.07)
     ideal_height = env_float("ROBOT_DEPTH_SURFACE_IDEAL_HEIGHT_M", 0.85)
     max_distance = env_float("ROBOT_DEPTH_SURFACE_MAX_DISTANCE_M", 2.4)
     min_ground_distance = env_float("ROBOT_DEPTH_SURFACE_MIN_GROUND_DISTANCE_M", 0.35)
@@ -1567,7 +1990,13 @@ def generate_surface_candidates_for_receptacle(
     )
     ideal_ground_distance = env_float("ROBOT_DEPTH_SURFACE_IDEAL_GROUND_DISTANCE_M", 0.75)
     ground_distance_score_span = env_float("ROBOT_DEPTH_SURFACE_GROUND_DISTANCE_SCORE_SPAN_M", 0.65)
-    blockers = surface_blockers_for(parent, all_candidates)
+    blockers = surface_blockers_for(
+        parent,
+        all_candidates,
+        holding_object=holding_object,
+        held_object_labels=held_object_labels,
+        held_object_family=held_object_family,
+    )
     patches: List[JsonDict] = []
 
     for yy in range(y1_i, y2_i, cell):
@@ -1602,22 +2031,71 @@ def generate_surface_candidates_for_receptacle(
                 height_m = None
             if height_m is not None and not (min_height <= height_m <= max_height):
                 continue
+            height_samples: List[float] = []
+            sample_step = max(1, int(max(1, min(yy2 - yy, xx2 - xx)) / 3))
+            for sample_y in range(yy, yy2, sample_step):
+                for sample_x in range(xx, xx2, sample_step):
+                    sample_depth = float(depth_frame[sample_y, sample_x])
+                    if not math.isfinite(sample_depth) or sample_depth <= 0.05 or sample_depth >= 20.0:
+                        continue
+                    sample_3d = project_pixel_to_3d(float(sample_x), float(sample_y), sample_depth, camera)
+                    sample_height = depth_number(sample_3d.get("y"))
+                    if sample_height is not None:
+                        height_samples.append(float(sample_height))
+            height_std = float(np.std(height_samples)) if len(height_samples) > 1 else 0.0
 
             patches.append(
                 {
                     "bbox": (float(xx), float(yy), float(xx2), float(yy2)),
                     "grid": (int((yy - y1_i) // cell), int((xx - x1_i) // cell)),
                     "center": (float(cx), float(cy)),
+                    "center_3d": center_3d,
                     "valid_ratio": valid_count / max(1, total),
                     "median_depth": float(median_depth),
                     "q10": float(q10),
                     "q90": float(q90),
+                    "depth_range": float(iqr),
                     "iqr": float(iqr),
                     "height_m": height_m,
+                    "height_std": height_std,
                     "ground_distance_m": ground_distance_m,
                 }
             )
 
+    if not patches:
+        return []
+
+    support_height_patches = [
+        patch for patch in patches
+        if patch.get("height_m") is not None
+        and support_min_height <= float(patch.get("height_m")) <= support_max_height
+    ]
+    if not support_height_patches:
+        return []
+
+    band_width = max(0.01, float(support_band_width))
+    bins: Dict[int, List[JsonDict]] = {}
+    for patch in support_height_patches:
+        height_value = float(patch.get("height_m"))
+        band_index = int(math.floor((height_value - support_min_height) / band_width))
+        bins.setdefault(band_index, []).append(patch)
+    dominant_band = max(
+        bins.values(),
+        key=lambda items: (len(items), -float(np.std([float(item.get("height_m")) for item in items]))),
+    )
+    dominant_height = float(np.median([float(patch.get("height_m")) for patch in dominant_band]))
+    band_tolerance = max(0.01, float(support_band_tolerance))
+    for patch in patches:
+        height_value = depth_number(patch.get("height_m"))
+        band_delta = abs(float(height_value) - dominant_height) if height_value is not None else float("inf")
+        patch["dominant_support_height_m"] = dominant_height
+        patch["support_height_band_delta_m"] = band_delta
+        patch["support_height_band_ok"] = bool(
+            height_value is not None
+            and support_min_height <= float(height_value) <= support_max_height
+            and band_delta <= band_tolerance
+        )
+    patches = [patch for patch in patches if patch.get("support_height_band_ok")]
     if not patches:
         return []
 
@@ -1706,47 +2184,327 @@ def apply_depth_geometry(
     *,
     depth_frame: Any,
     camera_info: Any,
+    image_path: str = "",
+    save_plane_vis: str = "",
     image_w: int,
     image_h: int,
     notes: List[str],
+    holding_object: bool = False,
+    held_object_labels: Optional[Iterable[str]] = None,
+    held_object_family: Optional[str] = None,
+    diagnostics: Optional[JsonDict] = None,
 ) -> List[JsonDict]:
     if depth_frame is None:
         return []
 
     camera = parse_camera_info(camera_info, image_w=image_w, image_h=image_h)
+    if camera.get("_parse_error"):
+        notes.append(f"camera_json_parse_failed={camera.get('_parse_error')}")
+    notes.append(
+        "camera_used="
+        + json.dumps(
+            {
+                "camera_height_m": camera.get("camera_height_m"),
+                "camera_horizon_deg": camera.get("camera_horizon_deg"),
+                "fx": camera.get("fx"),
+                "fy": camera.get("fy"),
+                "cx": camera.get("cx"),
+                "cy": camera.get("cy"),
+                "width": camera.get("width"),
+                "height": camera.get("height"),
+                "depth_convention": pickup_depth_convention(camera),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    held_labels = normalize_label_tokens(held_object_labels)
+    held_family = normalize_label(held_object_family or "") or held_object_family_for_labels(held_labels)
     generated: List[JsonDict] = []
+    pointcloud_generated: List[JsonDict] = []
+    patch_generated: List[JsonDict] = []
     original_candidates = list(candidates)
+    floor_plane = estimate_local_floor_plane(depth_frame, camera, projector=project_pixel_to_3d)
+    notes.append(
+        "pickup_floor_plane="
+        + json.dumps(
+            {
+                "available": floor_plane.get("available"),
+                "reason": floor_plane.get("reason"),
+                "inlier_count": floor_plane.get("inlier_count"),
+                "residual_p90_m": floor_plane.get("residual_p90_m"),
+                "normal_up_score": floor_plane.get("normal_up_score"),
+                "depth_convention": floor_plane.get("depth_convention"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
     for candidate in original_candidates:
-        summary = candidate_depth_summary(candidate, depth_frame, camera)
+        summary = candidate_depth_summary(candidate, depth_frame, camera, floor_plane=floor_plane)
         if summary is not None:
             candidate["depth"] = summary
             apply_depth_actionability(candidate)
+    blocker_candidates, held_blockers_ignored = filter_held_object_blockers(
+        original_candidates,
+        holding_object=bool(holding_object),
+        held_object_labels=held_labels,
+        held_object_family=held_family,
+    )
 
-    for candidate in original_candidates:
-        if candidate.get("task_semantic_class") != "place_receptacle":
-            continue
-        surface_regions = generate_surface_candidates_for_receptacle(
-            parent=candidate,
-            depth_frame=depth_frame,
-            camera=camera,
-            all_candidates=original_candidates,
-            image_w=image_w,
-            image_h=image_h,
-        )
-        if not surface_regions:
-            continue
-        candidate["context_only"] = True
-        candidate["context_reason"] = "depth_surface_regions_generated"
-        candidate["place_now"] = False
-        candidate["needs_alignment"] = False
-        candidate["needs_approach"] = False
-        candidate["surface_regions"] = surface_regions
-        candidate["surface_candidates"] = surface_regions
-        generated.extend(surface_regions)
+    def attach_surface_regions(surface_regions: List[JsonDict], *, context_reason: str) -> None:
+        for candidate in original_candidates:
+            if candidate.get("task_semantic_class") != "place_receptacle":
+                continue
+            matching = [
+                region
+                for region in surface_regions
+                if isinstance(region, dict)
+                and region.get("parent_bbox") == candidate.get("bbox")
+            ]
+            if not matching:
+                continue
+            candidate["context_only"] = True
+            candidate["context_reason"] = context_reason
+            candidate["place_now"] = False
+            candidate["needs_alignment"] = False
+            candidate["needs_approach"] = False
+            existing_regions = candidate.get("surface_regions") if isinstance(candidate.get("surface_regions"), list) else []
+            existing_candidates = (
+                candidate.get("surface_candidates")
+                if isinstance(candidate.get("surface_candidates"), list)
+                else []
+            )
+            candidate["surface_regions"] = list(existing_regions) + matching
+            candidate["surface_candidates"] = list(existing_candidates) + matching
+
+    if env_bool("ROBOT_POINTCLOUD_SURFACE_ENABLED", True):
+        try:
+            script_dir = str(Path(__file__).resolve().parent)
+            if script_dir not in sys.path:
+                sys.path.append(script_dir)
+            from surface_pointcloud import build_pointcloud_surface_output, depth_to_pointcloud  # type: ignore
+
+            stride = max(1, env_int("ROBOT_POINTCLOUD_STRIDE", 2))
+            pointcloud = depth_to_pointcloud(depth_frame, camera, stride=stride)
+            pointcloud_output = build_pointcloud_surface_output(
+                points=pointcloud,
+                parents=original_candidates,
+                blockers=original_candidates,
+                image_w=int(image_w),
+                image_h=int(image_h),
+                camera=camera,
+                holding_object=bool(holding_object),
+                held_object_labels=held_labels,
+                held_object_family=held_family,
+                debug_image_path=str(image_path or ""),
+                debug_plane_vis_path=str(save_plane_vis or ""),
+            )
+            raw_regions = pointcloud_output.get("regions") if isinstance(pointcloud_output, dict) else []
+            pointcloud_generated = [region for region in raw_regions if isinstance(region, dict)]
+            if pointcloud_generated:
+                attach_surface_regions(
+                    pointcloud_generated,
+                    context_reason="pointcloud_surface_regions_generated",
+                )
+                generated.extend(pointcloud_generated)
+            notes.append(f"pointcloud_surface_regions={len(pointcloud_generated)}")
+            notes.append(
+                f"pointcloud_surface_ready={sum(1 for region in pointcloud_generated if region.get('visual_place_ready'))}"
+            )
+            try:
+                held_blockers_ignored = max(
+                    int(held_blockers_ignored),
+                    int(pointcloud_output.get("ignored_held_blocker_count", 0) or 0),
+                )
+            except (TypeError, ValueError):
+                pass
+            skipped = pointcloud_output.get("skipped_blockers") if isinstance(pointcloud_output, dict) else []
+            if isinstance(skipped, list) and skipped:
+                notes.append(f"skipped_blockers={json.dumps(skipped[:12], ensure_ascii=False, sort_keys=True)}")
+            ignored_as_blocker = (
+                pointcloud_output.get("held_object_ignored_as_blocker")
+                if isinstance(pointcloud_output, dict)
+                else []
+            )
+            if isinstance(ignored_as_blocker, list) and ignored_as_blocker:
+                notes.append(
+                    "held_object_ignored_as_blocker="
+                    + json.dumps(ignored_as_blocker[:8], ensure_ascii=False, sort_keys=True)
+                )
+            point_filter = pointcloud_output.get("held_object_point_filter") if isinstance(pointcloud_output, dict) else []
+            if isinstance(point_filter, list) and point_filter:
+                notes.append(
+                    "held_object_point_filter="
+                    + json.dumps(point_filter[:8], ensure_ascii=False, sort_keys=True)
+                )
+            try:
+                removed_points = int(pointcloud_output.get("held_object_points_removed", 0) or 0)
+            except (TypeError, ValueError):
+                removed_points = 0
+            if removed_points:
+                notes.append(f"held_object_points_removed={removed_points}")
+            stats = pointcloud_output.get("stats") if isinstance(pointcloud_output, dict) else []
+            notes.append(f"open3d_plane_segmentation_stats={json.dumps(stats, ensure_ascii=False, sort_keys=True)}")
+            notes.append(f"pointcloud_initial_plane_count={int(pointcloud_output.get('initial_plane_count', 0) or 0)}")
+            if pointcloud_output.get("initial_plane_vis_path"):
+                notes.append(f"pointcloud_initial_plane_vis={pointcloud_output.get('initial_plane_vis_path')}")
+            if pointcloud_output.get("initial_plane_vis_error"):
+                notes.append(f"pointcloud_initial_plane_vis_failed={pointcloud_output.get('initial_plane_vis_error')}")
+            stage_vis_paths = pointcloud_output.get("stage_vis_paths") if isinstance(pointcloud_output, dict) else {}
+            if isinstance(stage_vis_paths, dict):
+                for stage_name, stage_path in stage_vis_paths.items():
+                    notes.append(f"pointcloud_stage_vis_{stage_name}={stage_path}")
+            stage_vis_errors = pointcloud_output.get("stage_vis_errors") if isinstance(pointcloud_output, dict) else {}
+            if isinstance(stage_vis_errors, dict):
+                for stage_name, stage_error in stage_vis_errors.items():
+                    notes.append(f"pointcloud_stage_vis_{stage_name}_failed={stage_error}")
+            grid_summary = pointcloud_output.get("free_space_grid_summary") if isinstance(pointcloud_output, dict) else {}
+            if isinstance(grid_summary, dict):
+                if isinstance(diagnostics, dict):
+                    diagnostics["free_space_grid_summary"] = dict(grid_summary)
+                notes.append(f"free_space_completion_mode={grid_summary.get('mode', 'plane_local_2d_grid')}")
+                notes.append(f"free_space_grid_resolution_m={grid_summary.get('grid_resolution_m', 0.0)}")
+                notes.append(f"free_space_grid_status={grid_summary.get('status', 'not_attempted')}")
+                notes.append(
+                    f"free_space_grid_attempted_region_count={int(grid_summary.get('attempted_region_count', 0) or 0)}"
+                )
+                notes.append(
+                    f"free_space_grid_successful_region_count={int(grid_summary.get('successful_region_count', 0) or 0)}"
+                )
+                notes.append(
+                    "free_space_grid_candidate_trigger_counts="
+                    + json.dumps(grid_summary.get("candidate_trigger_counts", {}), ensure_ascii=False, sort_keys=True)
+                )
+                notes.append(
+                    "free_space_grid_attempt_result_counts="
+                    + json.dumps(grid_summary.get("attempt_result_counts", {}), ensure_ascii=False, sort_keys=True)
+                )
+                notes.append(
+                    f"free_space_grid_suggested_recovery={grid_summary.get('suggested_recovery') or 'none'}"
+                )
+                notes.append(
+                    "free_space_ready_distance_range_m="
+                    + json.dumps(grid_summary.get("ready_distance_range_m", []), ensure_ascii=False)
+                )
+                notes.append(f"free_space_raw_component_count={int(grid_summary.get('raw_component_count', 0) or 0)}")
+                notes.append(f"free_space_component_count={int(grid_summary.get('component_count', 0) or 0)}")
+                notes.append(f"free_space_component_kept={int(grid_summary.get('component_kept', 0) or 0)}")
+                notes.append(f"free_space_raw_free_cell_count={int(grid_summary.get('raw_free_cell_count', 0) or 0)}")
+                notes.append(f"free_space_reachable_free_cell_count={int(grid_summary.get('reachable_free_cell_count', 0) or 0)}")
+                notes.append(
+                    f"free_space_reachability_filtered_cell_count={int(grid_summary.get('reachability_filtered_cell_count', 0) or 0)}"
+                )
+                notes.append(f"free_space_near_free_cell_count={int(grid_summary.get('near_free_cell_count', 0) or 0)}")
+                notes.append(f"free_space_far_free_cell_count={int(grid_summary.get('far_free_cell_count', 0) or 0)}")
+                notes.append(
+                    f"free_space_approachable_component_count={int(grid_summary.get('approachable_component_count', 0) or 0)}"
+                )
+                notes.append(
+                    f"free_space_has_approachable_free_space={str(bool(grid_summary.get('has_approachable_free_space'))).lower()}"
+                )
+                notes.append(
+                    "free_space_raw_component_rejection_counts="
+                    + json.dumps(grid_summary.get("raw_component_rejection_counts", {}), ensure_ascii=False, sort_keys=True)
+                )
+                notes.append(
+                    "free_space_raw_component_rejections="
+                    + json.dumps(grid_summary.get("raw_component_rejections", []), ensure_ascii=False, sort_keys=True)
+                )
+                notes.append(
+                    f"free_space_far_placeable_component_count={int(grid_summary.get('far_placeable_component_count', 0) or 0)}"
+                )
+                notes.append(
+                    f"free_space_has_far_placeable_free_space={str(bool(grid_summary.get('has_far_placeable_free_space'))).lower()}"
+                )
+                notes.append(
+                    "free_space_far_component_rejection_counts="
+                    + json.dumps(grid_summary.get("far_component_rejection_counts", {}), ensure_ascii=False, sort_keys=True)
+                )
+                notes.append(
+                    "free_space_far_component_rejections="
+                    + json.dumps(grid_summary.get("far_component_rejections", []), ensure_ascii=False, sort_keys=True)
+                )
+                notes.append(
+                    "free_space_raw_free_distance_range_m="
+                    + json.dumps(grid_summary.get("raw_free_distance_range_m"), ensure_ascii=False)
+                )
+                notes.append(
+                    "free_space_reachable_free_distance_range_m="
+                    + json.dumps(grid_summary.get("reachable_free_distance_range_m"), ensure_ascii=False)
+                )
+                notes.append(
+                    "free_space_component_rejection_counts="
+                    + json.dumps(grid_summary.get("component_rejection_counts", {}), ensure_ascii=False, sort_keys=True)
+                )
+                notes.append(
+                    "free_space_component_rejections="
+                    + json.dumps(grid_summary.get("component_rejections", []), ensure_ascii=False, sort_keys=True)
+                )
+                notes.append(f"occupancy_mask_blocker_count={int(grid_summary.get('occupancy_mask_blocker_count', 0) or 0)}")
+                notes.append(
+                    "free_space_occupancy_source_counts="
+                    + json.dumps(grid_summary.get("occupancy_source_counts", {}), ensure_ascii=False, sort_keys=True)
+                )
+                notes.append(f"edge_margin_m={grid_summary.get('edge_margin_m', 0.0)}")
+                notes.append(f"blocker_dilate_m={grid_summary.get('blocker_dilate_m', 0.0)}")
+            notes.append(f"held_footprint_radius_m={grid_summary.get('held_footprint_radius_m', 0.0)}")
+            notes.append(f"placement_clearance_m={grid_summary.get('placement_clearance_m', 0.0)}")
+            notes.append(
+                f"free_space_hard_image_exclusion_box_count={grid_summary.get('hard_image_exclusion_box_count', 0)}"
+            )
+            notes.append(
+                f"free_space_mapped_point_hard_rejection_count={grid_summary.get('mapped_point_hard_rejection_count', 0)}"
+            )
+            dbscan_stats = []
+            if isinstance(stats, list):
+                for item in stats:
+                    if isinstance(item, dict):
+                        dbscan_stats.extend(item.get("dbscan_clusters") or [])
+            notes.append(f"dbscan_cluster_stats={json.dumps(dbscan_stats, ensure_ascii=False, sort_keys=True)}")
+        except ModuleNotFoundError as exc:
+            notes.append(f"pointcloud_surface=disabled:dependency_missing:{exc}")
+        except Exception as exc:
+            notes.append(f"pointcloud_surface=disabled:failed:{exc}")
+    else:
+        notes.append("pointcloud_surface=disabled:env")
+
+    patch_debug = env_bool("ROBOT_PATCH_SURFACE_DEBUG_INCLUDE", False)
+    patch_fallback_enabled = env_bool("ROBOT_PATCH_SURFACE_FALLBACK_ENABLED", True)
+    run_patch_surface = bool(patch_debug or (patch_fallback_enabled and not pointcloud_generated))
+    if run_patch_surface:
+        notes.append("patch_surface_mode=debug" if patch_debug else "patch_surface_mode=fallback")
+        for candidate in original_candidates:
+            if candidate.get("task_semantic_class") != "place_receptacle":
+                continue
+            surface_regions = generate_surface_candidates_for_receptacle(
+                parent=candidate,
+                depth_frame=depth_frame,
+                camera=camera,
+                all_candidates=blocker_candidates,
+                image_w=image_w,
+                image_h=image_h,
+                holding_object=bool(holding_object),
+                held_object_labels=held_labels,
+                held_object_family=held_family,
+            )
+            if not surface_regions:
+                continue
+            patch_generated.extend(surface_regions)
+        if patch_generated:
+            attach_surface_regions(
+                patch_generated,
+                context_reason="patch_depth_surface_regions_generated",
+            )
+            generated.extend(patch_generated)
+    else:
+        notes.append("patch_surface_mode=skipped_pointcloud_available")
 
     if generated:
         candidates.extend(generated)
-    notes.append(f"depth_surface_regions={len(generated)}")
+    notes.append(f"depth_surface_regions={len(patch_generated)}")
+    notes.append(f"surface_candidates_total={len(generated)}")
+    notes.append(f"held_object_blockers_ignored={held_blockers_ignored}")
     return generated
 
 
@@ -1780,11 +2538,32 @@ def bbox_min_overlap_ratio(a: JsonDict, b: JsonDict) -> float:
 def placement_obstacle_candidate(candidate: JsonDict) -> bool:
     task_class = str(candidate.get("task_semantic_class") or "")
     label = normalize_label(candidate.get("label") or candidate.get("raw_label") or "")
+    placement_blocking_labels = {
+        "apple",
+        "banana",
+        "book",
+        "bowl",
+        "cup",
+        "kettle",
+        "lettuce",
+        "mug",
+        "pan",
+        "plate",
+        "pot",
+        "remote",
+        "remote_control",
+        "sink",
+        "stove",
+        "tomato",
+        "vase",
+    }
     if task_class == "pickup_target":
         return True
     if task_class == "ignored_object":
         return True
-    return bool(task_class == "place_receptacle" and label in {"bowl", "plate"})
+    if label in placement_blocking_labels:
+        return True
+    return bool(task_class == "place_receptacle" and label in SURFACE_BLOCKING_LABELS)
 
 
 def short_avoidance_candidate(candidate: JsonDict) -> JsonDict:
@@ -1798,12 +2577,31 @@ def short_avoidance_candidate(candidate: JsonDict) -> JsonDict:
         value = candidate.get(key)
         if isinstance(value, dict):
             item[key] = dict(value)
+    if candidate.get("likely_held_object_overlay"):
+        item["likely_held_object_overlay"] = True
+    if isinstance(candidate.get("held_object_overlay_checks"), dict):
+        item["held_object_overlay_checks"] = dict(candidate.get("held_object_overlay_checks") or {})
     return item
 
 
-def build_placement_avoidance_candidates(candidates: List[JsonDict]) -> List[JsonDict]:
+def build_placement_avoidance_candidates(
+    candidates: List[JsonDict],
+    *,
+    holding_object: bool = False,
+    held_object_labels: Optional[Iterable[str]] = None,
+    held_object_family: Optional[str] = None,
+) -> List[JsonDict]:
     avoidance: List[JsonDict] = []
+    held_labels = normalize_label_tokens(held_object_labels)
     for candidate in candidates:
+        if (
+            holding_object
+            and env_bool("ROBOT_HELD_OBJECT_BLOCKER_IGNORE_ENABLED", True)
+            and candidate_likely_held_object(candidate, held_labels, held_object_family)
+        ):
+            candidate["held_object_candidate"] = True
+            candidate["ignored_as_held_object_blocker"] = True
+            continue
         if not placement_obstacle_candidate(candidate):
             continue
         if bbox_pixel_tuple(candidate) is None:
@@ -1845,42 +2643,166 @@ def save_candidate_visualization(
         "ignored_object": (180, 180, 180),
     }
 
-    for candidate in candidates:
+    held_overlay_boxes = [
+        box
+        for candidate in candidates
+        if isinstance(candidate, dict)
+        and candidate.get("likely_held_object_overlay")
+        for box in [bbox_pixel_tuple(candidate)]
+        if box is not None
+    ]
+    ready_surface_boxes = [
+        box
+        for candidate in candidates
+        if isinstance(candidate, dict)
+        and str(candidate.get("surface_candidate_source") or "") in SURFACE_REGION_SOURCES
+        and candidate.get("visual_place_ready")
+        for box in [bbox_pixel_tuple(candidate)]
+        if box is not None
+    ]
+    hidden_held = 0
+    hidden_surface_overlap = 0
+    hidden_ready_duplicate = 0
+
+    def draw_order(candidate: JsonDict) -> int:
+        source = str(candidate.get("surface_candidate_source") or "")
+        is_surface = source in SURFACE_REGION_SOURCES
+        if is_surface and not candidate.get("visual_place_ready"):
+            return 0
+        if not is_surface:
+            return 1
+        return 2
+
+    for candidate in sorted(candidates, key=draw_order):
         box = bbox_pixel_tuple(candidate)
         if box is None:
             continue
         x1, y1, x2, y2 = [int(round(v)) for v in box]
         task_class = str(candidate.get("task_semantic_class") or "ignored_object")
-        is_surface_region = str(candidate.get("surface_candidate_source") or "") == "depth_region_geometry"
+        surface_source = str(candidate.get("surface_candidate_source") or "")
+        is_surface_region = surface_source in SURFACE_REGION_SOURCES
+        if candidate.get("likely_held_object_overlay") and not env_bool("ROBOT_SAVE_VIS_DRAW_HELD_OVERLAY", False):
+            hidden_held += 1
+            continue
+        if (
+            is_surface_region
+            and not candidate.get("visual_place_ready")
+            and ready_surface_boxes
+            and any(
+                bbox_overlap_area(box, ready_box) / max(1.0, (x2 - x1) * (y2 - y1)) > 0.80
+                for ready_box in ready_surface_boxes
+            )
+            and env_bool("ROBOT_SAVE_VIS_HIDE_REJECTED_READY_DUPLICATES", True)
+        ):
+            hidden_ready_duplicate += 1
+            continue
+        if (
+            is_surface_region
+            and held_overlay_boxes
+            and not candidate.get("visual_place_ready")
+            and env_bool("ROBOT_SAVE_VIS_HIDE_REJECTED_SURFACE_HELD_OVERLAP", True)
+            and any(bbox_overlap_area(box, held_box) > 0 for held_box in held_overlay_boxes)
+        ):
+            hidden_surface_overlap += 1
+            continue
         if is_surface_region:
-            if candidate.get("final_place_ready") or candidate.get("place_now"):
+            executor_checks = candidate.get("executor_checks") if isinstance(candidate.get("executor_checks"), dict) else {}
+            precheck_failed = bool(
+                executor_checks.get("precheck_supported")
+                and executor_checks.get("reason") not in {None, "", "precheck_not_run"}
+                and not executor_checks.get("precheck_ok")
+            )
+            memory_checks = candidate.get("memory_checks") if isinstance(candidate.get("memory_checks"), dict) else {}
+            failed_recently = bool(candidate.get("failed_recently") or memory_checks.get("failed_recently"))
+            rejected = bool(candidate.get("rejection_reasons") or candidate.get("blocked") or failed_recently)
+            if precheck_failed:
+                color = (180, 0, 180)
+            elif candidate.get("final_place_ready") or candidate.get("place_now"):
+                color = (0, 220, 0)
+            elif rejected:
+                color = (0, 0, 255)
+            elif candidate.get("visual_place_ready") and candidate.get("affordance_ready", True):
                 color = (0, 220, 0)
             elif candidate.get("visual_place_ready"):
                 color = (255, 120, 0)
             else:
-                color = (0, 0, 255)
+                color = (255, 120, 0)
         else:
             color = colors.get(task_class, (220, 220, 220))
-        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+        thickness = 3 if is_surface_region and candidate.get("visual_place_ready") else 2
+        grid_ready_surface = bool(
+            surface_source == POINTCLOUD_GRID_COMPLETION_SURFACE_SOURCE
+            and candidate.get("visual_place_ready")
+        )
+        if not grid_ready_surface:
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness)
+        if grid_ready_surface:
+            interaction = candidate.get("interaction_point") if isinstance(candidate.get("interaction_point"), dict) else {}
+            try:
+                point_x = int(round(float(interaction.get("x"))))
+                point_y = int(round(float(interaction.get("y"))))
+                cv2.drawMarker(image, (point_x, point_y), color, cv2.MARKER_CROSS, 18, 2)
+                cv2.circle(image, (point_x, point_y), 6, color, 2)
+            except (TypeError, ValueError):
+                pass
 
         label = str(candidate.get("raw_label") or candidate.get("label") or task_class)
+        if surface_source in {POINTCLOUD_SURFACE_SOURCE, POINTCLOUD_COMPLETION_SURFACE_SOURCE, POINTCLOUD_GRID_COMPLETION_SURFACE_SOURCE}:
+            label = "PLACE" if candidate.get("visual_place_ready") else "pc_surface"
+            if surface_source == POINTCLOUD_GRID_COMPLETION_SURFACE_SOURCE and candidate.get("visual_place_ready"):
+                completion = candidate.get("free_space_completion") if isinstance(candidate.get("free_space_completion"), dict) else {}
+                label = f"PLACE G{int(completion.get('component_id', 0) or 0)}"
         try:
             confidence = float(candidate.get("confidence", 0.0) or 0.0)
         except (TypeError, ValueError):
             confidence = 0.0
         if is_surface_region:
             reasons = [str(item) for item in candidate.get("rejection_reasons", []) if str(item)]
-            if candidate.get("failed_recently"):
-                reasons.insert(0, f"cooldown:{candidate.get('cooldown_remaining', 0)}")
+            memory_checks = candidate.get("memory_checks") if isinstance(candidate.get("memory_checks"), dict) else {}
+            cooldown_remaining = int(candidate.get("cooldown_remaining") or memory_checks.get("cooldown_remaining") or 0)
+            if candidate.get("failed_recently") or memory_checks.get("failed_recently"):
+                reasons.insert(0, f"cooldown:{cooldown_remaining}")
             if candidate.get("blocked") and not any(item.startswith("blocked") for item in reasons):
                 blocked_by = candidate.get("blocked_by") if isinstance(candidate.get("blocked_by"), list) else []
                 if blocked_by:
                     reasons.insert(0, f"blocked:{blocked_by[0]}")
                 else:
                     reasons.insert(0, "blocked")
-            status = "ready" if candidate.get("final_place_ready") or candidate.get("place_now") else "visual" if candidate.get("visual_place_ready") else "reject"
+            executor_checks = candidate.get("executor_checks") if isinstance(candidate.get("executor_checks"), dict) else {}
+            precheck_failed = bool(
+                executor_checks.get("precheck_supported")
+                and executor_checks.get("reason") not in {None, "", "precheck_not_run"}
+                and not executor_checks.get("precheck_ok")
+            )
+            if precheck_failed:
+                status = "precheck_failed"
+                if executor_checks.get("reason"):
+                    reasons.insert(0, str(executor_checks.get("reason")))
+            elif candidate.get("final_place_ready") or candidate.get("place_now"):
+                status = "ready"
+            elif candidate.get("visual_place_ready") and candidate.get("affordance_ready", True):
+                status = "ready"
+            elif candidate.get("visual_place_ready"):
+                status = "visual"
+            else:
+                status = "reject"
             reason_text = ",".join(reasons[:2]) if reasons else status
-            text = f"{label} {status} {reason_text}"
+            try:
+                surface_score = float(candidate.get("score", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                surface_score = 0.0
+            text = f"{label} {status} s={surface_score:.2f} {reason_text}"
+            if surface_source in {POINTCLOUD_SURFACE_SOURCE, POINTCLOUD_COMPLETION_SURFACE_SOURCE, POINTCLOUD_GRID_COMPLETION_SURFACE_SOURCE}:
+                plane_id = candidate.get("plane_id")
+                cluster_id = candidate.get("dbscan_cluster_id")
+                try:
+                    up_score = float(candidate.get("normal_up_score", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    up_score = 0.0
+                if candidate.get("visual_place_ready"):
+                    text = f"{label} {status} s={surface_score:.2f}"
+                else:
+                    text = f"{label} p={plane_id} c={cluster_id} up={up_score:.2f} s={surface_score:.2f} {reason_text}"
         else:
             text = f"{label} {confidence:.2f}"
         text_w, text_h = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
@@ -1903,12 +2825,29 @@ def save_candidate_visualization(
             notes.append(f"save_vis_failed:write_failed:{save_path}")
             return
         notes.append(f"save_vis_mode=reported_candidates:{len(candidates)}")
+        if hidden_held:
+            notes.append(f"save_vis_held_overlay_hidden={hidden_held}")
+        if hidden_surface_overlap:
+            notes.append(f"save_vis_held_overlap_surfaces_hidden={hidden_surface_overlap}")
+        if hidden_ready_duplicate:
+            notes.append(f"save_vis_ready_duplicate_rejected_hidden={hidden_ready_duplicate}")
     except Exception as exc:
         notes.append(f"save_vis_failed:{exc}")
 
 
-def decorate_receptacle_occupancy_context(candidates: List[JsonDict]) -> None:
-    avoidance = build_placement_avoidance_candidates(candidates)
+def decorate_receptacle_occupancy_context(
+    candidates: List[JsonDict],
+    *,
+    holding_object: bool = False,
+    held_object_labels: Optional[Iterable[str]] = None,
+    held_object_family: Optional[str] = None,
+) -> None:
+    avoidance = build_placement_avoidance_candidates(
+        candidates,
+        holding_object=holding_object,
+        held_object_labels=held_object_labels,
+        held_object_family=held_object_family,
+    )
     for receptacle in [c for c in candidates if c.get("task_semantic_class") == "place_receptacle"]:
         rx1, ry1, rx2, ry2 = bbox_ratios(receptacle)
         support_label = normalize_label(receptacle.get("label") or receptacle.get("raw_label") or "")
@@ -2053,6 +2992,31 @@ def support_relative_y(value: float, sy1: float, sy2: float) -> float:
     return (value - sy1) / height
 
 #支撑面规则：避免把桌上的东西误判成地面可捡物
+def pickup_floor_contact_like(candidate: JsonDict) -> bool:
+    floor_contact = candidate.get("floor_contact_geometry") if isinstance(candidate.get("floor_contact_geometry"), dict) else {}
+    if not bool(floor_contact.get("available") and floor_contact.get("contact_floor_like")):
+        return False
+    support_height = depth_number(floor_contact.get("support_height_m"))
+    if support_height is not None and support_height > env_float("ROBOT_DEPTH_FLOOR_CONTACT_MAX_SUPPORT_HEIGHT_M", 0.16):
+        return False
+    return True
+
+
+def pickup_support_height_m(candidate: JsonDict) -> Optional[float]:
+    floor_contact = candidate.get("floor_contact_geometry") if isinstance(candidate.get("floor_contact_geometry"), dict) else {}
+    return depth_number(floor_contact.get("support_height_m"))
+
+
+def support_candidate_height_m(candidate: JsonDict) -> Optional[float]:
+    point = candidate_center_3d(candidate)
+    if isinstance(point, dict):
+        value = depth_number(point.get("y"))
+        if value is not None:
+            return value
+    geometry = candidate.get("geometry") if isinstance(candidate.get("geometry"), dict) else {}
+    return depth_number(geometry.get("height_m"))
+
+
 def apply_support_context_rules(candidates: List[JsonDict]) -> None:
     """代码会检查 pickup candidate 是否被可见支撑物包住。如
     果它在桌子、架子、柜子之类的支撑结构里，就把它标记为：
@@ -2073,6 +3037,21 @@ def apply_support_context_rules(candidates: List[JsonDict]) -> None:
         if candidate.get("task_semantic_class") != "pickup_target":
             continue
         if candidate.get("actionability_source") == "depth_geometry" and candidate.get("is_floor_level"):
+            floor_source = str(candidate.get("floor_level_source") or "")
+            if floor_source in {"rgbd_floor_plane_contact", "bottom_band_ground_distance_fallback"}:
+                continue
+        # Strong RGB-D contact evidence owns the decision.  A coarse 2-D
+        # CounterTop/Cabinet box may overlap floor pixels, but it must not turn
+        # a floor object into an elevated object when the support strip below
+        # that object lies on the fitted floor plane.
+        if pickup_floor_contact_like(candidate):
+            candidate.setdefault("support_context_skipped", []).append(
+                {
+                    "reason": "rgbd_floor_contact_overrides_2d_support_bbox",
+                    "floor_plane_residual_m": candidate.get("floor_plane_residual_m"),
+                    "floor_contact_confidence": candidate.get("floor_contact_confidence"),
+                }
+            )
             continue
         cx_ratio = float((candidate.get("geometry") or {}).get("cx_ratio", 0.5) or 0.5)
         cy_ratio = float((candidate.get("geometry") or {}).get("cy_ratio", 0.5) or 0.5)
@@ -2091,6 +3070,30 @@ def apply_support_context_rules(candidates: List[JsonDict]) -> None:
                 and bottom_ratio <= sy2 + 0.055
                 and relative_bottom <= 0.72
             )
+
+            # A 2-D overlap is not enough to claim tabletop support.  When both
+            # surfaces have RGB-D height evidence, require the pickup support
+            # strip to agree with the candidate support height.
+            pickup_support_h = pickup_support_height_m(candidate)
+            support_h = support_candidate_height_m(support)
+            support_height_tolerance = env_float("ROBOT_PICKUP_SUPPORT_CONTEXT_HEIGHT_TOLERANCE_M", 0.18)
+            if (
+                (shelf_like and inside_x and inside_y) or on_support_plane
+            ) and pickup_support_h is not None and support_h is not None:
+                height_delta = abs(float(pickup_support_h) - float(support_h))
+                if height_delta > support_height_tolerance:
+                    candidate.setdefault("support_context_skipped", []).append(
+                        {
+                            "label": support.get("label"),
+                            "raw_label": support.get("raw_label"),
+                            "reason": "rgbd_support_height_mismatch",
+                            "pickup_support_height_m": round(float(pickup_support_h), 4),
+                            "support_height_m": round(float(support_h), 4),
+                            "height_delta_m": round(float(height_delta), 4),
+                            "height_tolerance_m": round(float(support_height_tolerance), 4),
+                        }
+                    )
+                    continue
 
             if not (shelf_like and inside_x and inside_y) and not on_support_plane:
                 if inside_x and inside_y and bottom_ratio >= 0.90 and relative_bottom > 0.72:
@@ -2248,6 +3251,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--obstacle-area-threshold", type=float, default=0.035)
     parser.add_argument("--max-candidates", type=int, default=int(os.getenv("ROBOT_YOLO_MAX_CANDIDATES", "8")))
     parser.add_argument("--save-vis", default="", help="Optional path to save YOLO annotated image.")
+    parser.add_argument("--save-plane-vis", default="", help="Optional path to save initial RANSAC plane visualization and derived filtering-stage images.")
+    parser.add_argument(
+        "--holding-object",
+        action="store_true",
+        default=env_bool("ROBOT_HOLDING_OBJECT", False),
+        help="Tell perception that the robot is carrying an object, so matching foreground detections can be ignored as self-held blockers.",
+    )
+    parser.add_argument(
+        "--held-object-labels",
+        default=os.getenv("ROBOT_HELD_OBJECT_LABELS", os.getenv("ROBOT_HELD_OBJECT_LABEL", "")),
+        help="Comma-separated labels for the currently held object, used only for self-held blocker filtering.",
+    )
+    parser.add_argument(
+        "--held-object-family",
+        default=os.getenv("ROBOT_HELD_OBJECT_FAMILY", ""),
+        help="Optional held object family for self-held overlay filtering: food, pickup_target, or unknown.",
+    )
     return parser
 
 
@@ -2273,8 +3293,12 @@ def analyze_image_with_model(
     obstacle_area_threshold: float = 0.035,
     max_candidates: int = 8,
     save_vis: str = "",
+    save_plane_vis: str = "",
     depth_path: str = "",
     camera_info: Any = None,
+    holding_object: bool = False,
+    held_object_labels: Optional[Iterable[Any]] = None,
+    held_object_family: Optional[str] = None,
 ) -> JsonDict:
     if not image_path.exists():
         return {
@@ -2286,6 +3310,9 @@ def analyze_image_with_model(
         }
 
     output_notes = list(notes or [])
+    held_labels = normalize_label_tokens(held_object_labels)
+    held_family = normalize_label(held_object_family or "") or held_object_family_for_labels(held_labels)
+    output_notes.append(f"holding_object_context={str(bool(holding_object)).lower()}")
     try:
         results = model(str(image_path), conf=float(conf), iou=float(iou), imgsz=int(imgsz), verbose=False)
     except Exception as exc:
@@ -2328,37 +3355,117 @@ def analyze_image_with_model(
             )
             all_candidates.append(candidate)
 
+    if bool(holding_object) and not held_labels:
+        held_labels = infer_held_object_labels_from_candidates(all_candidates)
+        if held_labels:
+            output_notes.append(f"held_object_label_inferred_from_foreground={','.join(held_labels)}")
+        held_family = normalize_label(held_object_family or "") or held_object_family_for_labels(held_labels)
+    output_notes.append(f"held_object_labels={','.join(held_labels) if held_labels else 'none'}")
+    output_notes.append(f"held_object_family={held_family or 'unknown'}")
+
     depth_frame = load_depth_frame(str(depth_path or ""), image_w=int(image_w), image_h=int(image_h), notes=output_notes)
+    resolved_plane_vis = str(save_plane_vis or "")
+    if not resolved_plane_vis and save_vis:
+        vis_path = Path(save_vis)
+        resolved_plane_vis = str(vis_path.with_name(f"{vis_path.stem}-pointcloud-planes{vis_path.suffix or '.jpg'}"))
+    surface_diagnostics: JsonDict = {}
     surface_candidates = apply_depth_geometry(
         all_candidates,
         depth_frame=depth_frame,
         camera_info=camera_info,
+        image_path=str(image_path),
+        save_plane_vis=resolved_plane_vis,
         image_w=int(image_w),
         image_h=int(image_h),
         notes=output_notes,
+        holding_object=bool(holding_object),
+        held_object_labels=held_labels,
+        held_object_family=held_family,
+        diagnostics=surface_diagnostics,
     )
 
     apply_support_context_rules(all_candidates)#支撑面规则：避免把桌上的东西误判成地面可捡物
-    decorate_receptacle_occupancy_context(all_candidates)
+    decorate_receptacle_occupancy_context(
+        all_candidates,
+        holding_object=bool(holding_object),
+        held_object_labels=held_labels,
+        held_object_family=held_family,
+    )
+    held_overlay_candidates = mark_held_object_overlays(
+        all_candidates,
+        holding_object=bool(holding_object),
+        held_object_labels=held_labels,
+        held_object_family=held_family,
+    )
 
-    pickup_candidates = [c for c in all_candidates if c.get("task_semantic_class") == "pickup_target"]
+    pickup_candidates = [
+        c for c in all_candidates
+        if c.get("task_semantic_class") == "pickup_target"
+        and not c.get("likely_held_object_overlay")
+    ]
     receptacle_all = [c for c in all_candidates if c.get("task_semantic_class") == "place_receptacle"]
-    active_receptacles = active_receptacle_candidates(receptacle_all)
-    surface_regions = [
+    raw_receptacle_all = [
+        c for c in receptacle_all
+        if str(c.get("surface_candidate_source") or "") not in SURFACE_REGION_SOURCES
+    ]
+    active_receptacles = active_receptacle_candidates(raw_receptacle_all)
+    pointcloud_surface_regions = [
         c for c in all_candidates
         if c.get("task_semantic_class") == "place_receptacle"
-        and c.get("surface_candidate_source") == "depth_region_geometry"
+        and c.get("surface_candidate_source") in {POINTCLOUD_SURFACE_SOURCE, POINTCLOUD_COMPLETION_SURFACE_SOURCE, POINTCLOUD_GRID_COMPLETION_SURFACE_SOURCE}
     ]
-    visual_ready_surface_regions = [c for c in surface_regions if c.get("visual_place_ready")]
-    placement_avoidance_candidates = build_placement_avoidance_candidates(all_candidates)
+    fallback_surface_regions = [
+        c for c in all_candidates
+        if c.get("task_semantic_class") == "place_receptacle"
+        and c.get("surface_candidate_source") == DEPTH_REGION_SURFACE_SOURCE
+    ]
+    surface_regions = pointcloud_surface_regions + fallback_surface_regions
+    active_surface_regions = pointcloud_surface_regions if pointcloud_surface_regions else fallback_surface_regions
+    visual_ready_surface_regions = [c for c in active_surface_regions if c.get("visual_place_ready")]
+    rejected_surface_regions = [c for c in active_surface_regions if not c.get("visual_place_ready")]
+    surface_rejection_summary = summarize_surface_rejections(rejected_surface_regions)
+    place_affordance_candidates = [
+        c for c in visual_ready_surface_regions
+        if c.get("affordance_ready", True)
+    ]
+    unblocked_surface_regions = [c for c in active_surface_regions if not c.get("blocked")]
+    grid_summary = (
+        surface_diagnostics.get("free_space_grid_summary")
+        if isinstance(surface_diagnostics.get("free_space_grid_summary"), dict)
+        else {}
+    )
+    has_approachable_free_space = bool(grid_summary.get("has_approachable_free_space"))
+    grid_no_ready_status = str(grid_summary.get("status") or "")
+    surface_free_space_status = (
+        "free_unblocked_affordance"
+        if place_affordance_candidates
+        else "free_space_outside_current_reach"
+        if has_approachable_free_space
+        else grid_no_ready_status
+        if grid_no_ready_status in {"no_grid_free_mask", "no_grid_component_passed_safety_checks"}
+        else "unblocked_but_not_affordance_ready"
+        if unblocked_surface_regions
+        else "no_free_unblocked_surface"
+        if active_surface_regions
+        else "no_surface_regions"
+    )
+    placement_avoidance_candidates = build_placement_avoidance_candidates(
+        all_candidates,
+        holding_object=bool(holding_object),
+        held_object_labels=held_labels,
+        held_object_family=held_family,
+    )
     trash_all = [c for c in all_candidates if c.get("task_semantic_class") == "cleanable_object"]
     ignored_all = [c for c in all_candidates if c.get("task_semantic_class") in {"ignored_object", "obstacle"}]
     obstacle_all = [c for c in all_candidates if c.get("task_semantic_class") == "obstacle"]
 
     best_pickup = best_candidate(pickup_candidates, intent="pickup")
     best_receptacle = best_candidate(active_receptacles, intent="receptacle")
-    best_surface = best_candidate(visual_ready_surface_regions or surface_regions, intent="receptacle")
+    best_surface = best_candidate(place_affordance_candidates, intent="receptacle")
+    best_rejected_surface = best_candidate(rejected_surface_regions, intent="receptacle")
+    best_place_affordance = best_candidate(place_affordance_candidates, intent="receptacle")
     best_obstacle = best_candidate(obstacle_all, intent="obstacle")
+    surface_place_status = "visual_ready_surface" if best_surface else "no_visual_ready_surface"
 
     max_candidates = max(1, int(max_candidates))
     service_candidates = sorted_candidates(
@@ -2368,6 +3475,16 @@ def analyze_image_with_model(
     )
     receptacle_candidates = sorted_candidates(active_receptacles, intent="receptacle", max_items=max_candidates)
     surface_region_candidates = sorted_candidates(surface_regions, intent="receptacle", max_items=max_candidates)
+    pointcloud_surface_region_candidates = sorted_candidates(
+        pointcloud_surface_regions,
+        intent="receptacle",
+        max_items=max_candidates,
+    )
+    place_affordance_candidates = sorted_candidates(
+        place_affordance_candidates,
+        intent="receptacle",
+        max_items=max_candidates,
+    )
     trash_candidates = sorted_candidates(trash_all, intent="service", max_items=max_candidates)
     ignored_candidates = sorted_candidates(ignored_all, intent="obstacle", max_items=max_candidates)
     top_obstacle_candidates = sorted_candidates(obstacle_all, intent="obstacle", max_items=max_candidates)
@@ -2385,7 +3502,10 @@ def analyze_image_with_model(
     direct_place_detected = bool(best_surface and best_surface.get("place_now"))
     direct_cleanable_detected = any(c.get("cleanable_now") for c in trash_candidates)
     alignment_needed = any(c.get("needs_alignment") for c in service_candidates + trash_candidates)
-    approach_needed = any(c.get("needs_approach") for c in service_candidates + trash_candidates)
+    approach_needed = bool(
+        any(c.get("needs_approach") for c in service_candidates + trash_candidates)
+        or (not place_affordance_candidates and has_approachable_free_space)
+    )
     frontier_exists = bool(open_directions)
     max_conf = max([float(c.get("confidence", 0.0) or 0.0) for c in all_candidates], default=0.0)
 
@@ -2395,6 +3515,11 @@ def analyze_image_with_model(
         analysis_confidence = 0.72 if not obstacle_ahead else 0.68
     else:
         analysis_confidence = 0.65
+    held_object_blockers_ignored = sum(
+        1
+        for candidate in all_candidates
+        if isinstance(candidate, dict) and candidate.get("ignored_as_held_object_blocker")
+    )
 
     output_notes.extend(
         [
@@ -2403,11 +3528,19 @@ def analyze_image_with_model(
             f"raw_candidates={len(all_candidates)}",
             f"service_candidates={len(service_candidates)}",
             f"receptacle_candidates={len(receptacle_candidates)}",
-            f"receptacle_candidates_merged={len(receptacle_all) - len(active_receptacles)}",
+            f"receptacle_candidates_merged={len(raw_receptacle_all) - len(active_receptacles)}",
             f"ignored_or_obstacle_candidates={len(ignored_candidates)}",
             f"surface_candidates={len(surface_candidates)}",
             f"surface_region_count={len(surface_regions)}",
+            f"pointcloud_surface_region_count={len(pointcloud_surface_regions)}",
             f"surface_region_visual_ready={len(visual_ready_surface_regions)}",
+            f"visual_ready_surface_region_count={len(visual_ready_surface_regions)}",
+            f"place_affordance_candidate_count={len(place_affordance_candidates)}",
+            f"surface_place_status={surface_place_status}",
+            f"surface_free_space_status={surface_free_space_status}",
+            f"held_object_blockers_ignored={held_object_blockers_ignored}",
+            f"held_object_overlay_candidates={len(held_overlay_candidates)}",
+            f"surface_rejection_summary={json.dumps(surface_rejection_summary, ensure_ascii=False, sort_keys=True)}",
             f"yolo_iou={float(iou):.2f}",
             "raw_receptacle_place_now=disabled_depth_surface_required",
             "surface_place_distance=ground_distance_m",
@@ -2430,6 +3563,15 @@ def analyze_image_with_model(
         "weights": weights,
         "ontology": str(ontology),
         "notes": output_notes,
+        "holding_object_context": bool(holding_object),
+        "held_object_labels": held_labels,
+        "held_object_family": held_family,
+        "held_object_blockers_ignored": int(held_object_blockers_ignored),
+        "held_object_overlay_count": len(held_overlay_candidates),
+        "held_object_overlay_candidates": [
+            short_avoidance_candidate(candidate)
+            for candidate in held_overlay_candidates[:8]
+        ],
 
         "pickup_target_detected": bool(pickup_target_detected),
         "place_receptacle_detected": bool(place_receptacle_detected),
@@ -2438,11 +3580,26 @@ def analyze_image_with_model(
         "best_pickup_candidate": best_pickup,
         "best_receptacle_candidate": best_receptacle,
         "best_surface_candidate": best_surface,
+        "best_rejected_surface_candidate": best_rejected_surface,
+        "best_place_affordance": best_place_affordance,
         "best_obstacle_candidate": best_obstacle,
         "service_candidates": service_candidates,
         "receptacle_candidates": receptacle_candidates,
+        "visual_ready_surface_regions": sorted_candidates(
+            visual_ready_surface_regions,
+            intent="receptacle",
+            max_items=max_candidates,
+        ),
+        "pointcloud_surface_regions": pointcloud_surface_region_candidates,
+        "place_affordance_candidates": place_affordance_candidates,
         "surface_candidates": sorted_candidates(surface_candidates, intent="receptacle", max_items=max_candidates),
         "surface_regions": surface_region_candidates,
+        "surface_rejection_summary": surface_rejection_summary,
+        "surface_place_status": surface_place_status,
+        "surface_free_space_status": surface_free_space_status,
+        "surface_search_action": None,
+        "surface_search_reason": None,
+        "no_ready_surface_steps": 0,
         "placement_avoidance_candidates": placement_avoidance_candidates,
         "top_obstacle_candidates": top_obstacle_candidates,
 
@@ -2460,7 +3617,7 @@ def analyze_image_with_model(
         "occupancy": occupancy,
         "recommended_action": recommended_action(
             best_pickup_candidate=best_pickup,
-            best_receptacle_candidate=best_surface or best_receptacle,
+            best_receptacle_candidate=best_surface,
             direct_cleanable_detected=bool(direct_cleanable_detected),
             service_candidates=service_candidates,
             obstacle_ahead=bool(obstacle_ahead),
@@ -2470,12 +3627,14 @@ def analyze_image_with_model(
         "reported_candidate_count": len(service_candidates) + len(ignored_candidates),
         "surface_candidate_count": len(surface_candidates),
         "surface_region_count": len(surface_regions),
+        "pointcloud_surface_region_count": len(pointcloud_surface_regions),
+        "visual_ready_surface_region_count": len(visual_ready_surface_regions),
     }
     if save_vis:
         save_candidate_visualization(
             image_path=image_path,
             save_path=Path(save_vis),
-            candidates=surface_region_candidates + service_candidates + ignored_candidates,
+            candidates=surface_region_candidates + service_candidates + ignored_candidates + held_overlay_candidates,
             notes=output_notes,
         )
     return output
@@ -2521,8 +3680,12 @@ def main() -> None:
         obstacle_area_threshold=float(args.obstacle_area_threshold),
         max_candidates=int(args.max_candidates),
         save_vis=str(args.save_vis or ""),
+        save_plane_vis=str(args.save_plane_vis or ""),
         depth_path=str(args.depth or ""),
         camera_info=str(args.camera_json or ""),
+        holding_object=bool(args.holding_object),
+        held_object_labels=str(args.held_object_labels or "").split(","),
+        held_object_family=str(args.held_object_family or ""),
     )
     json_print(output)
     if output.get("status") != "success":

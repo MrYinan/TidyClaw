@@ -185,7 +185,7 @@ def move():
     try:
         data = request.get_json(silent=True) or {}
         action = data.get("action")
-        valid_actions = {"MoveAhead", "MoveBack", "RotateLeft", "RotateRight"}
+        valid_actions = {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight", "RotateLeft", "RotateRight", "LookUp", "LookDown"}
         if action not in valid_actions:
             return (
                 jsonify(

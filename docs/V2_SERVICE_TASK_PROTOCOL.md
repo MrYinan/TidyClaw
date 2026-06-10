@@ -20,7 +20,7 @@ OpenClaw heartbeat
 The service ontology lives in `configs/service_task_ontology_v2.json`.
 
 - `pickup_target`: object that can be tidied with `PickupObject`
-- `place_receptacle`: visible support/container for `PutObject`
+- `place_receptacle`: visible support/container for placement
 - `obstacle`: object or geometry that constrains movement
 - `cleanable_object`: legacy cleanable floor proxy
 - `ignored_object`: object irrelevant to the current task
@@ -92,8 +92,7 @@ After `place-object` succeeds and inventory is empty, the runner records:
 - the final object position must remain inside the robot's reachable front zone
 - default placement uses a controlled screen point near the visible front area
   of the receptacle
-- whole-receptacle fallback is disabled unless
-  `ROBOT_ALLOW_RECEPTACLE_WIDE_PLACE_FALLBACK=true`
+- whole-receptacle simulator-selected fallback is not supported
 
 Then it clears the pickup/receptacle locks and continues room patrol. It does
 not mark the room complete just because one object was placed.

@@ -1,17 +1,13 @@
 # AGENTS.md - Household Service Robot
 
-本工作区是 OpenClaw + AI2-THOR 家庭服务机器人 Agent 的行动现场。项目名仍含 `robot-cleaner`，但 V2 主线是单房间服务巡视：主动感知、决策、执行、验证、记忆更新、总结。清扫是兼容能力；`tidy` 的核心是拾取、放置和持续巡视。
+本工作区是 OpenClaw + AI2-THOR 家庭服务机器人 Agent 的行动现场。项目名仍含 `robot-cleaner`，但 主线是单房间服务巡视：主动感知、决策、执行、验证、记忆更新、总结。清扫是兼容能力；`tidy` 的核心是拾取、放置和持续巡视。
 
 ## 启动必读
 
-每次任务开始前按顺序读取：
-
+在开始任何任务前，按以下顺序读取工作区内容：
 1. `SOUL.md`
 2. `IDENTITY.md`
 3. `TOOLS.md`
-4. `memory/patrol-state.json`，若存在
-5. `memory/mission-state.json`，若存在
-6. `memory/room-state.json`，若存在
 
 仅在最终汇报、异常复盘或用户明确要求时读取 `memory/YYYY-MM-DD.md`。
 

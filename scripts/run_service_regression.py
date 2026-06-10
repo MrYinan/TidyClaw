@@ -78,6 +78,13 @@ CASES: Dict[str, RegressionCase] = {
         expects=("floor_pickup_ready", "no_elevated_pickup_ready"),
         description="When floor and elevated candidates coexist, only the floor target should be actionable.",
     ),
+    "far_receptacle_should_approach_not_place": RegressionCase(
+        name="far_receptacle_should_approach_not_place",
+        bug="bug: distant CounterTop was treated as immediately placeable",
+        scenario="regression_far_receptacle_no_place",
+        expects=("receptacle_visible", "no_direct_place", "recommended_not_place"),
+        description="A visible but distant receptacle must be approached/aligned, not used for immediate place.",
+    ),
 }
 
 
@@ -190,6 +197,10 @@ def support_candidates(analysis: JsonDict) -> List[JsonDict]:
     ]
 
 
+def receptacle_candidates(analysis: JsonDict) -> List[JsonDict]:
+    return [c for c in all_candidates(analysis) if c.get("task_semantic_class") == "place_receptacle"]
+
+
 def check_floor_pickup_ready(analysis: JsonDict) -> Tuple[bool, str]:
     candidate = analysis.get("best_pickup_candidate")
     if not isinstance(candidate, dict):
@@ -230,6 +241,17 @@ def check_recommended_not_pick(analysis: JsonDict) -> Tuple[bool, str]:
     return action != "pick-object", f"recommended_action={action}"
 
 
+def check_recommended_not_place(analysis: JsonDict) -> Tuple[bool, str]:
+    action = str(analysis.get("recommended_action") or "")
+    return action != "place-object", f"recommended_action={action}"
+
+
+def check_no_direct_place(analysis: JsonDict) -> Tuple[bool, str]:
+    value = truthy(analysis.get("direct_place_detected"))
+    ready = [short_candidate(c) for c in receptacle_candidates(analysis) if truthy(c.get("place_now"))]
+    return (not value and not ready), f"direct_place_detected={analysis.get('direct_place_detected')} place_now={ready}"
+
+
 def check_no_elevated_pickup_ready(analysis: JsonDict) -> Tuple[bool, str]:
     offenders = []
     for candidate in pickup_candidates(analysis):
@@ -255,13 +277,21 @@ def check_support_visible(analysis: JsonDict) -> Tuple[bool, str]:
     return bool(shelf_like), f"shelf_like_supports={shelf_like[:5]}"
 
 
+def check_receptacle_visible(analysis: JsonDict) -> Tuple[bool, str]:
+    candidates = receptacle_candidates(analysis)
+    return bool(candidates), f"receptacles={[short_candidate(c) for c in candidates[:5]]}"
+
+
 EXPECTATIONS: Dict[str, Callable[[JsonDict], Tuple[bool, str]]] = {
     "floor_pickup_ready": check_floor_pickup_ready,
     "best_pickup_approach_or_pick": check_best_pickup_approach_or_pick,
     "no_direct_pickup": check_no_direct_pickup,
+    "no_direct_place": check_no_direct_place,
     "recommended_not_pick": check_recommended_not_pick,
+    "recommended_not_place": check_recommended_not_place,
     "no_elevated_pickup_ready": check_no_elevated_pickup_ready,
     "support_visible": check_support_visible,
+    "receptacle_visible": check_receptacle_visible,
 }
 
 
@@ -276,6 +306,7 @@ def short_candidate(candidate: JsonDict) -> JsonDict:
         "is_floor_level": candidate.get("is_floor_level"),
         "reachable": candidate.get("reachable"),
         "pickup_now": candidate.get("pickup_now"),
+        "place_now": candidate.get("place_now"),
         "needs_approach": candidate.get("needs_approach"),
         "support_context_blocked": candidate.get("support_context_blocked"),
     }

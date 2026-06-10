@@ -14,11 +14,12 @@ The project still contains legacy "robot-cleaner" names, but the active V2 line 
 - Simulator: AI2-THOR
 - Local control service: `http://127.0.0.1:5000`
 - Default vision image: `D:\photos\openclaw_robot_vision.jpg`
+- Default workspace Python: `D:\Anaconda\envs\robot\python.exe`
 
 ## Core Skills And Scripts
 
-- `get-vision`: capture the current RGB observation and action feedback
-- `perceive-scene-yolo`: YOLO service perception for pickup targets, receptacles, obstacles, and cleanable objects
+- `get-vision`: capture the current RGB observation, optional depth frame, camera info, and action feedback
+- `perceive-scene-yolo`: YOLO service perception for pickup targets, receptacles, obstacles, cleanable objects, and depth-derived surface candidates
 - `analyze-scene-opencv`: legacy OpenCV floor-cleaning perception baseline
 - `move-robot`: execute `MoveAhead`, `MoveBack`, `RotateLeft`, `RotateRight`
 - `pick-object`: execute a visual-candidate grounded pickup action

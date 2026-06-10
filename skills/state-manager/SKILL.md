@@ -1,6 +1,6 @@
 ---
 name: state-manager
-description: Manage household service robot patrol / mission / room memory JSON consistently.
+description: 统一管理家庭服务机器人 patrol / mission / room 记忆 JSON。
 metadata:
   {
     "openclaw":
@@ -11,97 +11,97 @@ metadata:
   }
 ---
 
-# State Manager
+# 状态管理器
 
-This skill is the single memory writer for the household service robot.
+本技能是家庭服务机器人的唯一记忆写入入口。
 
-It manages:
+它管理以下文件：
 
 - `memory/patrol-state.json`
 - `memory/mission-state.json`
 - `memory/room-state.json`
 
-Implementation:
+核心实现：
 
 ```text
 scripts/state_manager_core.py
 ```
 
-## Common Commands
+## 常用命令
 
-Show state:
+显示状态：
 
 ```powershell
 python skills\state-manager\scripts\state_manager.py show
 ```
 
-Validate consistency:
+验证一致性：
 
 ```powershell
 python skills\state-manager\scripts\state_manager.py validate
 ```
 
-Check whether patrol should continue:
+检查巡视是否应该继续：
 
 ```powershell
 python skills\state-manager\scripts\state_manager.py should-continue
 ```
 
-Start/reset a mission:
+启动或重置任务：
 
 ```powershell
 python skills\state-manager\scripts\state_manager.py start-mission --room current_room --max-steps 120
 ```
 
-Record one physical-action step:
+记录一次物理动作步骤：
 
 ```powershell
 python skills\state-manager\scripts\state_manager.py record-step --action MoveAhead --mode EXPLORE
 ```
 
-Record a service step:
+记录一次服务步骤：
 
 ```powershell
 python skills\state-manager\scripts\state_manager.py record-step --action place-object --mode SERVICE --placed Apple --service-completed "Apple->CounterTop"
 ```
 
-Stop without marking room complete:
+停止任务，但不标记房间完成：
 
 ```powershell
 python skills\state-manager\scripts\state_manager.py stop-mission --reason user_stop
 ```
 
-Mark recover failed:
+标记恢复失败：
 
 ```powershell
 python skills\state-manager\scripts\state_manager.py mark-recover-failed --reason consecutive_action_failures
 ```
 
-Archive report and return to idle:
+归档报告并返回空闲状态：
 
 ```powershell
 python skills\state-manager\scripts\state_manager.py finalize-report --reason report_delivered
 ```
 
-## Memory Semantics
+## 记忆语义
 
-Legacy compatibility fields:
+旧版兼容字段：
 
 - `garbage_detected`
 - `garbage_cleaned`
 - `targets_found`
 - `targets_cleaned`
 
-Service-mode fields:
+服务模式字段：
 
 - `objects_detected`
 - `objects_placed`
 - `service_tasks_completed`
 
-`room_complete=true` means the room patrol is complete. It does not mean a single pickup/place subgoal completed.
+`room_complete=true` 表示房间巡视完成，不表示单个 pickup/place 子目标完成。
 
-## Agent Rule
+## Agent 使用规则
 
-Do not manually edit the three state JSON files separately. Use this skill or import `scripts.state_manager_core`.
+不要分别手动编辑这三个状态 JSON 文件。应使用本技能，或导入 `scripts.state_manager_core`。
 
-After a final user-visible report is delivered, finalize the state so the next heartbeat sees an idle system.
+最终的用户可见汇报交付后，应 finalize 状态，让下一次 heartbeat 看到空闲系统。

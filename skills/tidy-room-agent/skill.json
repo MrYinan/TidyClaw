@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "name": "tidy-room-agent",
+  "role": "official-llm-room-tidying-entrypoint",
+  "status": "stable-entrypoint",
+  "description": "OpenClaw model-facing room tidying agent that decides only by selecting option_id values from a bounded decision context.",
+  "model_visible": true,
+  "uses_tools": [
+    "robot_cleaner_prepare_decision_turn",
+    "robot_cleaner_execute_option",
+    "robot_cleaner_status",
+    "robot_cleaner_report",
+    "robot_cleaner_stop"
+  ],
+  "decision_contract": {
+    "model_selects": "option_id",
+    "option_must_come_from_current_option_set": true,
+    "program_recommendation_forbidden": true,
+    "rule_baseline_is_diagnostic_only": true,
+    "executor_validates": true,
+    "one_option_per_turn": true,
+    "raw_memory_excluded": true,
+    "direct_low_level_robot_skills_forbidden": true
+  },
+  "loop": [
+    "robot_cleaner_prepare_decision_turn",
+    "select_existing_option_id",
+    "robot_cleaner_execute_option",
+    "continue_or_report_or_stop"
+  ],
+  "forbidden_direct_skills": [
+    "get-vision",
+    "perceive-scene-yolo",
+    "move-robot",
+    "pick-object",
+    "place-object",
+    "clean-garbage",
+    "build-decision-context",
+    "execute-option",
+    "patrol-runner"
+  ]
+}

@@ -409,6 +409,29 @@
       "tags": ["service", "regression", "tabletop", "no_pick", "floor_only"]
     },
     {
+      "name": "regression_far_receptacle_no_place",
+      "scene": "FloorPlan1",
+      "mode": "benchmark",
+      "description": "Regression: a visible far/side receptacle must not be treated as immediately placeable.",
+      "look_down": true,
+      "initial_pose": {
+        "position": {"x": -1.0, "y": 0.9, "z": 0.0},
+        "rotation": {"x": 0, "y": 180, "z": 0}
+      },
+      "seed_objects": [
+        {
+          "kind": "place_receptacle",
+          "dataset_label": "CounterTop",
+          "task_semantic_class": "place_receptacle",
+          "layout": "far-front",
+          "distance": 1.15,
+          "y": 0.72,
+          "object_types": ["CounterTop", "SideTable", "DiningTable"]
+        }
+      ],
+      "tags": ["service", "regression", "place", "far_receptacle", "no_direct_place"]
+    },
+    {
       "name": "general_kitchen_floorplan2",
       "scene": "FloorPlan2",
       "mode": "benchmark",

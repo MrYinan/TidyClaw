@@ -39,7 +39,7 @@ DEFAULT_DATASET_ROOT = REPO_ROOT / "datasets" / "ai2thor_service_yolo_v2"
 DEFAULT_ONTOLOGY = REPO_ROOT / "configs" / "service_task_ontology_v2.json"
 DEFAULT_BASE_URL = "http://127.0.0.1:5000"
 DEFAULT_SCENARIOS = "book_front_pick,apple_front_pick,book_on_floor_to_table,mixed_book_and_cabinet"
-VALID_ACTIONS = ["RotateLeft", "RotateRight", "MoveAhead", "MoveBack"]
+VALID_ACTIONS = ["RotateLeft", "RotateRight", "MoveAhead", "MoveBack", "MoveLeft", "MoveRight", "LookDown", "LookUp"]
 CLASS_ALIASES = {
     "SinkBasin": "Sink",
     "Table": "DiningTable",
@@ -306,7 +306,7 @@ def sample_action(policy: str, actions: Sequence[str], rng: random.Random) -> Op
         pool = [action for action in actions if action in VALID_ACTIONS]
         return rng.choice(pool) if pool else None
     if policy == "random":
-        pool = [action for action in actions if action in VALID_ACTIONS] or ["RotateLeft", "RotateRight", "MoveAhead"]
+        pool = [action for action in actions if action in VALID_ACTIONS] or ["RotateLeft", "RotateRight", "MoveAhead", "MoveLeft", "MoveRight", "LookDown", "LookUp"]
         return rng.choice(pool)
     raise ValueError(f"unknown action policy: {policy}")
 
@@ -484,7 +484,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenarios", default=DEFAULT_SCENARIOS)
     parser.add_argument("--scenario-interval", type=int, default=10)
     parser.add_argument("--action-policy", choices=["none", "rotate", "random", "scripted"], default="random")
-    parser.add_argument("--actions", default="RotateLeft,RotateRight,MoveAhead")
+    parser.add_argument("--actions", default="RotateLeft,RotateRight,MoveAhead,MoveLeft,MoveRight,LookDown,LookUp")
     parser.add_argument("--move-after-capture", action="store_true", default=True)
     parser.add_argument("--no-move-after-capture", action="store_false", dest="move_after_capture")
     parser.add_argument("--min-box-area", type=int, default=64)

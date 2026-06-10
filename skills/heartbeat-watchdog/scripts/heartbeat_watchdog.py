@@ -57,6 +57,22 @@ def compact_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
+def invocation_metadata(argv: Optional[Sequence[str]], args: argparse.Namespace) -> JsonDict:
+    effective_argv = list(sys.argv) if argv is None else [str(Path(__file__)), *[str(item) for item in argv]]
+    ppid = os.getppid() if hasattr(os, "getppid") else None
+    metadata: JsonDict = {
+        "pid": os.getpid(),
+        "ppid": ppid,
+        "parent_process": process_snapshot(ppid),
+        "sys_executable": sys.executable,
+        "argv": effective_argv,
+        "cwd": os.getcwd(),
+        "script": str(Path(__file__).resolve()),
+        "scan_idle": bool(getattr(args, "scan_idle", False)),
+    }
+    return metadata
+
+
 def hidden_startupinfo() -> Optional[subprocess.STARTUPINFO]:
     if os.name != "nt":
         return None
@@ -70,6 +86,71 @@ def hidden_creationflags() -> int:
     if os.name != "nt":
         return 0
     return int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def process_snapshot(pid: Optional[int]) -> Optional[JsonDict]:
+    if not pid or pid <= 0:
+        return None
+    psutil_error: Optional[str] = None
+    try:
+        import psutil  # type: ignore
+
+        process = psutil.Process(int(pid))
+        return {
+            "pid": process.pid,
+            "ppid": process.ppid(),
+            "process_name": process.name(),
+            "path": process.exe(),
+            "cmdline": process.cmdline(),
+            "create_time": process.create_time(),
+            "lookup_status": "found_psutil",
+        }
+    except Exception as exc:
+        psutil_error = str(exc)[:300]
+    if os.name != "nt":
+        return {"pid": pid, "lookup_status": "error", "psutil_error": psutil_error}
+    command = (
+        "$p=Get-Process -Id "
+        + str(int(pid))
+        + " -ErrorAction SilentlyContinue; "
+        + "if ($p) { $p | Select-Object Id,ProcessName,Path,StartTime | ConvertTo-Json -Compress }"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3,
+            check=False,
+            startupinfo=hidden_startupinfo(),
+            creationflags=hidden_creationflags(),
+        )
+    except Exception as exc:
+        return {"pid": pid, "lookup_status": "error", "psutil_error": psutil_error, "error": str(exc)[:300]}
+    text = completed.stdout.strip()
+    if not text:
+        return {
+            "pid": pid,
+            "lookup_status": "not_found",
+            "psutil_error": psutil_error,
+            "returncode": completed.returncode,
+            "stderr": completed.stderr.strip()[-300:],
+        }
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {"pid": pid, "lookup_status": "unparsed", "psutil_error": psutil_error, "stdout": text[:300]}
+    if not isinstance(data, dict):
+        return {"pid": pid, "lookup_status": "unexpected", "psutil_error": psutil_error, "stdout": text[:300]}
+    return {
+        "pid": data.get("Id", pid),
+        "process_name": data.get("ProcessName"),
+        "path": data.get("Path"),
+        "start_time": data.get("StartTime"),
+        "lookup_status": "found",
+    }
 
 
 def parse_json_output(text: str) -> JsonDict:
@@ -90,9 +171,11 @@ def parse_json_output(text: str) -> JsonDict:
     return {}
 
 
-def run_command(command: Sequence[str], timeout: int) -> JsonDict:
+def run_command(command: Sequence[str], timeout: int, *, extra_env: Optional[Dict[str, str]] = None) -> JsonDict:
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
+    if extra_env:
+        env.update({str(key): str(value) for key, value in extra_env.items()})
     completed = subprocess.run(
         list(command),
         cwd=str(REPO_ROOT),
@@ -121,6 +204,20 @@ def analyze_script_for_backend(backend: str) -> Path:
     if script is None:
         raise ValueError(f"Unsupported perception backend: {backend}")
     return script
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def append_log(event: str, payload: JsonDict) -> None:
@@ -218,40 +315,192 @@ def report_user_message(report_result: JsonDict, status: JsonDict) -> str:
 def start_user_message(start_result: JsonDict) -> str:
     if start_result.get("status") == "success" and start_result.get("user_message"):
         return (
-            "心跳主动感知到当前房间存在疑似可清扫地面目标；"
+            "心跳主动感知到当前房间存在疑似可处理目标；"
             f"{start_result.get('user_message')}"
         )
     if start_result.get("status") == "success":
         return (
-            "心跳主动感知到当前房间存在疑似可清扫地面目标，"
+            "心跳主动感知到当前房间存在疑似可处理目标，"
             "已启动当前房间自动巡视，后台 runner 正在执行。"
         )
     return (
-        "心跳主动感知到当前房间存在疑似可清扫地面目标，"
+        "心跳主动感知到当前房间存在疑似可处理目标，"
         "但启动自动巡视失败，请检查 patrol-runner 状态。"
     )
 
 
 def service_start_user_message(start_result: JsonDict) -> str:
     if start_result.get("status") == "success" and start_result.get("user_message"):
-        return f"Heartbeat detected a possible household service target; {start_result.get('user_message')}"
+        return f"心跳主动感知到当前房间存在疑似服务整理目标；{start_result.get('user_message')}"
     if start_result.get("status") == "success":
-        return "Heartbeat detected a possible household service target and started the background tidy runner."
-    return "Heartbeat detected a possible household service target, but the tidy runner did not start."
+        return "心跳主动感知到当前房间存在疑似服务整理目标，已启动后台 tidy 巡视。"
+    return "心跳主动感知到当前房间存在疑似服务整理目标，但后台 tidy 巡视启动失败。"
 
 
 def analysis_has_trigger_target(analysis: JsonDict, *, task_mode: str) -> bool:
-    if bool(analysis.get("floor_trash_detected", False)):
-        return True
-    if str(task_mode or "clean").lower() != "tidy":
-        return False
+    if str(task_mode or "tidy").lower() != "tidy":
+        return bool(analysis.get("floor_trash_detected", False))
     if bool(analysis.get("pickup_target_detected", False)):
         return True
+    if bool(analysis.get("direct_pickup_detected", False)):
+        return True
     candidates = analysis.get("service_candidates", []) or []
-    return isinstance(candidates, list) and any(isinstance(item, dict) for item in candidates)
+    if isinstance(candidates, list) and any(isinstance(item, dict) for item in candidates):
+        return True
+    return bool(analysis.get("floor_trash_detected", False))
 
 
-def idle_scan(timeout: int, perception_backend: str) -> JsonDict:
+def service_start_user_message(start_result: JsonDict) -> str:
+    if start_result.get("status") == "success" and start_result.get("user_message"):
+        return (
+            "心跳主动感知到当前房间存在疑似服务整理候选，"
+            "已启动后台 tidy 巡视做 RGB-D 复核；"
+            f"{start_result.get('user_message')}"
+        )
+    if start_result.get("status") == "success":
+        return "心跳主动感知到当前房间存在疑似服务整理候选，已启动后台 tidy 巡视做 RGB-D 复核。"
+    return "心跳主动感知到当前房间存在疑似服务整理候选，但后台 tidy 巡视启动失败。"
+
+
+def candidate_number(candidate: JsonDict, *keys: str, default: float = 0.0) -> float:
+    for key in keys:
+        value: Any = candidate
+        for part in key.split("."):
+            if not isinstance(value, dict):
+                value = None
+                break
+            value = value.get(part)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return float(default)
+
+
+def short_candidate(candidate: JsonDict, *, reason: str) -> JsonDict:
+    return {
+        "label": candidate.get("label"),
+        "raw_label": candidate.get("raw_label") or candidate.get("label"),
+        "task_semantic_class": candidate.get("task_semantic_class"),
+        "confidence": candidate.get("confidence"),
+        "surface_hint": candidate.get("surface_hint"),
+        "is_floor_level": candidate.get("is_floor_level"),
+        "pickup_now": candidate.get("pickup_now"),
+        "cleanable_now": candidate.get("cleanable_now"),
+        "reachable": candidate.get("reachable"),
+        "position_hint": candidate.get("position_hint"),
+        "bottom_y_ratio": candidate_number(candidate, "geometry.bottom_y_ratio", "bottom_y_ratio"),
+        "ground_distance": candidate.get("ground_distance") or candidate_number(
+            candidate,
+            "geometry.ground_distance_m",
+            "depth.ground_distance_m",
+            default=0.0,
+        ),
+        "reason": reason,
+    }
+
+
+def floor_contact_like(candidate: JsonDict) -> bool:
+    detail = candidate.get("floor_contact_geometry") if isinstance(candidate.get("floor_contact_geometry"), dict) else {}
+    return bool(detail.get("available") and detail.get("contact_floor_like"))
+
+
+def heartbeat_floor_pickup_candidate(candidate: Any) -> Optional[JsonDict]:
+    if not isinstance(candidate, dict):
+        return None
+    if str(candidate.get("task_semantic_class") or "") != "pickup_target":
+        return None
+    if bool(candidate.get("support_context_blocked")) or bool(candidate.get("is_support_surface")):
+        return None
+
+    confidence = candidate_number(candidate, "confidence", default=0.0)
+    if confidence < env_float("ROBOT_HEARTBEAT_PICKUP_MIN_CONF", 0.65):
+        return None
+
+    surface_hint = str(candidate.get("surface_hint") or "")
+    bottom_y = candidate_number(candidate, "geometry.bottom_y_ratio", "bottom_y_ratio", default=0.0)
+    contact_like = floor_contact_like(candidate)
+    if (
+        surface_hint in {"surface_or_elevated", "support_surface", "table", "counter_top", "countertop"}
+        and candidate.get("is_floor_level") is False
+        and not contact_like
+    ):
+        return None
+    floor_like = bool(
+        contact_like
+        or (surface_hint == "floor" and bool(candidate.get("is_floor_level")))
+        or bool(candidate.get("pickup_now"))
+    )
+    if not floor_like:
+        return None
+    has_depth_evidence = bool(
+        isinstance(candidate.get("depth"), dict)
+        or isinstance(candidate.get("center_3d"), dict)
+        or isinstance(candidate.get("floor_contact_geometry"), dict)
+        or str(candidate.get("actionability_source") or "") == "depth_geometry"
+    )
+    if (
+        not bool(candidate.get("pickup_now"))
+        and not has_depth_evidence
+        and bottom_y < env_float("ROBOT_HEARTBEAT_PICKUP_MIN_BOTTOM_RATIO", 0.78)
+    ):
+        return None
+
+    reason = "direct_floor_pickup" if bool(candidate.get("pickup_now")) else "floor_pickup_candidate"
+    return short_candidate(candidate, reason=reason)
+
+
+def heartbeat_floor_clean_candidate(candidate: Any) -> Optional[JsonDict]:
+    if not isinstance(candidate, dict):
+        return None
+    if str(candidate.get("task_semantic_class") or "") != "cleanable_object":
+        return None
+    if not bool(candidate.get("cleanable_now")):
+        return None
+    if bool(candidate.get("support_context_blocked")):
+        return None
+    if str(candidate.get("surface_hint") or "") != "floor" and not bool(candidate.get("is_floor_level")):
+        return None
+    if candidate_number(candidate, "confidence", default=0.0) < env_float("ROBOT_HEARTBEAT_CLEAN_MIN_CONF", 0.60):
+        return None
+    return short_candidate(candidate, reason="floor_clean_candidate")
+
+
+def heartbeat_trigger_candidates(analysis: JsonDict, *, task_mode: str) -> List[JsonDict]:
+    triggers: List[JsonDict] = []
+    seen = set()
+
+    def add(candidate: Optional[JsonDict]) -> None:
+        if not isinstance(candidate, dict):
+            return
+        key = json.dumps(candidate, ensure_ascii=False, sort_keys=True)
+        if key in seen:
+            return
+        seen.add(key)
+        triggers.append(candidate)
+
+    if str(task_mode or "tidy").lower() == "tidy":
+        pickup_pools = [analysis.get("best_pickup_candidate")]
+        pickup_pools.extend(analysis.get("service_candidates", []) or [])
+        for candidate in pickup_pools:
+            add(heartbeat_floor_pickup_candidate(candidate))
+
+    clean_pools = [analysis.get("best_clean_candidate")]
+    clean_pools.extend(analysis.get("trash_candidates", []) or [])
+    for candidate in clean_pools:
+        add(heartbeat_floor_clean_candidate(candidate))
+
+    return triggers
+
+
+def analysis_has_trigger_target(analysis: JsonDict, *, task_mode: str) -> bool:
+    candidates = analysis.get("heartbeat_trigger_candidates")
+    if isinstance(candidates, list):
+        return any(isinstance(item, dict) for item in candidates)
+    return bool(heartbeat_trigger_candidates(analysis, task_mode=task_mode))
+
+
+def idle_scan(timeout: int, perception_backend: str, *, task_mode: str) -> JsonDict:
     vision = run_command([sys.executable, str(GET_VISION_SCRIPT)], timeout=timeout)
     if vision.get("status") != "success" or not vision.get("image_path"):
         return {
@@ -266,9 +515,42 @@ def idle_scan(timeout: int, perception_backend: str) -> JsonDict:
 
     backend = str(perception_backend or "yolo").strip().lower()
     analyze_script = analyze_script_for_backend(backend)
+    analyze_command = [sys.executable, str(analyze_script), "--image", str(vision["image_path"])]
+    analyze_env: Dict[str, str] = {}
+    if backend == "yolo":
+        depth_path = str(vision.get("depth_path") or "").strip()
+        camera = vision.get("camera") if isinstance(vision.get("camera"), dict) else {}
+        if depth_path:
+            analyze_command.extend(["--depth", depth_path])
+        if camera:
+            analyze_command.extend(["--camera-json", compact_json(camera)])
+        analyze_command.extend(
+            [
+                "--iou",
+                str(env_float("ROBOT_HEARTBEAT_YOLO_IOU", 0.45)),
+                "--max-candidates",
+                str(env_int("ROBOT_HEARTBEAT_YOLO_MAX_CANDIDATES", 8)),
+                "--disable-stale-service-fallback",
+            ]
+        )
+        save_vis = str(
+            os.getenv(
+                "ROBOT_HEARTBEAT_YOLO_SAVE_VIS",
+                str(MEMORY_DIR / "yolo-heartbeat-annotated-rgbd.jpg"),
+            )
+            or ""
+        ).strip()
+        if save_vis:
+            analyze_command.extend(["--save-vis", save_vis])
+        analyze_env = {
+            "ROBOT_YOLO_FORCE_LOCAL_CORE": "0",
+            "ROBOT_YOLO_DISABLE_STALE_SERVICE_FALLBACK": "1",
+        }
+
     analysis = run_command(
-        [sys.executable, str(analyze_script), "--image", str(vision["image_path"])],
+        analyze_command,
         timeout=timeout,
+        extra_env=analyze_env,
     )
     if analysis.get("status") != "success":
         return {
@@ -282,22 +564,37 @@ def idle_scan(timeout: int, perception_backend: str) -> JsonDict:
             },
         }
 
+    trigger_candidates = heartbeat_trigger_candidates(analysis, task_mode=task_mode)
     return {
         "status": "success",
         "result_type": "heartbeat_idle_scan",
         "vision": {
             "image_path": vision.get("image_path"),
+            "depth_path": vision.get("depth_path"),
+            "camera": vision.get("camera") if isinstance(vision.get("camera"), dict) else None,
             "observation_contract": vision.get("observation_contract"),
             "online_safe": vision.get("online_safe", True),
             "last_action_feedback": vision.get("last_action_feedback"),
         },
         "analysis": {
             "perception_backend": analysis.get("perception_backend", backend),
+            "perception_command": " ".join(analyze_command),
+            "rgbd_used": bool(analysis.get("depth_path") or vision.get("depth_path")),
+            "candidate_interpretation": "suspected_candidates_only;runner_revalidates_before_action",
+            "heartbeat_trigger_candidates": trigger_candidates,
+            "heartbeat_trigger_candidate_count": len(trigger_candidates),
             "floor_trash_detected": bool(analysis.get("floor_trash_detected", False)),
             "direct_cleanable_detected": bool(analysis.get("direct_cleanable_detected", False)),
             "pickup_target_detected": bool(analysis.get("pickup_target_detected", False)),
             "place_receptacle_detected": bool(analysis.get("place_receptacle_detected", False)),
             "direct_pickup_detected": bool(analysis.get("direct_pickup_detected", False)),
+            "direct_place_detected": bool(analysis.get("direct_place_detected", False)),
+            "best_pickup_candidate": short_candidate(
+                analysis.get("best_pickup_candidate"),
+                reason="best_pickup_candidate",
+            )
+            if isinstance(analysis.get("best_pickup_candidate"), dict)
+            else None,
             "service_candidates": analysis.get("service_candidates", []),
             "receptacle_candidates": analysis.get("receptacle_candidates", []),
             "alignment_needed": bool(analysis.get("alignment_needed", False)),
@@ -381,7 +678,11 @@ def check_once(args: argparse.Namespace) -> JsonDict:
         return result
 
     if args.scan_idle and state_is_idle(state):
-        scan = idle_scan(timeout=args.timeout, perception_backend=args.perception_backend)
+        scan = idle_scan(
+            timeout=args.timeout,
+            perception_backend=args.perception_backend,
+            task_mode=str(args.task_mode),
+        )
         result["idle_scan"] = scan
         analysis = scan.get("analysis", {})
         if scan.get("status") == "success" and analysis_has_trigger_target(
@@ -390,7 +691,7 @@ def check_once(args: argparse.Namespace) -> JsonDict:
         ):
             start_result = start_runner(args)
             start_ok = start_result.get("status") == "success"
-            task_noun = "service target" if str(args.task_mode).lower() == "tidy" else "floor target"
+            task_noun = "suspected service candidate" if str(args.task_mode).lower() == "tidy" else "floor target"
             result.update(
                 {
                     "result_type": (
@@ -415,10 +716,15 @@ def check_once(args: argparse.Namespace) -> JsonDict:
                 }
             )
         else:
+            task_noun = (
+                "household service target"
+                if str(args.task_mode).lower() == "tidy"
+                else "cleanable floor target"
+            )
             result.update(
                 {
                     "result_type": "heartbeat_idle_no_task",
-                    "message": "idle scan found no cleanable floor target",
+                    "message": f"idle scan found no {task_noun}",
                 }
             )
         return result
@@ -455,13 +761,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--task-mode",
         choices=["clean", "tidy"],
-        default=os.getenv("ROBOT_TASK_MODE", "clean"),
+        default=os.getenv("ROBOT_TASK_MODE", "tidy"),
         help="Runner task mode. tidy starts on service-object detections, clean starts on floor-clean targets.",
     )
     parser.add_argument(
         "--scan-idle",
         action="store_true",
-        help="When IDLE, do one get-vision + analyze pass and start patrol-runner if floor trash is detected.",
+        help="When IDLE, do one get-vision + analyze pass and start patrol-runner if a task target is detected.",
     )
     parser.add_argument(
         "--no-scan-idle",
@@ -475,6 +781,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    invocation = invocation_metadata(argv, args)
     try:
         result = check_once(args)
     except subprocess.TimeoutExpired as exc:
@@ -492,6 +799,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "time": now_iso(),
         }
 
+    result["invocation"] = invocation
     write_heartbeat_state(result)
     append_log(result.get("result_type", "heartbeat_unknown"), result)
     print_json(result)
