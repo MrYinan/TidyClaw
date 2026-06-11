@@ -37,7 +37,7 @@ PLACE_SCRIPT = REPO_ROOT / "skills" / "place-object" / "scripts" / "place_object
 
 DECISION_CONTEXT_SCHEMA = "robot_cleaner_decision_context_v1"
 PLACE_PRECHECK_CACHE_SCHEMA = "robot_cleaner_place_precheck_cache_v1"
-PHYSICAL_KINDS = {"move_action", "service_action", "clean_action"}
+PHYSICAL_KINDS = {"move_action", "explore_frontier", "service_action", "clean_action"}
 SURFACE_REGION_SOURCES = {
     "pointcloud_plane",
     "pointcloud_plane_completion",
@@ -223,6 +223,19 @@ def as_list(value: Any) -> list[Any]:
     return [value]
 
 
+def resolved_move_action_for_option(context: JsonDict, option: JsonDict) -> str:
+    action = str(option.get("action") or "").strip()
+    if action:
+        return action
+    step_option_id = str(option.get("resolved_step_option_id") or "").strip()
+    if not step_option_id:
+        return ""
+    step_option = find_option(context, step_option_id)
+    if not step_option:
+        return ""
+    return str(step_option.get("action") or "").strip()
+
+
 def place_candidate_executor_ready(candidate: JsonDict) -> bool:
     actionability = as_dict(candidate.get("actionability"))
     executor_checks = as_dict(candidate.get("executor_checks"))
@@ -316,6 +329,26 @@ def warning_blocks_physical_action(warning: JsonDict) -> bool:
     return warning.get("blocking") is not False
 
 
+def validate_move_action_fields(context: JsonDict, action: str) -> list[JsonDict]:
+    errors: list[JsonDict] = []
+    if action not in MOVE_ACTIONS:
+        errors.append({"type": "invalid_move_action", "action": action})
+        return errors
+    navigation = as_dict(context.get("navigation"))
+    action_safety = as_dict(as_dict(as_dict(navigation.get("local_costmap")).get("action_safety")).get(action))
+    if action_safety.get("safe") is False:
+        errors.append(
+            {
+                "type": "move_action_blocked_by_costmap",
+                "action": action,
+                "reason": action_safety.get("reason"),
+            }
+        )
+    if action == "MoveAhead" and as_dict(context.get("perception")).get("obstacle_ahead") is True:
+        errors.append({"type": "moveahead_blocked_by_perception"})
+    return errors
+
+
 def validate_option(
     context: JsonDict,
     option: JsonDict,
@@ -353,21 +386,16 @@ def validate_option(
                 }
             )
     if option.get("kind") == "move_action":
-        action = str(option.get("action") or "")
-        if action not in MOVE_ACTIONS:
-            errors.append({"type": "invalid_move_action", "action": action})
-        navigation = as_dict(context.get("navigation"))
-        action_safety = as_dict(as_dict(as_dict(navigation.get("local_costmap")).get("action_safety")).get(action))
-        if action_safety.get("safe") is False:
-            errors.append(
-                {
-                    "type": "move_action_blocked_by_costmap",
-                    "action": action,
-                    "reason": action_safety.get("reason"),
-                }
-            )
-        if action == "MoveAhead" and as_dict(context.get("perception")).get("obstacle_ahead") is True:
-            errors.append({"type": "moveahead_blocked_by_perception"})
+        action = resolved_move_action_for_option(context, option)
+        errors.extend(validate_move_action_fields(context, action))
+    if option.get("kind") == "explore_frontier":
+        action = resolved_move_action_for_option(context, option)
+        frontier_target = as_dict(option.get("frontier_target"))
+        if not frontier_target.get("cell"):
+            errors.append({"type": "explore_frontier_missing_target_cell"})
+        if not str(option.get("option_id") or "").startswith("explore:frontier:"):
+            errors.append({"type": "invalid_explore_frontier_option_id", "option_id": option_id})
+        errors.extend(validate_move_action_fields(context, action))
     if option.get("kind") == "service_action":
         action = str(option.get("action") or "")
         held = bool(as_dict(as_dict(context.get("worklist")).get("held_object")).get("holding_object"))
@@ -677,6 +705,45 @@ def run_observe_refresh(*, timeout_seconds: int) -> JsonDict:
     }
 
 
+def run_move_step(
+    context: JsonDict,
+    option: JsonDict,
+    *,
+    action: str,
+    timeout_seconds: int,
+    result_type: str,
+    extra: JsonDict | None = None,
+) -> JsonDict:
+    result = run_script(MOVE_SCRIPT, ["--action", action], timeout_seconds=timeout_seconds)
+    ok = (
+        result.returncode == 0
+        and result.data.get("status") != "error"
+        and result.data.get("lastActionSuccess", True) is not False
+    )
+    state_sync_option = dict(option)
+    state_sync_option["kind"] = "move_action"
+    state_sync_option["action"] = action
+    state_sync = sync_option_result(
+        context=context,
+        option=state_sync_option,
+        candidate=None,
+        execution=result.data,
+        success=ok,
+        memory_dir=MEMORY_DIR,
+    )
+    payload = {
+        "status": "success" if ok else "error",
+        "result_type": result_type,
+        "option_id": option.get("option_id"),
+        "physical_action_executed": True,
+        "resolved_action": action,
+        "execution": script_result_payload(result),
+        "state_sync": state_sync,
+    }
+    payload.update(extra or {})
+    return payload
+
+
 def run_selected_option(
     context: JsonDict,
     option: JsonDict,
@@ -709,28 +776,27 @@ def run_selected_option(
             "done_readiness": context.get("done_readiness"),
         }
     if kind == "move_action":
-        result = run_script(MOVE_SCRIPT, ["--action", action], timeout_seconds=timeout_seconds)
-        ok = (
-            result.returncode == 0
-            and result.data.get("status") != "error"
-            and result.data.get("lastActionSuccess", True) is not False
+        return run_move_step(
+            context,
+            option,
+            action=resolved_move_action_for_option(context, option),
+            timeout_seconds=timeout_seconds,
+            result_type="option_move_executed",
         )
-        state_sync = sync_option_result(
-            context=context,
-            option=option,
-            candidate=None,
-            execution=result.data,
-            success=ok,
-            memory_dir=MEMORY_DIR,
+    if kind == "explore_frontier":
+        resolved_action = resolved_move_action_for_option(context, option)
+        return run_move_step(
+            context,
+            option,
+            action=resolved_action,
+            timeout_seconds=timeout_seconds,
+            result_type="option_explore_frontier_step_executed",
+            extra={
+                "frontier_target": as_dict(option.get("frontier_target")),
+                "resolved_step_option_id": option.get("resolved_step_option_id"),
+                "one_step_only": True,
+            },
         )
-        return {
-            "status": "success" if ok else "error",
-            "result_type": "option_move_executed",
-            "option_id": option_id,
-            "physical_action_executed": True,
-            "execution": script_result_payload(result),
-            "state_sync": state_sync,
-        }
     if kind == "clean_action":
         result = run_script(CLEAN_SCRIPT, [], timeout_seconds=timeout_seconds)
         ok = result.returncode == 0 and result.data.get("status") != "error"

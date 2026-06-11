@@ -18,6 +18,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+try:
+    from scripts.exploration_context import build_exploration_context
+except ImportError:  # pragma: no cover - direct script execution
+    from exploration_context import build_exploration_context
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MEMORY_DIR = REPO_ROOT / "memory"
@@ -70,6 +75,17 @@ SURFACE_REGION_SOURCES = {
     "pointcloud_plane_completion",
     "pointcloud_plane_grid_completion",
     "depth_region_geometry",
+}
+
+GOAL_LEVEL_OPTION_KINDS = {
+    "service_action",
+    "place_precheck",
+    "clean_action",
+    "explore_frontier",
+}
+SUPPORT_OPTION_KINDS = {
+    "perception",
+    "completion_probe",
 }
 
 FORBIDDEN_AGENT_VIEW_KEYS = {
@@ -990,6 +1006,19 @@ def option_id(prefix: str, value: str) -> str:
     return f"{prefix}:{safe or 'option'}"
 
 
+def frontier_option_id(cell: Any) -> str:
+    try:
+        left, right = str(cell or "").split(",", 1)
+        x = int(left)
+        z = int(right)
+        def encode(value: int) -> str:
+            return f"m{abs(value)}" if value < 0 else str(value)
+
+        return f"explore:frontier:x{encode(x)}_z{encode(z)}"
+    except (TypeError, ValueError):
+        return option_id("explore:frontier", str(cell or "frontier"))
+
+
 def candidate_ref(candidate: JsonDict) -> JsonDict:
     return clean_empty(
         {
@@ -1162,11 +1191,88 @@ def place_candidate_executor_ready(candidate: JsonDict) -> bool:
     return actionability.get("place_now") is True or actionability.get("final_place_ready") is True
 
 
+def annotate_option_selection_contract(options: list[JsonDict]) -> JsonDict:
+    """Annotate options with model-facing decision-level metadata.
+
+    This is not a recommender. It keeps the LLM as the selector while making the
+    interface explicit: pick/place/explore are goal-level choices; raw move:*
+    actions are motor-level fallbacks whenever a goal-level option exists.
+    """
+
+    goal_option_ids = [
+        str(option.get("option_id"))
+        for option in options
+        if option.get("kind") in GOAL_LEVEL_OPTION_KINDS and option.get("executable_now") is True
+    ]
+    explore_option_ids = [
+        str(option.get("option_id"))
+        for option in options
+        if option.get("kind") == "explore_frontier" and option.get("executable_now") is True
+    ]
+    has_goal_options = bool(goal_option_ids)
+
+    primary_options: list[str] = []
+    fallback_options: list[str] = []
+    low_level_move_options: list[str] = []
+
+    for option in options:
+        kind = str(option.get("kind") or "")
+        oid = str(option.get("option_id") or "")
+        if not oid:
+            continue
+        if kind == "move_action":
+            low_level_move_options.append(oid)
+            option["decision_level"] = "motor"
+            option["llm_priority"] = "fallback" if has_goal_options else "available_when_no_goal_option"
+            option["fallback_only"] = bool(has_goal_options)
+            option["allowed_when"] = (
+                "no_goal_level_option_or_recovery_required"
+                if has_goal_options
+                else "no_goal_level_option_available"
+            )
+            if option["fallback_only"]:
+                fallback_options.append(oid)
+            else:
+                primary_options.append(oid)
+            continue
+
+        option["fallback_only"] = False
+        if kind == "explore_frontier":
+            option["decision_level"] = "goal"
+            option["llm_priority"] = "primary"
+            option["allowed_when"] = "no_immediate_pick_place_goal_or_as_exploration_target"
+        elif kind in {"service_action", "place_precheck", "clean_action"}:
+            option["decision_level"] = "task"
+            option["llm_priority"] = "primary"
+            option["allowed_when"] = "task_subgoal_available"
+        elif kind in SUPPORT_OPTION_KINDS:
+            option["decision_level"] = "support"
+            option["llm_priority"] = "support"
+            option["allowed_when"] = "refresh_status_or_completion_check"
+        else:
+            option["decision_level"] = "support"
+            option["llm_priority"] = "available"
+            option["allowed_when"] = "option_specific_contract"
+        primary_options.append(oid)
+
+    return clean_empty(
+        {
+            "primary_options": primary_options,
+            "fallback_options": fallback_options,
+            "goal_options": goal_option_ids,
+            "explore_frontier_options": explore_option_ids,
+            "low_level_move_options": low_level_move_options,
+            "raw_move_policy_active": bool(has_goal_options),
+        }
+    )
+
+
 def build_options(
     *,
     task: JsonDict,
     perception: JsonDict,
     costmap: JsonDict,
+    exploration: JsonDict | None = None,
     worklist: JsonDict,
     done_readiness: JsonDict,
     max_options: int,
@@ -1192,6 +1298,7 @@ def build_options(
     receptacle_candidates = as_list(current_view.get("receptacle_candidates"))
     surface_candidates = as_list(current_view.get("surface_candidates"))
     cleanable_candidates = as_list(current_view.get("cleanable_candidates"))
+    action_effects = as_dict(as_dict(exploration).get("action_effects"))
 
     if structured_ok and not holding and phase in SERVICE_PICKUP_PHASES | {""}:
         for candidate in pickup_candidates:
@@ -1273,6 +1380,7 @@ def build_options(
     else:
         conservative_turns = BODY_MOVE_ACTIONS
         move_reason = "Movement option is gated by latest local costmap safety."
+    move_options: list[JsonDict] = []
     for action in conservative_turns:
         safe, reason = action_safe(costmap, action)
         if safe is False:
@@ -1283,22 +1391,27 @@ def build_options(
         if safe is None:
             bootstrap_safe, bootstrap_reason = perception_bootstrap_move_safe(perception, action)
         if safe is True or action in {"RotateLeft", "RotateRight"} or bootstrap_safe:
-            options.append(
-                {
-                    "option_id": option_id("move", action),
-                    "kind": "move_action",
-                    "physical_action": True,
-                    "tool": "move-robot",
-                    "action": action,
-                    "executable_now": True,
-                    "reason": bootstrap_reason if bootstrap_safe else (reason or move_reason),
-                    "safety_source": (
-                        "navigation-costmap"
-                        if safe is True or action in {"RotateLeft", "RotateRight"}
-                        else "perception-navigation-bootstrap"
-                    ),
-                }
-            )
+            move_option = {
+                "option_id": option_id("move", action),
+                "kind": "move_action",
+                "physical_action": True,
+                "tool": "move-robot",
+                "action": action,
+                "executable_now": True,
+                "reason": bootstrap_reason if bootstrap_safe else (reason or move_reason),
+                "safety_source": (
+                    "navigation-costmap"
+                    if safe is True or action in {"RotateLeft", "RotateRight"}
+                    else "perception-navigation-bootstrap"
+                ),
+            }
+            effect = as_dict(action_effects.get(action))
+            if effect:
+                move_option["exploration_effect"] = effect
+            move_options.append(move_option)
+
+    options.extend(build_explore_frontier_options(exploration=as_dict(exploration), move_options=move_options))
+    options.extend(move_options)
 
     options.append(
         {
@@ -1313,6 +1426,7 @@ def build_options(
     )
 
     options = options[: max(1, max_options)]
+    selection_metadata = annotate_option_selection_contract(options)
     rule_baseline = choose_rule_baseline_option(options, task=task, perception=perception, worklist=worklist)
     return {
         "schema": OPTION_SET_SCHEMA,
@@ -1326,10 +1440,84 @@ def build_options(
             "rule_baseline_usage": "diagnostic_only_for_rule_fallback_and_regression_tests",
             "executor_must_validate_before_action": True,
             "one_physical_action_per_turn": True,
+            "llm_should_choose_from": "primary_options_first",
+            "raw_move_policy": "fallback_only_when_goal_level_options_exist",
+            "explore_policy": (
+                "when no pick/place option is appropriate and explore:frontier options exist, "
+                "choose explore:frontier before raw move:*"
+            ),
+            "raw_move_allowed_when": "no goal-level option exists or recovery after failure requires it",
         },
         "rule_baseline_option_id": rule_baseline,
+        **selection_metadata,
         "options": options,
     }
+
+
+def build_explore_frontier_options(
+    *,
+    exploration: JsonDict,
+    move_options: list[JsonDict],
+    max_frontiers: int = 4,
+) -> list[JsonDict]:
+    move_by_action = {
+        str(option.get("action") or ""): option
+        for option in move_options
+        if option.get("kind") == "move_action" and option.get("executable_now") is True
+    }
+    action_effects = as_dict(exploration.get("action_effects"))
+    result: list[JsonDict] = []
+    seen_ids: set[str] = set()
+    for raw_candidate in as_list(exploration.get("frontier_candidates")):
+        candidate = as_dict(raw_candidate)
+        cell = str(candidate.get("cell") or "").strip()
+        action = str(candidate.get("first_action_hint") or "").strip()
+        if not cell or action not in move_by_action:
+            continue
+        oid = frontier_option_id(cell)
+        if oid in seen_ids:
+            continue
+        seen_ids.add(oid)
+        step_option = move_by_action[action]
+        step_effect = as_dict(action_effects.get(action)) or as_dict(step_option.get("exploration_effect"))
+        result.append(
+            clean_empty(
+                {
+                    "option_id": oid,
+                    "kind": "explore_frontier",
+                    "physical_action": True,
+                    "tool": "move-robot",
+                    "action": action,
+                    "executable_now": True,
+                    "decision_level": "goal",
+                    "llm_priority": "primary",
+                    "fallback_only": False,
+                    "allowed_when": "no_immediate_pick_place_goal_or_as_exploration_target",
+                    "one_step_only": True,
+                    "resolved_step_option_id": step_option.get("option_id"),
+                    "frontier_target": {
+                        "cell": cell,
+                        "distance_steps": candidate.get("distance_steps"),
+                        "direction_from_current": candidate.get("direction_from_current"),
+                        "score": candidate.get("score"),
+                        "unknown_neighbor_count": candidate.get("unknown_neighbor_count"),
+                        "cluster_size": candidate.get("cluster_size"),
+                        "planner_selected": candidate.get("planner_selected"),
+                        "reasons": candidate.get("reasons"),
+                        "first_action_policy": candidate.get("first_action_policy"),
+                    },
+                    "exploration_effect": step_effect,
+                    "reason": (
+                        f"Explore toward frontier {cell}; executor will perform one validated "
+                        f"{action} step this turn."
+                    ),
+                    "safety_source": step_option.get("safety_source"),
+                }
+            )
+        )
+        if len(result) >= max(1, int(max_frontiers)):
+            break
+    return result
 
 
 def choose_rule_baseline_option(
@@ -1351,6 +1539,9 @@ def choose_rule_baseline_option(
         for option in options:
             if str(option.get("option_id", "")).startswith("pick:"):
                 return str(option["option_id"])
+    for option in options:
+        if option.get("kind") == "explore_frontier":
+            return str(option["option_id"])
     recommended_action = str(perception.get("recommended_action") or "")
     for option in options:
         if option.get("kind") == "move_action" and option.get("action") == recommended_action:
@@ -1604,6 +1795,12 @@ def build_context(args: argparse.Namespace) -> JsonDict:
         position_map=position_map,
         global_plan=global_plan,
     )
+    exploration = build_exploration_context(
+        position_map=position_map,
+        navigation_costmap=costmap,
+        global_plan=global_plan,
+        max_frontier_candidates=max(3, args.max_candidates),
+    )
     done_readiness = build_done_readiness(
         task=task,
         perception=perception_summary,
@@ -1614,6 +1811,7 @@ def build_context(args: argparse.Namespace) -> JsonDict:
         task=task,
         perception=perception_summary,
         costmap=costmap,
+        exploration=exploration,
         worklist=worklist,
         done_readiness=done_readiness,
         max_options=max(1, args.max_options),
@@ -1640,6 +1838,7 @@ def build_context(args: argparse.Namespace) -> JsonDict:
         "task": task,
         "perception": perception_summary,
         "navigation": navigation,
+        "exploration": exploration,
         "worklist": worklist,
         "done_readiness": done_readiness,
         "option_set": option_set,

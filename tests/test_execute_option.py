@@ -1,6 +1,15 @@
 import unittest
+from unittest.mock import patch
 
-from scripts.execute_option import candidate_executor_payload, find_option, validate_context, validate_option
+from scripts.execute_option import (
+    MOVE_SCRIPT,
+    ScriptResult,
+    candidate_executor_payload,
+    find_option,
+    run_selected_option,
+    validate_context,
+    validate_option,
+)
 
 
 def base_context() -> dict:
@@ -36,6 +45,17 @@ def base_context() -> dict:
                     "physical_action": False,
                     "tool": "state-manager/report",
                     "executable_now": True,
+                },
+                {
+                    "option_id": "explore:frontier:x0_z1",
+                    "kind": "explore_frontier",
+                    "physical_action": True,
+                    "tool": "move-robot",
+                    "action": "MoveAhead",
+                    "executable_now": True,
+                    "one_step_only": True,
+                    "resolved_step_option_id": "move:moveahead",
+                    "frontier_target": {"cell": "0,1", "distance_steps": 1},
                 },
             ]
         },
@@ -79,6 +99,46 @@ class ExecuteOptionTests(unittest.TestCase):
         option = find_option(context, "move:moveahead")
         errors = validate_option(context, option or {})
         self.assertTrue(any(item["type"] == "moveahead_blocked_by_perception" for item in errors))
+
+    def test_explore_frontier_option_reuses_move_validation(self) -> None:
+        context = base_context()
+        option = find_option(context, "explore:frontier:x0_z1")
+        self.assertEqual(validate_option(context, option or {}), [])
+        context["perception"]["obstacle_ahead"] = True
+        errors = validate_option(context, option or {})
+        self.assertTrue(any(item["type"] == "moveahead_blocked_by_perception" for item in errors))
+
+    def test_explore_frontier_executes_one_resolved_move_step(self) -> None:
+        context = base_context()
+        option = find_option(context, "explore:frontier:x0_z1")
+        script_result = ScriptResult(
+            command=["python", str(MOVE_SCRIPT), "--action", "MoveAhead"],
+            returncode=0,
+            stdout='{"status":"success","lastActionSuccess":true}',
+            stderr="",
+            data={"status": "success", "lastActionSuccess": True},
+        )
+        with patch("scripts.execute_option.run_script", return_value=script_result) as run_script, patch(
+            "scripts.execute_option.sync_option_result",
+            return_value={"status": "success", "result_type": "move_state_synchronized"},
+        ) as sync:
+            result = run_selected_option(
+                context,
+                option or {},
+                timeout_seconds=5,
+                dry_run=False,
+                strict_visual_grounding=True,
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["result_type"], "option_explore_frontier_step_executed")
+        self.assertTrue(result["one_step_only"])
+        self.assertEqual(result["resolved_action"], "MoveAhead")
+        self.assertEqual(result["frontier_target"]["cell"], "0,1")
+        run_script.assert_called_once_with(MOVE_SCRIPT, ["--action", "MoveAhead"], timeout_seconds=5)
+        synced_option = sync.call_args.kwargs["option"]
+        self.assertEqual(synced_option["kind"], "move_action")
+        self.assertEqual(synced_option["action"], "MoveAhead")
 
     def test_place_option_blocks_when_candidate_needs_alignment(self) -> None:
         context = base_context()
