@@ -23,6 +23,11 @@ try:
 except ImportError:  # pragma: no cover - direct script execution
     from exploration_context import build_exploration_context
 
+try:
+    from scripts.explore_planner import build_explore_plan
+except ImportError:  # pragma: no cover - direct script execution
+    from explore_planner import build_explore_plan
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MEMORY_DIR = REPO_ROOT / "memory"
@@ -42,7 +47,11 @@ BODY_MOVE_ACTIONS = (
     "RotateLeft",
     "RotateRight",
 )
+TRANSLATION_ACTIONS = {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight"}
 CAMERA_ACTIONS = ("LookUp", "LookDown")
+DEFAULT_FORWARD_MIN_OBSERVED_RATIO = 0.30
+DEFAULT_LATERAL_MIN_OBSERVED_RATIO = 0.50
+DEFAULT_REAR_MIN_OBSERVED_RATIO = 0.60
 SERVICE_PICKUP_PHASES = {
     "SEARCH_PICKUP_TARGET",
     "LOCK_PICKUP_TARGET",
@@ -82,6 +91,8 @@ GOAL_LEVEL_OPTION_KINDS = {
     "place_precheck",
     "clean_action",
     "explore_frontier",
+    "explore_waypoint",
+    "recovery_action",
 }
 SUPPORT_OPTION_KINDS = {
     "perception",
@@ -931,6 +942,12 @@ def build_navigation_summary(
                 "confidence": number_or_none(item.get("confidence")),
                 "reason": item.get("reason"),
                 "observed_ratio": number_or_none(item.get("observed_ratio")),
+                "min_observed_ratio": number_or_none(
+                    item.get("min_observed_ratio"),
+                    digits=4,
+                )
+                if number_or_none(item.get("min_observed_ratio"), digits=4) is not None
+                else default_min_observed_ratio_for_action(action),
                 "blocked_cell_count": number_or_none(item.get("blocked_cell_count")),
             }
         )
@@ -1017,6 +1034,20 @@ def frontier_option_id(cell: Any) -> str:
         return f"explore:frontier:x{encode(x)}_z{encode(z)}"
     except (TypeError, ValueError):
         return option_id("explore:frontier", str(cell or "frontier"))
+
+
+def waypoint_option_id(cell: Any) -> str:
+    try:
+        left, right = str(cell or "").split(",", 1)
+        x = int(left)
+        z = int(right)
+
+        def encode(value: int) -> str:
+            return f"m{abs(value)}" if value < 0 else str(value)
+
+        return f"explore:waypoint:x{encode(x)}_z{encode(z)}"
+    except (TypeError, ValueError):
+        return option_id("explore:waypoint", str(cell or "waypoint"))
 
 
 def candidate_ref(candidate: JsonDict) -> JsonDict:
@@ -1163,6 +1194,52 @@ def action_safe(costmap: JsonDict, action: str) -> tuple[bool | None, str]:
     return bool_or_none(raw.get("safe")), str(raw.get("reason") or "")
 
 
+def costmap_action_record(costmap: JsonDict, action: str) -> JsonDict:
+    return as_dict(as_dict(costmap.get("action_safety")).get(action))
+
+
+def default_min_observed_ratio_for_action(action: str) -> float:
+    if action == "MoveBack":
+        return DEFAULT_REAR_MIN_OBSERVED_RATIO
+    if action in {"MoveLeft", "MoveRight"}:
+        return DEFAULT_LATERAL_MIN_OBSERVED_RATIO
+    if action == "MoveAhead":
+        return DEFAULT_FORWARD_MIN_OBSERVED_RATIO
+    return 0.0
+
+
+def required_min_observed_ratio_for_action(action: str, raw: JsonDict) -> float:
+    observed_min = number_or_none(raw.get("min_observed_ratio"), digits=4)
+    default_min = default_min_observed_ratio_for_action(action)
+    if observed_min is None:
+        return default_min
+    return max(float(observed_min), float(default_min))
+
+
+def low_confidence_move_record(costmap: JsonDict, action: str) -> JsonDict | None:
+    if action not in TRANSLATION_ACTIONS:
+        return None
+    raw = costmap_action_record(costmap, action)
+    if not raw:
+        return None
+    observed_ratio = number_or_none(raw.get("observed_ratio"), digits=4)
+    if observed_ratio is None:
+        return None
+    min_observed_ratio = required_min_observed_ratio_for_action(action, raw)
+    if float(observed_ratio) >= float(min_observed_ratio):
+        return None
+    return clean_empty(
+        {
+            "action": action,
+            "observed_ratio": observed_ratio,
+            "min_observed_ratio": min_observed_ratio,
+            "confidence": number_or_none(raw.get("confidence"), digits=4),
+            "reason": "low_observed_swept_volume",
+            "costmap_reason": raw.get("reason"),
+        }
+    )
+
+
 def perception_bootstrap_move_safe(perception: JsonDict, action: str) -> tuple[bool, str]:
     """Fallback only for cold-start exploration when local costmap has no verdict."""
     if action != "MoveAhead":
@@ -1207,7 +1284,13 @@ def annotate_option_selection_contract(options: list[JsonDict]) -> JsonDict:
     explore_option_ids = [
         str(option.get("option_id"))
         for option in options
-        if option.get("kind") == "explore_frontier" and option.get("executable_now") is True
+        if option.get("kind") in {"explore_frontier", "explore_waypoint"}
+        and option.get("executable_now") is True
+    ]
+    recovery_option_ids = [
+        str(option.get("option_id"))
+        for option in options
+        if option.get("kind") == "recovery_action" and option.get("executable_now") is True
     ]
     has_goal_options = bool(goal_option_ids)
 
@@ -1237,10 +1320,14 @@ def annotate_option_selection_contract(options: list[JsonDict]) -> JsonDict:
             continue
 
         option["fallback_only"] = False
-        if kind == "explore_frontier":
+        if kind in {"explore_frontier", "explore_waypoint"}:
             option["decision_level"] = "goal"
             option["llm_priority"] = "primary"
             option["allowed_when"] = "no_immediate_pick_place_goal_or_as_exploration_target"
+        elif kind == "recovery_action":
+            option["decision_level"] = "recovery"
+            option["llm_priority"] = "primary"
+            option["allowed_when"] = "dead_end_or_blocked_region_recovery"
         elif kind in {"service_action", "place_precheck", "clean_action"}:
             option["decision_level"] = "task"
             option["llm_priority"] = "primary"
@@ -1257,14 +1344,131 @@ def annotate_option_selection_contract(options: list[JsonDict]) -> JsonDict:
 
     return clean_empty(
         {
-            "primary_options": primary_options,
+            "primary_options": (
+                [
+                    oid
+                    for oid in recovery_option_ids
+                    if oid in primary_options
+                ]
+                + [oid for oid in primary_options if oid not in recovery_option_ids]
+                if recovery_option_ids
+                else primary_options
+            ),
             "fallback_options": fallback_options,
             "goal_options": goal_option_ids,
-            "explore_frontier_options": explore_option_ids,
+            "explore_goal_options": explore_option_ids,
+            "explore_frontier_options": [
+                str(option.get("option_id"))
+                for option in options
+                if option.get("kind") == "explore_frontier" and option.get("executable_now") is True
+            ],
+            "explore_waypoint_options": [
+                str(option.get("option_id"))
+                for option in options
+                if option.get("kind") == "explore_waypoint" and option.get("executable_now") is True
+            ],
+            "recovery_options": recovery_option_ids,
             "low_level_move_options": low_level_move_options,
             "raw_move_policy_active": bool(has_goal_options),
         }
     )
+
+
+def build_recovery_options(
+    *,
+    exploration: JsonDict,
+    explore_plan: JsonDict | None = None,
+    costmap: JsonDict,
+    move_options: list[JsonDict],
+    max_recovery_options: int = 3,
+) -> list[JsonDict]:
+    dead_end = as_dict(exploration.get("dead_end"))
+    camera_posture = as_dict(exploration.get("camera_posture"))
+    plan = as_dict(explore_plan)
+    camera_needs_normalization = camera_posture.get("needs_normalization") is True
+    planner_recovery_actions = as_list(plan.get("recovery_actions"))
+    if (
+        dead_end.get("active") is not True
+        and not camera_needs_normalization
+        and not planner_recovery_actions
+    ):
+        return []
+
+    move_by_action = {
+        str(option.get("action") or ""): option
+        for option in move_options
+        if option.get("kind") == "move_action" and option.get("executable_now") is True
+    }
+    candidates: list[tuple[str, str]] = []
+    normalize_action = str(camera_posture.get("normalize_action") or "")
+    if camera_needs_normalization and normalize_action:
+        candidates.append((normalize_action, "restore_default_camera_pitch_before_navigation"))
+    for raw in planner_recovery_actions:
+        item = as_dict(raw)
+        action = str(item.get("action") or "").strip()
+        reason = str(item.get("reason") or "planner_recovery_action")
+        if action:
+            candidates.append((action, reason))
+    suggested = str(dead_end.get("suggested_backtrack_action") or "")
+    if suggested:
+        candidates.append((suggested, "backtrack_toward_previous_pose"))
+    candidates.extend(
+        [
+            ("LookDown", "refresh_depth_with_lower_camera_pitch"),
+            ("LookUp", "refresh_depth_with_higher_camera_pitch"),
+            ("RotateLeft", "scan_left_for_exit"),
+            ("RotateRight", "scan_right_for_exit"),
+            ("MoveBack", "step_back_if_costmap_allows"),
+        ]
+    )
+
+    result: list[JsonDict] = []
+    seen: set[str] = set()
+    for action, reason in candidates:
+        if action in seen:
+            continue
+        seen.add(action)
+        safe, safety_reason = action_safe(costmap, action)
+        step_option = as_dict(move_by_action.get(action))
+        if action in BODY_MOVE_ACTIONS and not step_option:
+            continue
+        if safe is False:
+            continue
+        oid = option_id("recover", action)
+        result.append(
+            clean_empty(
+                {
+                    "option_id": oid,
+                    "kind": "recovery_action",
+                    "physical_action": True,
+                    "tool": "move-robot",
+                    "action": action,
+                    "executable_now": True,
+                    "decision_level": "recovery",
+                    "llm_priority": "primary",
+                    "fallback_only": False,
+                    "one_step_only": True,
+                    "reason": reason,
+                    "safety_source": "navigation-costmap" if safe is True else "camera-recovery-fallback",
+                    "costmap_reason": safety_reason,
+                    "dead_end_context": {
+                        "current_cell": dead_end.get("current_cell"),
+                        "current_heading": dead_end.get("current_heading"),
+                        "blocked_actions": dead_end.get("blocked_actions"),
+                        "suggested_backtrack_cell": dead_end.get("suggested_backtrack_cell"),
+                    },
+                    "camera_posture": {
+                        "needs_normalization": camera_posture.get("needs_normalization"),
+                        "normalize_action": camera_posture.get("normalize_action"),
+                        "pitch_offset_steps": camera_posture.get("pitch_offset_steps"),
+                        "last_camera_action": camera_posture.get("last_camera_action"),
+                    },
+                }
+            )
+        )
+        if len(result) >= max(1, int(max_recovery_options)):
+            break
+    return result
 
 
 def build_options(
@@ -1273,6 +1477,7 @@ def build_options(
     perception: JsonDict,
     costmap: JsonDict,
     exploration: JsonDict | None = None,
+    explore_plan: JsonDict | None = None,
     worklist: JsonDict,
     done_readiness: JsonDict,
     max_options: int,
@@ -1381,6 +1586,7 @@ def build_options(
         conservative_turns = BODY_MOVE_ACTIONS
         move_reason = "Movement option is gated by latest local costmap safety."
     move_options: list[JsonDict] = []
+    low_confidence_moves: list[JsonDict] = []
     for action in conservative_turns:
         safe, reason = action_safe(costmap, action)
         if safe is False:
@@ -1391,6 +1597,10 @@ def build_options(
         if safe is None:
             bootstrap_safe, bootstrap_reason = perception_bootstrap_move_safe(perception, action)
         if safe is True or action in {"RotateLeft", "RotateRight"} or bootstrap_safe:
+            low_confidence = None if bootstrap_safe else low_confidence_move_record(costmap, action)
+            if low_confidence:
+                low_confidence_moves.append(low_confidence)
+                continue
             move_option = {
                 "option_id": option_id("move", action),
                 "kind": "move_action",
@@ -1410,7 +1620,26 @@ def build_options(
                 move_option["exploration_effect"] = effect
             move_options.append(move_option)
 
-    options.extend(build_explore_frontier_options(exploration=as_dict(exploration), move_options=move_options))
+    recovery_options = build_recovery_options(
+        exploration=as_dict(exploration),
+        explore_plan=as_dict(explore_plan),
+        costmap=costmap,
+        move_options=move_options,
+    )
+    options.extend(recovery_options)
+    options.extend(
+        build_explore_waypoint_options(
+            explore_plan=as_dict(explore_plan),
+            move_options=move_options,
+        )
+    )
+    options.extend(
+        build_explore_frontier_options(
+            exploration=as_dict(exploration),
+            move_options=move_options,
+            explore_plan=as_dict(explore_plan),
+        )
+    )
     options.extend(move_options)
 
     options.append(
@@ -1443,21 +1672,97 @@ def build_options(
             "llm_should_choose_from": "primary_options_first",
             "raw_move_policy": "fallback_only_when_goal_level_options_exist",
             "explore_policy": (
-                "when no pick/place option is appropriate and explore:frontier options exist, "
-                "choose explore:frontier before raw move:*"
+                "when no pick/place option is appropriate and explore goal options exist, "
+                "choose explore:waypoint/explore:frontier before raw move:*; "
+                "during rotation loops, choose explore:waypoint before rotation-only frontier options"
             ),
             "raw_move_allowed_when": "no goal-level option exists or recovery after failure requires it",
+            "recovery_policy": (
+                "if recovery_options are present, choose one before repeated observe:refresh, "
+                "done:probe, or normal exploration; recover:lookdown restores camera pitch after recover:lookup"
+            ),
         },
         "rule_baseline_option_id": rule_baseline,
         **selection_metadata,
+        "low_confidence_moves": low_confidence_moves,
         "options": options,
     }
+
+
+def build_explore_waypoint_options(
+    *,
+    explore_plan: JsonDict,
+    move_options: list[JsonDict],
+    max_waypoints: int = 3,
+) -> list[JsonDict]:
+    move_by_action = {
+        str(option.get("action") or ""): option
+        for option in move_options
+        if option.get("kind") == "move_action" and option.get("executable_now") is True
+    }
+    result: list[JsonDict] = []
+    seen_cells: set[str] = set()
+    for raw_candidate in as_list(explore_plan.get("waypoint_candidates")):
+        candidate = as_dict(raw_candidate)
+        cell = str(candidate.get("cell") or "").strip()
+        action = str(candidate.get("action") or "").strip()
+        if not cell or not action:
+            continue
+        step_option = as_dict(move_by_action.get(action))
+        if not step_option:
+            continue
+        if cell in seen_cells:
+            continue
+        seen_cells.add(cell)
+        result.append(
+            clean_empty(
+                {
+                    "option_id": waypoint_option_id(cell),
+                    "kind": "explore_waypoint",
+                    "physical_action": True,
+                    "tool": "move-robot",
+                    "action": action,
+                    "executable_now": True,
+                    "decision_level": "goal",
+                    "llm_priority": "primary",
+                    "fallback_only": False,
+                    "allowed_when": (
+                        "safe_translation_waypoint_for_exploration_or_rotation_loop_escape"
+                    ),
+                    "one_step_only": True,
+                    "resolved_step_option_id": step_option.get("option_id"),
+                    "waypoint_target": {
+                        "cell": cell,
+                        "source": "explore_planner",
+                        "purpose": candidate.get("purpose"),
+                        "score": candidate.get("score"),
+                        "target_state": candidate.get("target_state"),
+                        "target_visited": candidate.get("target_visited"),
+                        "target_recent": candidate.get("target_recent"),
+                        "nearest_frontier_distance_delta": candidate.get(
+                            "nearest_frontier_distance_delta"
+                        ),
+                        "reasons": candidate.get("reasons"),
+                    },
+                    "exploration_effect": as_dict(step_option.get("exploration_effect")),
+                    "reason": (
+                        f"Move one validated {action} step toward waypoint {cell}; "
+                        "used to make exploration progress instead of repeating rotation-only goals."
+                    ),
+                    "safety_source": step_option.get("safety_source"),
+                }
+            )
+        )
+        if len(result) >= max(1, int(max_waypoints)):
+            break
+    return result
 
 
 def build_explore_frontier_options(
     *,
     exploration: JsonDict,
     move_options: list[JsonDict],
+    explore_plan: JsonDict | None = None,
     max_frontiers: int = 4,
 ) -> list[JsonDict]:
     move_by_action = {
@@ -1466,20 +1771,35 @@ def build_explore_frontier_options(
         if option.get("kind") == "move_action" and option.get("executable_now") is True
     }
     action_effects = as_dict(exploration.get("action_effects"))
+    plan = as_dict(explore_plan)
+    suppressed = {
+        str(as_dict(item).get("cell") or "").strip(): as_dict(item)
+        for item in as_list(plan.get("suppressed_frontiers"))
+        if str(as_dict(item).get("cell") or "").strip()
+    }
+    suppress_when_escape_exists = bool(as_list(plan.get("waypoint_candidates"))) and bool(suppressed)
     result: list[JsonDict] = []
     seen_ids: set[str] = set()
-    for raw_candidate in as_list(exploration.get("frontier_candidates")):
-        candidate = as_dict(raw_candidate)
-        cell = str(candidate.get("cell") or "").strip()
-        action = str(candidate.get("first_action_hint") or "").strip()
-        if not cell or action not in move_by_action:
-            continue
+    seen_cells: set[str] = set()
+
+    def append_frontier_option(
+        *,
+        cell: str,
+        action: str,
+        step_option: JsonDict,
+        target: JsonDict,
+        step_effect: JsonDict,
+    ) -> None:
+        if len(result) >= max(1, int(max_frontiers)):
+            return
         oid = frontier_option_id(cell)
-        if oid in seen_ids:
-            continue
+        if oid in seen_ids or cell in seen_cells:
+            return
+        suppression = as_dict(suppressed.get(cell))
+        if suppression and suppress_when_escape_exists and str(suppression.get("severity") or "") == "block":
+            return
         seen_ids.add(oid)
-        step_option = move_by_action[action]
-        step_effect = as_dict(action_effects.get(action)) or as_dict(step_option.get("exploration_effect"))
+        seen_cells.add(cell)
         result.append(
             clean_empty(
                 {
@@ -1495,17 +1815,7 @@ def build_explore_frontier_options(
                     "allowed_when": "no_immediate_pick_place_goal_or_as_exploration_target",
                     "one_step_only": True,
                     "resolved_step_option_id": step_option.get("option_id"),
-                    "frontier_target": {
-                        "cell": cell,
-                        "distance_steps": candidate.get("distance_steps"),
-                        "direction_from_current": candidate.get("direction_from_current"),
-                        "score": candidate.get("score"),
-                        "unknown_neighbor_count": candidate.get("unknown_neighbor_count"),
-                        "cluster_size": candidate.get("cluster_size"),
-                        "planner_selected": candidate.get("planner_selected"),
-                        "reasons": candidate.get("reasons"),
-                        "first_action_policy": candidate.get("first_action_policy"),
-                    },
+                    "frontier_target": target,
                     "exploration_effect": step_effect,
                     "reason": (
                         f"Explore toward frontier {cell}; executor will perform one validated "
@@ -1515,8 +1825,63 @@ def build_explore_frontier_options(
                 }
             )
         )
+
+    for raw_candidate in as_list(exploration.get("frontier_candidates")):
+        candidate = as_dict(raw_candidate)
+        cell = str(candidate.get("cell") or "").strip()
+        action = str(candidate.get("first_action_hint") or "").strip()
+        if not cell or action not in move_by_action:
+            continue
+        step_option = move_by_action[action]
+        step_effect = as_dict(action_effects.get(action)) or as_dict(step_option.get("exploration_effect"))
+        append_frontier_option(
+            cell=cell,
+            action=action,
+            step_option=step_option,
+            target={
+                "cell": cell,
+                "distance_steps": candidate.get("distance_steps"),
+                "direction_from_current": candidate.get("direction_from_current"),
+                "score": candidate.get("score"),
+                "unknown_neighbor_count": candidate.get("unknown_neighbor_count"),
+                "cluster_size": candidate.get("cluster_size"),
+                "planner_selected": candidate.get("planner_selected"),
+                "reasons": candidate.get("reasons"),
+                "first_action_policy": candidate.get("first_action_policy"),
+                "first_step_action": candidate.get("first_step_action"),
+                "first_step_target_cell": candidate.get("first_step_target_cell"),
+                "first_step_enters_recent_cell": candidate.get("first_step_enters_recent_cell"),
+                "first_step_enters_visited_cell": candidate.get("first_step_enters_visited_cell"),
+                "route_risk": candidate.get("route_risk"),
+                "source": "frontier_candidate",
+            },
+            step_effect=step_effect,
+        )
+    for step_option in move_options:
         if len(result) >= max(1, int(max_frontiers)):
             break
+        action = str(step_option.get("action") or "").strip()
+        step_effect = as_dict(step_option.get("exploration_effect"))
+        if step_effect.get("enters_frontier") is not True:
+            continue
+        cell = str(step_effect.get("target_cell") or "").strip()
+        if not cell:
+            continue
+        append_frontier_option(
+            cell=cell,
+            action=action,
+            step_option=step_option,
+            target={
+                "cell": cell,
+                "source": "move_exploration_effect",
+                "target_state": step_effect.get("target_state"),
+                "best_frontier_cell": step_effect.get("best_frontier_cell"),
+                "best_frontier_distance_delta": step_effect.get("best_frontier_distance_delta"),
+                "nearest_frontier_distance_delta": step_effect.get("nearest_frontier_distance_delta"),
+                "reasons": ["move_enters_frontier"],
+            },
+            step_effect=step_effect,
+        )
     return result
 
 
@@ -1539,6 +1904,12 @@ def choose_rule_baseline_option(
         for option in options:
             if str(option.get("option_id", "")).startswith("pick:"):
                 return str(option["option_id"])
+    for option in options:
+        if option.get("kind") == "recovery_action":
+            return str(option["option_id"])
+    for option in options:
+        if option.get("kind") == "explore_waypoint":
+            return str(option["option_id"])
     for option in options:
         if option.get("kind") == "explore_frontier":
             return str(option["option_id"])
@@ -1801,6 +2172,11 @@ def build_context(args: argparse.Namespace) -> JsonDict:
         global_plan=global_plan,
         max_frontier_candidates=max(3, args.max_candidates),
     )
+    explore_plan = build_explore_plan(
+        position_map=position_map,
+        navigation_costmap=costmap,
+        exploration=exploration,
+    )
     done_readiness = build_done_readiness(
         task=task,
         perception=perception_summary,
@@ -1812,6 +2188,7 @@ def build_context(args: argparse.Namespace) -> JsonDict:
         perception=perception_summary,
         costmap=costmap,
         exploration=exploration,
+        explore_plan=explore_plan,
         worklist=worklist,
         done_readiness=done_readiness,
         max_options=max(1, args.max_options),
@@ -1835,10 +2212,16 @@ def build_context(args: argparse.Namespace) -> JsonDict:
             "model_should_choose_option_id_only": True,
             "executor_remains_authoritative": True,
         },
+        "context_lifecycle": {
+            "valid_for_execution": True,
+            "stale_after_option_execution": False,
+            "required_next_after_execution": "robot_cleaner_prepare_decision_turn",
+        },
         "task": task,
         "perception": perception_summary,
         "navigation": navigation,
         "exploration": exploration,
+        "explore_plan": explore_plan,
         "worklist": worklist,
         "done_readiness": done_readiness,
         "option_set": option_set,

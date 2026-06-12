@@ -30,6 +30,7 @@ from scripts.execute_option import (
     script_result_payload,
 )
 from scripts.local_costmap import LocalCostmap
+from scripts.option_state_sync import ensure_tool_mission_active
 
 
 JsonDict = dict[str, Any]
@@ -166,6 +167,7 @@ def prepare_decision_turn(args: argparse.Namespace) -> JsonDict:
     output_path = resolve_workspace_path(args.output)
     attempts: list[JsonDict] = []
     refresh: JsonDict = {}
+    mission_activation = ensure_tool_mission_active(memory_dir=MEMORY_DIR, mode="SERVICE")
 
     for attempt_index in range(1, max(0, int(args.observe_retries)) + 2):
         refresh = run_observe_refresh(timeout_seconds=max(1, int(args.timeout)))
@@ -178,6 +180,7 @@ def prepare_decision_turn(args: argparse.Namespace) -> JsonDict:
             "status": "error",
             "result_type": "decision_turn_prepare_failed",
             "stage": "observe_refresh",
+            "mission_activation": mission_activation,
             "attempts": attempts,
             "required_next": "retry_prepare_decision_turn_or_stop",
         }
@@ -201,6 +204,7 @@ def prepare_decision_turn(args: argparse.Namespace) -> JsonDict:
             "status": "error",
             "result_type": "decision_turn_prepare_failed",
             "stage": "build_decision_context",
+            "mission_activation": mission_activation,
             "observe_refresh": attempts[-1] if attempts else {},
             "local_costmap": local_costmap,
             "context_builder": script_result_payload(context_result),
@@ -215,6 +219,7 @@ def prepare_decision_turn(args: argparse.Namespace) -> JsonDict:
         "result_type": "decision_turn_prepared",
         "schema": "robot_cleaner_decision_turn_v1",
         "prepared_at": now_iso(),
+        "mission_activation": mission_activation,
         "context_path": display_path(output_path),
         "perception_path": display_path(DEFAULT_PERCEPTION_PATH),
         "observe_refresh": attempts[-1] if attempts else {},
@@ -234,6 +239,7 @@ def prepare_decision_turn(args: argparse.Namespace) -> JsonDict:
             "rule_baseline_option_id": result.get("rule_baseline_option_id"),
             "option_count": result.get("option_count"),
             "context_path": result.get("context_path"),
+            "mission_activation": mission_activation,
             "local_costmap": result.get("local_costmap"),
         }
     )

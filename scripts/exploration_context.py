@@ -61,6 +61,8 @@ DEFAULT_MEMORY_DIR = REPO_ROOT / "memory"
 EXPLORATION_CONTEXT_SCHEMA = "robot_cleaner_exploration_context_v1"
 TRANSLATION_ACTIONS = ("MoveAhead", "MoveLeft", "MoveRight", "MoveBack")
 ROTATION_ACTIONS = ("RotateLeft", "RotateRight")
+BODY_MOVE_ACTIONS = (*TRANSLATION_ACTIONS, *ROTATION_ACTIONS)
+CAMERA_ACTIONS = ("LookUp", "LookDown")
 MOVE_ACTIONS = (*TRANSLATION_ACTIONS, *ROTATION_ACTIONS)
 RECENT_PATH_LIMIT = 14
 RECENT_ACTION_LIMIT = 18
@@ -136,6 +138,8 @@ def canonical_action(value: Any) -> str:
         "turnleft": "RotateLeft",
         "rotateright": "RotateRight",
         "turnright": "RotateRight",
+        "lookup": "LookUp",
+        "lookdown": "LookDown",
     }
     return mapping.get(compact, text)
 
@@ -381,6 +385,36 @@ def frontier_first_action_hint(
     return target_action
 
 
+def first_step_target_cell(current_cell: str, current_heading: str, action: str | None) -> str:
+    if action in TRANSLATION_ACTIONS:
+        return safe_neighbor_for_action(current_cell, current_heading, action) or ""
+    return current_cell
+
+
+def build_camera_posture(recent_actions: Sequence[Any]) -> JsonDict:
+    canonical = [canonical_action(item) for item in as_list(recent_actions)]
+    camera_actions = [action for action in canonical if action in CAMERA_ACTIONS]
+    offset = 0
+    for action in camera_actions:
+        if action == "LookUp":
+            offset += 1
+        elif action == "LookDown":
+            offset -= 1
+        offset = max(-2, min(2, offset))
+    last_camera_action = camera_actions[-1] if camera_actions else ""
+    needs_normalization = bool(last_camera_action == "LookUp" or offset > 0)
+    normalize_action = "LookDown" if needs_normalization else ""
+    return clean_empty(
+        {
+            "last_camera_action": last_camera_action,
+            "pitch_offset_steps": offset,
+            "needs_normalization": needs_normalization,
+            "normalize_action": normalize_action,
+            "reason": "last_camera_action_looked_up" if needs_normalization else "",
+        }
+    )
+
+
 def _frontier_cluster_sizes(frontiers: Sequence[str]) -> dict[str, int]:
     remaining = {str(item) for item in frontiers if str(item).strip()}
     sizes: dict[str, int] = {}
@@ -452,6 +486,27 @@ def build_frontier_candidates(
         recent_penalty = 1.0 if frontier in recent_cells else 0.0
         seen_penalty = 0.35 * float(visited_or_seen_count(cells, frontier))
         planner_selected = frontier == selected_goal
+        first_action = frontier_first_action_hint(
+            current_heading=current_heading,
+            direction=direction,
+            planner_selected=planner_selected,
+            planner_next_action=planner_next_action,
+        )
+        first_step_cell = first_step_target_cell(current_cell, current_heading, first_action)
+        first_step_rec = _target_cell_record(position_map, first_step_cell)
+        first_step_visited = bool(first_step_rec.get("visited") is True)
+        first_step_recent = bool(first_step_cell and first_step_cell in recent_cells)
+        first_step_is_target = bool(first_step_cell and first_step_cell == frontier)
+        backtrack_penalty = 0.0
+        route_risk = ""
+        if first_action in TRANSLATION_ACTIONS and first_step_cell:
+            if first_step_recent and not first_step_is_target:
+                route_risk = "backtrack_first_step"
+                backtrack_penalty += 3.0
+            elif first_step_visited and not first_step_is_target:
+                route_risk = "visited_first_step"
+                backtrack_penalty += 1.6
+
         score = (
             10.0
             - 0.65 * float(distance)
@@ -460,6 +515,7 @@ def build_frontier_candidates(
             - 1.4 * behind_penalty
             - 2.5 * recent_penalty
             - seen_penalty
+            - backtrack_penalty
             + (1.2 if planner_selected else 0.0)
         )
         reasons: list[str] = []
@@ -471,14 +527,12 @@ def build_frontier_candidates(
             reasons.append("behind_current_heading")
         if frontier in recent_cells:
             reasons.append("on_recent_path")
+        if route_risk == "backtrack_first_step":
+            reasons.append("first_step_backtracks_to_recent_cell")
+        elif route_risk == "visited_first_step":
+            reasons.append("first_step_enters_visited_cell")
         if planner_selected:
             reasons.append("matches_existing_global_plan")
-        first_action = frontier_first_action_hint(
-            current_heading=current_heading,
-            direction=direction,
-            planner_selected=planner_selected,
-            planner_next_action=planner_next_action,
-        )
         candidates.append(
             clean_empty(
                 {
@@ -492,6 +546,11 @@ def build_frontier_candidates(
                     "score": round(score, 3),
                     "reasons": reasons,
                     "first_action_policy": "rotate_or_forward_only",
+                    "first_step_action": first_action,
+                    "first_step_target_cell": first_step_cell,
+                    "first_step_enters_recent_cell": first_step_recent,
+                    "first_step_enters_visited_cell": first_step_visited,
+                    "route_risk": route_risk,
                 }
             )
         )
@@ -501,6 +560,127 @@ def build_frontier_candidates(
 
 def _target_cell_record(position_map: JsonDict, cell: str) -> JsonDict:
     return as_dict(as_dict(position_map.get("cells")).get(cell))
+
+
+def action_safety_record(navigation_costmap: JsonDict, action: str) -> JsonDict:
+    return as_dict(as_dict(navigation_costmap.get("action_safety")).get(action))
+
+
+def action_is_safe(navigation_costmap: JsonDict, action: str) -> bool | None:
+    record = action_safety_record(navigation_costmap, action)
+    if not record:
+        return None
+    value = record.get("safe")
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def inverse_recovery_action(action: str) -> str | None:
+    if action == "MoveAhead":
+        return "MoveBack"
+    if action == "MoveBack":
+        return "MoveAhead"
+    if action == "MoveLeft":
+        return "MoveRight"
+    if action == "MoveRight":
+        return "MoveLeft"
+    if action == "RotateLeft":
+        return "RotateRight"
+    if action == "RotateRight":
+        return "RotateLeft"
+    return None
+
+
+def build_dead_end_status(
+    *,
+    position_map: JsonDict,
+    navigation_costmap: JsonDict,
+    current_cell: str,
+    current_heading: str,
+    recent_actions: Sequence[Any],
+) -> JsonDict:
+    """Summarize whether the current pose is locally trapped.
+
+    This is an advisory decision-context field. It does not authorize motion;
+    execute_option still validates any recover:* option against the current
+    costmap before running a single physical action.
+    """
+
+    action_records = {
+        action: action_safety_record(navigation_costmap, action)
+        for action in (*BODY_MOVE_ACTIONS, *CAMERA_ACTIONS)
+    }
+    blocked_actions = [
+        action
+        for action in BODY_MOVE_ACTIONS
+        if action_records.get(action) and action_records[action].get("safe") is False
+    ]
+    safe_body_actions = [
+        action
+        for action in BODY_MOVE_ACTIONS
+        if action_records.get(action) and action_records[action].get("safe") is True
+    ]
+    safe_camera_actions = [
+        action
+        for action in CAMERA_ACTIONS
+        if not action_records.get(action) or action_records[action].get("safe") is not False
+    ]
+
+    all_body_known = all(bool(action_records.get(action)) for action in BODY_MOVE_ACTIONS)
+    all_body_blocked = all_body_known and len(blocked_actions) == len(BODY_MOVE_ACTIONS)
+    active = bool(all_body_blocked and not safe_body_actions)
+
+    canonical_recent = [canonical_action(item) for item in as_list(recent_actions)]
+    canonical_recent = [action for action in canonical_recent if action in MOVE_ACTIONS]
+    last_action = canonical_recent[-1] if canonical_recent else ""
+    recovery_action = inverse_recovery_action(last_action)
+    previous_cell = ""
+    if recovery_action and last_action in TRANSLATION_ACTIONS:
+        try:
+            previous_cell, _ = _previous_pose(current_cell, current_heading, last_action)
+        except Exception:
+            previous_cell = ""
+
+    avoid_frontiers: list[JsonDict] = []
+    if active:
+        avoid_frontiers.append(
+            clean_empty(
+                {
+                    "cell": current_cell,
+                    "reason": "entered_cell_then_all_body_actions_blocked",
+                    "severity": "block",
+                    "last_action": last_action,
+                    "blocked_actions": blocked_actions,
+                }
+            )
+        )
+
+    return clean_empty(
+        {
+            "active": active,
+            "severity": "strong" if active else "none",
+            "current_cell": current_cell,
+            "current_heading": current_heading,
+            "all_body_actions_blocked": all_body_blocked,
+            "blocked_actions": blocked_actions,
+            "safe_body_actions": safe_body_actions,
+            "safe_camera_actions": safe_camera_actions,
+            "last_action": last_action,
+            "suggested_backtrack_action": recovery_action if active else None,
+            "suggested_backtrack_cell": previous_cell if active else None,
+            "avoid_frontiers": avoid_frontiers,
+            "recovery_hints": (
+                [
+                    "choose_recover_option_before_done_or_repeated_refresh",
+                    "camera_pitch_recovery_can_refresh_depth_before_motion",
+                    "do_not_reuse_option_ids_from_previous_turns",
+                ]
+                if active
+                else []
+            ),
+        }
+    )
 
 
 def build_avoid_actions(
@@ -785,6 +965,7 @@ def build_exploration_context(
     )
     revisit_counts = build_revisit_counts(position_map, recent_path)
     loop_warning = build_loop_warning(recent_path=recent_path, recent_actions=recent_actions)
+    camera_posture = build_camera_posture(recent_actions)
     frontier_candidates = build_frontier_candidates(
         position_map=position_map,
         global_plan=as_dict(global_plan),
@@ -808,6 +989,13 @@ def build_exploration_context(
         recent_path=recent_path,
         frontier_candidates=frontier_candidates,
     )
+    dead_end = build_dead_end_status(
+        position_map=position_map,
+        navigation_costmap=as_dict(navigation_costmap),
+        current_cell=current_cell,
+        current_heading=current_heading,
+        recent_actions=recent_actions,
+    )
 
     stats = as_dict(position_map.get("stats"))
     return clean_empty(
@@ -830,6 +1018,8 @@ def build_exploration_context(
             "revisit_counts": revisit_counts,
             "frontier_candidates": frontier_candidates,
             "loop_warning": loop_warning,
+            "camera_posture": camera_posture,
+            "dead_end": dead_end,
             "avoid_actions": avoid_actions,
             "action_effects": action_effects,
         }

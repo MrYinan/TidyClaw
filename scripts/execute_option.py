@@ -37,7 +37,14 @@ PLACE_SCRIPT = REPO_ROOT / "skills" / "place-object" / "scripts" / "place_object
 
 DECISION_CONTEXT_SCHEMA = "robot_cleaner_decision_context_v1"
 PLACE_PRECHECK_CACHE_SCHEMA = "robot_cleaner_place_precheck_cache_v1"
-PHYSICAL_KINDS = {"move_action", "explore_frontier", "service_action", "clean_action"}
+PHYSICAL_KINDS = {
+    "move_action",
+    "explore_frontier",
+    "explore_waypoint",
+    "recovery_action",
+    "service_action",
+    "clean_action",
+}
 SURFACE_REGION_SOURCES = {
     "pointcloud_plane",
     "pointcloud_plane_completion",
@@ -54,6 +61,10 @@ MOVE_ACTIONS = {
     "LookUp",
     "LookDown",
 }
+TRANSLATION_ACTIONS = {"MoveAhead", "MoveBack", "MoveLeft", "MoveRight"}
+DEFAULT_FORWARD_MIN_OBSERVED_RATIO = 0.30
+DEFAULT_LATERAL_MIN_OBSERVED_RATIO = 0.50
+DEFAULT_REAR_MIN_OBSERVED_RATIO = 0.60
 
 
 JsonDict = dict[str, Any]
@@ -96,6 +107,71 @@ def load_json(path: Path) -> JsonDict:
             "message": str(exc),
         }
     return data if isinstance(data, dict) else {"status": "error", "result_type": "error_json_root_not_object"}
+
+
+def atomic_write_json(path: Path, data: JsonDict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def context_stale_error(context: JsonDict) -> JsonDict | None:
+    lifecycle = as_dict(context.get("context_lifecycle"))
+    if lifecycle.get("stale_after_option_execution") is not True and lifecycle.get("valid_for_execution") is not False:
+        return None
+    return {
+        "type": "decision_context_stale_after_option_execution",
+        "required_next": "robot_cleaner_prepare_decision_turn",
+        "message": "This decision context was already used for an option execution; prepare a fresh turn before selecting another option.",
+        "executed_option_id": lifecycle.get("executed_option_id"),
+        "executed_at": lifecycle.get("executed_at"),
+        "execution_result_type": lifecycle.get("execution_result_type"),
+    }
+
+
+def mark_context_stale_after_execution(
+    context_path: Path,
+    *,
+    option_id: str,
+    execution: JsonDict,
+) -> JsonDict:
+    try:
+        context = load_json(context_path)
+        if context.get("schema") != DECISION_CONTEXT_SCHEMA:
+            return {
+                "status": "skipped",
+                "result_type": "context_stale_mark_skipped_invalid_schema",
+                "context_path": str(context_path),
+            }
+        lifecycle = as_dict(context.get("context_lifecycle"))
+        lifecycle.update(
+            {
+                "valid_for_execution": False,
+                "stale_after_option_execution": True,
+                "stale_reason": "option_executed",
+                "executed_option_id": option_id,
+                "executed_at": now_iso(),
+                "execution_status": execution.get("status"),
+                "execution_result_type": execution.get("result_type"),
+                "required_next": "robot_cleaner_prepare_decision_turn",
+            }
+        )
+        context["context_lifecycle"] = lifecycle
+        atomic_write_json(context_path, context)
+        return {
+            "status": "success",
+            "result_type": "context_marked_stale_after_execution",
+            "context_path": str(context_path),
+            "required_next": "robot_cleaner_prepare_decision_turn",
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "result_type": "error_context_stale_mark_failed",
+            "context_path": str(context_path),
+            "message": str(exc),
+        }
 
 
 def parse_json_output(text: str) -> JsonDict:
@@ -223,6 +299,20 @@ def as_list(value: Any) -> list[Any]:
     return [value]
 
 
+def number_or_none(value: Any) -> int | float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
 def resolved_move_action_for_option(context: JsonDict, option: JsonDict) -> str:
     action = str(option.get("action") or "").strip()
     if action:
@@ -234,6 +324,38 @@ def resolved_move_action_for_option(context: JsonDict, option: JsonDict) -> str:
     if not step_option:
         return ""
     return str(step_option.get("action") or "").strip()
+
+
+def move_action_safety_record(context: JsonDict, action: str) -> JsonDict:
+    navigation = as_dict(context.get("navigation"))
+    return as_dict(as_dict(as_dict(navigation.get("local_costmap")).get("action_safety")).get(action))
+
+
+def default_min_observed_ratio_for_action(action: str) -> float:
+    if action == "MoveBack":
+        return DEFAULT_REAR_MIN_OBSERVED_RATIO
+    if action in {"MoveLeft", "MoveRight"}:
+        return DEFAULT_LATERAL_MIN_OBSERVED_RATIO
+    if action == "MoveAhead":
+        return DEFAULT_FORWARD_MIN_OBSERVED_RATIO
+    return 0.0
+
+
+def required_min_observed_ratio_for_action(action: str, record: JsonDict) -> float:
+    observed_min = number_or_none(record.get("min_observed_ratio"))
+    default_min = default_min_observed_ratio_for_action(action)
+    if observed_min is None:
+        return default_min
+    return max(float(observed_min), float(default_min))
+
+
+def option_allows_bootstrap_moveahead(option: JsonDict, action: str) -> bool:
+    if action != "MoveAhead":
+        return False
+    if str(option.get("safety_source") or "") == "perception-navigation-bootstrap":
+        return True
+    step_source = str(as_dict(option.get("exploration_effect")).get("safety_source") or "")
+    return step_source == "perception-navigation-bootstrap"
 
 
 def place_candidate_executor_ready(candidate: JsonDict) -> bool:
@@ -322,6 +444,9 @@ def validate_context(context: JsonDict) -> list[JsonDict]:
         )
     if context.get("forbidden_private_fields_absent") is False:
         errors.append({"type": "forbidden_private_fields_present"})
+    stale = context_stale_error(context)
+    if stale:
+        errors.append(stale)
     return errors
 
 
@@ -329,13 +454,12 @@ def warning_blocks_physical_action(warning: JsonDict) -> bool:
     return warning.get("blocking") is not False
 
 
-def validate_move_action_fields(context: JsonDict, action: str) -> list[JsonDict]:
+def validate_resolved_move_safety(context: JsonDict, action: str, option: JsonDict) -> list[JsonDict]:
     errors: list[JsonDict] = []
     if action not in MOVE_ACTIONS:
         errors.append({"type": "invalid_move_action", "action": action})
         return errors
-    navigation = as_dict(context.get("navigation"))
-    action_safety = as_dict(as_dict(as_dict(navigation.get("local_costmap")).get("action_safety")).get(action))
+    action_safety = move_action_safety_record(context, action)
     if action_safety.get("safe") is False:
         errors.append(
             {
@@ -344,9 +468,40 @@ def validate_move_action_fields(context: JsonDict, action: str) -> list[JsonDict
                 "reason": action_safety.get("reason"),
             }
         )
+    if action in TRANSLATION_ACTIONS:
+        if not action_safety:
+            if not option_allows_bootstrap_moveahead(option, action):
+                errors.append(
+                    {
+                        "type": "move_action_missing_costmap_safety",
+                        "action": action,
+                        "required_next": "observe_or_rotate_before_translation",
+                    }
+                )
+        else:
+            observed_ratio = number_or_none(action_safety.get("observed_ratio"))
+            min_observed_ratio = required_min_observed_ratio_for_action(action, action_safety)
+            if (
+                observed_ratio is not None
+                and min_observed_ratio is not None
+                and float(observed_ratio) < float(min_observed_ratio)
+            ):
+                errors.append(
+                    {
+                        "type": "move_action_low_observed_ratio",
+                        "action": action,
+                        "observed_ratio": round(float(observed_ratio), 4),
+                        "min_observed_ratio": round(float(min_observed_ratio), 4),
+                        "required_next": "observe_or_rotate_before_translation",
+                    }
+                )
     if action == "MoveAhead" and as_dict(context.get("perception")).get("obstacle_ahead") is True:
         errors.append({"type": "moveahead_blocked_by_perception"})
     return errors
+
+
+def validate_move_action_fields(context: JsonDict, action: str) -> list[JsonDict]:
+    return validate_resolved_move_safety(context, action, {"action": action})
 
 
 def validate_option(
@@ -387,7 +542,7 @@ def validate_option(
             )
     if option.get("kind") == "move_action":
         action = resolved_move_action_for_option(context, option)
-        errors.extend(validate_move_action_fields(context, action))
+        errors.extend(validate_resolved_move_safety(context, action, option))
     if option.get("kind") == "explore_frontier":
         action = resolved_move_action_for_option(context, option)
         frontier_target = as_dict(option.get("frontier_target"))
@@ -395,7 +550,22 @@ def validate_option(
             errors.append({"type": "explore_frontier_missing_target_cell"})
         if not str(option.get("option_id") or "").startswith("explore:frontier:"):
             errors.append({"type": "invalid_explore_frontier_option_id", "option_id": option_id})
-        errors.extend(validate_move_action_fields(context, action))
+        errors.extend(validate_resolved_move_safety(context, action, option))
+    if option.get("kind") == "explore_waypoint":
+        action = resolved_move_action_for_option(context, option)
+        waypoint_target = as_dict(option.get("waypoint_target"))
+        if not waypoint_target.get("cell"):
+            errors.append({"type": "explore_waypoint_missing_target_cell"})
+        if not str(option.get("option_id") or "").startswith("explore:waypoint:"):
+            errors.append({"type": "invalid_explore_waypoint_option_id", "option_id": option_id})
+        errors.extend(validate_resolved_move_safety(context, action, option))
+    if option.get("kind") == "recovery_action":
+        action = resolved_move_action_for_option(context, option)
+        if not str(option.get("option_id") or "").startswith("recover:"):
+            errors.append({"type": "invalid_recovery_option_id", "option_id": option_id})
+        if action not in MOVE_ACTIONS:
+            errors.append({"type": "invalid_recovery_action", "action": action})
+        errors.extend(validate_resolved_move_safety(context, action, option))
     if option.get("kind") == "service_action":
         action = str(option.get("action") or "")
         held = bool(as_dict(as_dict(context.get("worklist")).get("held_object")).get("holding_object"))
@@ -797,6 +967,33 @@ def run_selected_option(
                 "one_step_only": True,
             },
         )
+    if kind == "explore_waypoint":
+        resolved_action = resolved_move_action_for_option(context, option)
+        return run_move_step(
+            context,
+            option,
+            action=resolved_action,
+            timeout_seconds=timeout_seconds,
+            result_type="option_explore_waypoint_step_executed",
+            extra={
+                "waypoint_target": as_dict(option.get("waypoint_target")),
+                "resolved_step_option_id": option.get("resolved_step_option_id"),
+                "one_step_only": True,
+            },
+        )
+    if kind == "recovery_action":
+        resolved_action = resolved_move_action_for_option(context, option)
+        return run_move_step(
+            context,
+            option,
+            action=resolved_action,
+            timeout_seconds=timeout_seconds,
+            result_type="option_recovery_step_executed",
+            extra={
+                "dead_end_context": as_dict(option.get("dead_end_context")),
+                "one_step_only": True,
+            },
+        )
     if kind == "clean_action":
         result = run_script(CLEAN_SCRIPT, [], timeout_seconds=timeout_seconds)
         ok = result.returncode == 0 and result.data.get("status") != "error"
@@ -973,6 +1170,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         dry_run=bool(args.dry_run),
         strict_visual_grounding=not bool(args.no_strict_visual_grounding),
     )
+    context_lifecycle_update: JsonDict = {}
+    if not bool(args.dry_run) and execution.get("result_type") != "done_probe_result":
+        context_lifecycle_update = mark_context_stale_after_execution(
+            context_path,
+            option_id=option_id,
+            execution=execution,
+        )
     result = {
         "status": execution.get("status", "error"),
         "result_type": "selected_option_handled",
@@ -980,6 +1184,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "context_path": str(context_path),
         "option": option,
         "execution": execution,
+        "context_lifecycle_update": context_lifecycle_update,
         "trace_path": str(TRACE_PATH),
     }
     append_trace({"event": "selected_option_handled", "result": result})

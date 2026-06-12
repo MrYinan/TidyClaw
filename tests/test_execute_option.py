@@ -1,4 +1,8 @@
 import unittest
+import json
+import shutil
+import uuid
+from pathlib import Path
 from unittest.mock import patch
 
 from scripts.execute_option import (
@@ -6,10 +10,14 @@ from scripts.execute_option import (
     ScriptResult,
     candidate_executor_payload,
     find_option,
+    mark_context_stale_after_execution,
     run_selected_option,
     validate_context,
     validate_option,
 )
+
+
+TEST_TMP_ROOT = Path(__file__).resolve().parents[1] / ".test-tmp"
 
 
 def base_context() -> dict:
@@ -57,9 +65,36 @@ def base_context() -> dict:
                     "resolved_step_option_id": "move:moveahead",
                     "frontier_target": {"cell": "0,1", "distance_steps": 1},
                 },
+                {
+                    "option_id": "explore:waypoint:x0_z1",
+                    "kind": "explore_waypoint",
+                    "physical_action": True,
+                    "tool": "move-robot",
+                    "action": "MoveAhead",
+                    "executable_now": True,
+                    "one_step_only": True,
+                    "resolved_step_option_id": "move:moveahead",
+                    "waypoint_target": {"cell": "0,1", "purpose": "break_rotation_loop_via_safe_translation"},
+                },
+                {
+                    "option_id": "recover:lookdown",
+                    "kind": "recovery_action",
+                    "physical_action": True,
+                    "tool": "move-robot",
+                    "action": "LookDown",
+                    "executable_now": True,
+                    "one_step_only": True,
+                    "dead_end_context": {"current_cell": "1,4"},
+                },
             ]
         },
     }
+
+
+def make_tmp_dir(name: str) -> Path:
+    path = TEST_TMP_ROOT / f"{name}-{uuid.uuid4().hex}"
+    path.mkdir(parents=True, exist_ok=False)
+    return path
 
 
 class ExecuteOptionTests(unittest.TestCase):
@@ -73,6 +108,34 @@ class ExecuteOptionTests(unittest.TestCase):
         option = find_option(context, "move:moveahead")
         self.assertEqual(validate_context(context), [])
         self.assertEqual(validate_option(context, option or {}), [])
+
+    def test_context_marked_stale_blocks_option_reuse(self) -> None:
+        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        tmp = make_tmp_dir("stale-context")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        context_path = tmp / "decision-context.json"
+        context = base_context()
+        context["context_lifecycle"] = {
+            "valid_for_execution": True,
+            "stale_after_option_execution": False,
+        }
+        context_path.write_text(json.dumps(context, ensure_ascii=False), encoding="utf-8")
+
+        mark = mark_context_stale_after_execution(
+            context_path,
+            option_id="move:moveahead",
+            execution={"status": "success", "result_type": "option_move_executed"},
+        )
+        reloaded = json.loads(context_path.read_text(encoding="utf-8"))
+        errors = validate_context(reloaded)
+
+        self.assertEqual(mark["status"], "success")
+        self.assertFalse(reloaded["context_lifecycle"]["valid_for_execution"])
+        self.assertTrue(reloaded["context_lifecycle"]["stale_after_option_execution"])
+        self.assertTrue(
+            any(item["type"] == "decision_context_stale_after_option_execution" for item in errors)
+        )
+        self.assertTrue(any(item.get("required_next") == "robot_cleaner_prepare_decision_turn" for item in errors))
 
     def test_physical_option_blocks_on_consistency_warning(self) -> None:
         context = base_context()
@@ -100,6 +163,19 @@ class ExecuteOptionTests(unittest.TestCase):
         errors = validate_option(context, option or {})
         self.assertTrue(any(item["type"] == "moveahead_blocked_by_perception" for item in errors))
 
+    def test_move_action_blocks_on_low_observed_ratio(self) -> None:
+        context = base_context()
+        context["navigation"]["local_costmap"]["action_safety"]["MoveAhead"] = {
+            "safe": True,
+            "reason": "clear_swept_volume",
+            "observed_ratio": 0.2,
+            "min_observed_ratio": 0.3,
+        }
+        option = find_option(context, "move:moveahead")
+        errors = validate_option(context, option or {})
+        self.assertTrue(any(item["type"] == "move_action_low_observed_ratio" for item in errors))
+        self.assertTrue(any(item.get("required_next") == "observe_or_rotate_before_translation" for item in errors))
+
     def test_explore_frontier_option_reuses_move_validation(self) -> None:
         context = base_context()
         option = find_option(context, "explore:frontier:x0_z1")
@@ -107,6 +183,31 @@ class ExecuteOptionTests(unittest.TestCase):
         context["perception"]["obstacle_ahead"] = True
         errors = validate_option(context, option or {})
         self.assertTrue(any(item["type"] == "moveahead_blocked_by_perception" for item in errors))
+
+    def test_explore_frontier_blocks_on_low_resolved_action_observed_ratio(self) -> None:
+        context = base_context()
+        context["navigation"]["local_costmap"]["action_safety"]["MoveAhead"] = {
+            "safe": True,
+            "reason": "clear_swept_volume",
+            "observed_ratio": 0.2,
+            "min_observed_ratio": 0.3,
+        }
+        option = find_option(context, "explore:frontier:x0_z1")
+        errors = validate_option(context, option or {})
+        self.assertTrue(any(item["type"] == "move_action_low_observed_ratio" for item in errors))
+
+    def test_explore_waypoint_option_reuses_move_validation(self) -> None:
+        context = base_context()
+        option = find_option(context, "explore:waypoint:x0_z1")
+        self.assertEqual(validate_option(context, option or {}), [])
+        context["navigation"]["local_costmap"]["action_safety"]["MoveAhead"] = {
+            "safe": True,
+            "reason": "clear_swept_volume",
+            "observed_ratio": 0.2,
+            "min_observed_ratio": 0.3,
+        }
+        errors = validate_option(context, option or {})
+        self.assertTrue(any(item["type"] == "move_action_low_observed_ratio" for item in errors))
 
     def test_explore_frontier_executes_one_resolved_move_step(self) -> None:
         context = base_context()
@@ -139,6 +240,71 @@ class ExecuteOptionTests(unittest.TestCase):
         synced_option = sync.call_args.kwargs["option"]
         self.assertEqual(synced_option["kind"], "move_action")
         self.assertEqual(synced_option["action"], "MoveAhead")
+
+    def test_explore_waypoint_executes_one_resolved_move_step(self) -> None:
+        context = base_context()
+        option = find_option(context, "explore:waypoint:x0_z1")
+        script_result = ScriptResult(
+            command=["python", str(MOVE_SCRIPT), "--action", "MoveAhead"],
+            returncode=0,
+            stdout='{"status":"success","lastActionSuccess":true}',
+            stderr="",
+            data={"status": "success", "lastActionSuccess": True},
+        )
+        with patch("scripts.execute_option.run_script", return_value=script_result) as run_script, patch(
+            "scripts.execute_option.sync_option_result",
+            return_value={"status": "success", "result_type": "move_state_synchronized"},
+        ) as sync:
+            result = run_selected_option(
+                context,
+                option or {},
+                timeout_seconds=5,
+                dry_run=False,
+                strict_visual_grounding=True,
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["result_type"], "option_explore_waypoint_step_executed")
+        self.assertTrue(result["one_step_only"])
+        self.assertEqual(result["resolved_action"], "MoveAhead")
+        self.assertEqual(result["waypoint_target"]["cell"], "0,1")
+        run_script.assert_called_once_with(MOVE_SCRIPT, ["--action", "MoveAhead"], timeout_seconds=5)
+        synced_option = sync.call_args.kwargs["option"]
+        self.assertEqual(synced_option["kind"], "move_action")
+        self.assertEqual(synced_option["action"], "MoveAhead")
+
+    def test_recovery_action_executes_one_validated_move_step(self) -> None:
+        context = base_context()
+        option = find_option(context, "recover:lookdown")
+        script_result = ScriptResult(
+            command=["python", str(MOVE_SCRIPT), "--action", "LookDown"],
+            returncode=0,
+            stdout='{"status":"success","lastActionSuccess":true}',
+            stderr="",
+            data={"status": "success", "lastActionSuccess": True},
+        )
+        with patch("scripts.execute_option.run_script", return_value=script_result) as run_script, patch(
+            "scripts.execute_option.sync_option_result",
+            return_value={"status": "success", "result_type": "move_state_synchronized"},
+        ) as sync:
+            result = run_selected_option(
+                context,
+                option or {},
+                timeout_seconds=5,
+                dry_run=False,
+                strict_visual_grounding=True,
+            )
+
+        self.assertEqual(validate_option(context, option or {}), [])
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["result_type"], "option_recovery_step_executed")
+        self.assertTrue(result["one_step_only"])
+        self.assertEqual(result["resolved_action"], "LookDown")
+        self.assertEqual(result["dead_end_context"]["current_cell"], "1,4")
+        run_script.assert_called_once_with(MOVE_SCRIPT, ["--action", "LookDown"], timeout_seconds=5)
+        synced_option = sync.call_args.kwargs["option"]
+        self.assertEqual(synced_option["kind"], "move_action")
+        self.assertEqual(synced_option["action"], "LookDown")
 
     def test_place_option_blocks_when_candidate_needs_alignment(self) -> None:
         context = base_context()

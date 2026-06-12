@@ -94,6 +94,86 @@ class ExplorationContextTests(unittest.TestCase):
         self.assertEqual(context["frontier_candidates"][0]["first_action_hint"], "RotateLeft")
         self.assertEqual(context["frontier_candidates"][0]["first_action_policy"], "rotate_or_forward_only")
 
+    def test_dead_end_summary_marks_all_body_actions_blocked(self) -> None:
+        position_map = {
+            "pose": {"cell": "1,4", "heading": "east"},
+            "cells": {"1,4": {"state": "free", "visited": True}},
+            "frontiers": ["1,5"],
+            "recent_actions": ["MoveAhead"],
+            "stats": {"visited_cell_count": 6, "collision_count": 0},
+        }
+        costmap = {
+            "status": "success",
+            "action_safety": {
+                "MoveAhead": {"safe": False, "reason": "inflated_obstacle_in_swept_volume"},
+                "MoveBack": {"safe": False, "reason": "inflated_obstacle_in_swept_volume"},
+                "MoveLeft": {"safe": False, "reason": "inflated_obstacle_in_swept_volume"},
+                "MoveRight": {"safe": False, "reason": "inflated_obstacle_in_swept_volume"},
+                "RotateLeft": {"safe": False, "reason": "inflated_obstacle_in_swept_volume"},
+                "RotateRight": {"safe": False, "reason": "inflated_obstacle_in_swept_volume"},
+                "LookDown": {"safe": True, "reason": "camera_pitch_action"},
+            },
+        }
+
+        context = build_exploration_context(
+            position_map=position_map,
+            navigation_costmap=costmap,
+            global_plan={},
+        )
+
+        self.assertTrue(context["dead_end"]["active"])
+        self.assertTrue(context["dead_end"]["all_body_actions_blocked"])
+        self.assertEqual(context["dead_end"]["suggested_backtrack_action"], "MoveBack")
+        self.assertEqual(context["dead_end"]["suggested_backtrack_cell"], "0,4")
+        self.assertEqual(context["dead_end"]["avoid_frontiers"][0]["cell"], "1,4")
+        self.assertIn("LookDown", context["dead_end"]["safe_camera_actions"])
+
+    def test_camera_posture_requires_lookdown_after_lookup(self) -> None:
+        position_map = {
+            "pose": {"cell": "0,0", "heading": "north"},
+            "cells": {"0,0": {"state": "free", "visited": True}},
+            "frontiers": ["0,1"],
+            "recent_actions": ["MoveAhead", "LookUp", "RotateRight"],
+            "stats": {"visited_cell_count": 1, "collision_count": 0},
+        }
+
+        context = build_exploration_context(
+            position_map=position_map,
+            navigation_costmap={},
+            global_plan={},
+        )
+
+        self.assertTrue(context["camera_posture"]["needs_normalization"])
+        self.assertEqual(context["camera_posture"]["normalize_action"], "LookDown")
+        self.assertEqual(context["camera_posture"]["last_camera_action"], "LookUp")
+
+    def test_frontier_candidate_penalizes_first_step_into_visited_cell(self) -> None:
+        position_map = {
+            "pose": {"cell": "1,3", "heading": "west"},
+            "cells": {
+                "1,3": {"state": "free", "visited": True},
+                "0,3": {"state": "free", "visited": True},
+                "-1,3": {"state": "unknown", "visited": False},
+                "-1,4": {"state": "unknown", "visited": False},
+            },
+            "frontiers": ["-1,3", "-1,4"],
+            "recent_actions": ["MoveBack"],
+            "stats": {"visited_cell_count": 2, "collision_count": 0},
+        }
+
+        context = build_exploration_context(
+            position_map=position_map,
+            navigation_costmap={},
+            global_plan={},
+        )
+        by_cell = {item["cell"]: item for item in context["frontier_candidates"]}
+
+        self.assertEqual(by_cell["-1,3"]["first_step_action"], "MoveAhead")
+        self.assertEqual(by_cell["-1,3"]["first_step_target_cell"], "0,3")
+        self.assertTrue(by_cell["-1,3"]["first_step_enters_visited_cell"])
+        self.assertIn(by_cell["-1,3"]["route_risk"], {"visited_first_step", "backtrack_first_step"})
+        self.assertIn("first_step", " ".join(by_cell["-1,3"]["reasons"]))
+
 
 if __name__ == "__main__":
     unittest.main()

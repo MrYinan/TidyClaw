@@ -7,6 +7,8 @@ from pathlib import Path
 from scripts.decision_context_builder import (
     DECISION_CONTEXT_SCHEMA,
     LoadedJson,
+    build_explore_frontier_options,
+    build_explore_waypoint_options,
     build_consistency_warnings,
     build_context,
 )
@@ -158,6 +160,422 @@ class DecisionContextBuilderTests(unittest.TestCase):
         self.assertEqual(context["option_set"]["selection_contract"]["llm_should_choose_from"], "primary_options_first")
         self.assertIn("rule_baseline_option_id", context["option_set"])
         self.assertNotIn("recommended_option_id", context["option_set"])
+
+    def test_low_confidence_translation_move_is_not_exposed(self) -> None:
+        memory = WORKSPACE_ROOT / "memory" / "decision-context-low-confidence-fixture"
+        if memory.exists():
+            shutil.rmtree(memory)
+        try:
+            write_json(memory / "mission-state.json", {"enabled": True, "mode": "SERVICE", "max_steps": 80})
+            write_json(memory / "room-state.json", {"room_name": "current_room", "room_complete": False})
+            write_json(memory / "patrol-state.json", {"enabled": True, "mode": "SERVICE", "step_count": 4})
+            write_json(
+                memory / "service-task-state.json",
+                {"phase": "SEARCH_PICKUP_TARGET", "holding_object": False, "pickup_surface_policy": "floor-only"},
+            )
+            write_json(
+                memory / "navigation-costmap.json",
+                {
+                    "status": "success",
+                    "action_safety": {
+                        "MoveLeft": {
+                            "safe": True,
+                            "reason": "clear_swept_volume",
+                            "observed_ratio": 0.2,
+                            "min_observed_ratio": 0.5,
+                        },
+                        "RotateLeft": {"safe": True, "reason": "clear_swept_volume"},
+                    },
+                },
+            )
+            write_json(
+                memory / "position-map.json",
+                {
+                    "pose": {"cell": "0,0", "heading": "east"},
+                    "frontiers": ["0,1"],
+                    "cells": {"0,0": {"state": "free"}, "0,1": {"state": "unknown"}},
+                },
+            )
+            perception = memory / "yolo-current-rgbd.json"
+            write_json(
+                perception,
+                {
+                    "status": "success",
+                    "result_type": "scene_analyzed_yolo",
+                    "perception_backend": "yolo",
+                    "online_safe": True,
+                    "pickup_target_detected": False,
+                    "frontier_exists": True,
+                },
+            )
+
+            context = build_context(self.build_args(memory, perception))
+        finally:
+            if memory.exists():
+                shutil.rmtree(memory)
+
+        option_ids = [item["option_id"] for item in context["option_set"]["options"]]
+        self.assertNotIn("move:moveleft", option_ids)
+        self.assertIn(
+            {
+                "action": "MoveLeft",
+                "observed_ratio": 0.2,
+                "min_observed_ratio": 0.5,
+                "reason": "low_observed_swept_volume",
+                "costmap_reason": "clear_swept_volume",
+            },
+            context["option_set"]["low_confidence_moves"],
+        )
+
+    def test_explore_frontier_can_be_synthesized_from_safe_move_effect(self) -> None:
+        options = build_explore_frontier_options(
+            exploration={"frontier_candidates": [], "action_effects": {}},
+            move_options=[
+                {
+                    "option_id": "move:moveright",
+                    "kind": "move_action",
+                    "action": "MoveRight",
+                    "executable_now": True,
+                    "physical_action": True,
+                    "safety_source": "navigation-costmap",
+                    "exploration_effect": {
+                        "action": "MoveRight",
+                        "effect": "enters_frontier",
+                        "enters_frontier": True,
+                        "target_cell": "1,0",
+                        "target_state": "unknown",
+                    },
+                }
+            ],
+        )
+
+        self.assertEqual(len(options), 1)
+        self.assertEqual(options[0]["option_id"], "explore:frontier:x1_z0")
+        self.assertEqual(options[0]["resolved_step_option_id"], "move:moveright")
+        self.assertEqual(options[0]["frontier_target"]["cell"], "1,0")
+        self.assertEqual(options[0]["frontier_target"]["source"], "move_exploration_effect")
+        self.assertEqual(options[0]["llm_priority"], "primary")
+
+    def test_explore_waypoint_options_use_planner_candidates(self) -> None:
+        options = build_explore_waypoint_options(
+            explore_plan={
+                "mode": "break_rotation_loop",
+                "waypoint_candidates": [
+                    {
+                        "cell": "0,2",
+                        "action": "MoveAhead",
+                        "purpose": "break_rotation_loop_via_safe_translation",
+                        "score": 8.2,
+                        "target_state": "free",
+                        "target_visited": True,
+                        "target_recent": True,
+                        "reasons": ["break_rotation_loop_via_safe_translation", "rotation_loop_active"],
+                    }
+                ],
+            },
+            move_options=[
+                {
+                    "option_id": "move:moveahead",
+                    "kind": "move_action",
+                    "action": "MoveAhead",
+                    "executable_now": True,
+                    "physical_action": True,
+                    "safety_source": "navigation-costmap",
+                    "exploration_effect": {"target_cell": "0,2", "effect": "enters_visited_cell"},
+                }
+            ],
+        )
+
+        self.assertEqual(len(options), 1)
+        self.assertEqual(options[0]["option_id"], "explore:waypoint:x0_z2")
+        self.assertEqual(options[0]["kind"], "explore_waypoint")
+        self.assertEqual(options[0]["resolved_step_option_id"], "move:moveahead")
+        self.assertEqual(options[0]["waypoint_target"]["cell"], "0,2")
+        self.assertEqual(options[0]["decision_level"], "goal")
+        self.assertEqual(options[0]["llm_priority"], "primary")
+
+    def test_build_context_exposes_waypoint_before_rotation_frontier_in_loop(self) -> None:
+        memory = WORKSPACE_ROOT / "memory" / "decision-context-waypoint-fixture"
+        if memory.exists():
+            shutil.rmtree(memory)
+        try:
+            write_json(memory / "mission-state.json", {"enabled": True, "mode": "SERVICE", "max_steps": 80})
+            write_json(memory / "room-state.json", {"room_name": "current_room", "room_complete": False})
+            write_json(memory / "patrol-state.json", {"enabled": True, "mode": "SERVICE", "step_count": 12})
+            write_json(
+                memory / "service-task-state.json",
+                {"phase": "SEARCH_PICKUP_TARGET", "holding_object": False, "pickup_surface_policy": "floor-only"},
+            )
+            write_json(
+                memory / "navigation-costmap.json",
+                {
+                    "status": "success",
+                    "action_safety": {
+                        "MoveAhead": {
+                            "safe": True,
+                            "reason": "clear_swept_volume",
+                            "observed_ratio": 0.85,
+                            "min_observed_ratio": 0.3,
+                        },
+                        "MoveLeft": {"safe": False, "reason": "unknown_swept_volume"},
+                        "MoveRight": {"safe": False, "reason": "unknown_swept_volume"},
+                        "MoveBack": {"safe": False, "reason": "unknown_swept_volume"},
+                        "RotateLeft": {"safe": True, "reason": "clear_swept_volume"},
+                        "RotateRight": {"safe": True, "reason": "clear_swept_volume"},
+                    },
+                },
+            )
+            write_json(
+                memory / "position-map.json",
+                {
+                    "pose": {"cell": "0,3", "heading": "south"},
+                    "frontiers": ["-1,3", "-1,2"],
+                    "cells": {
+                        "0,3": {"state": "free", "visited": True},
+                        "0,2": {"state": "free", "visited": True},
+                        "-1,3": {"state": "unknown", "visited": False},
+                        "-1,2": {"state": "unknown", "visited": False},
+                    },
+                    "recent_actions": [
+                        "LookDown",
+                        "RotateLeft",
+                        "RotateRight",
+                        "RotateLeft",
+                        "RotateRight",
+                        "RotateLeft",
+                    ],
+                    "stats": {"visited_cell_count": 4, "collision_count": 0},
+                },
+            )
+            write_json(memory / "global-plan.json", {"status": "success"})
+            perception = memory / "yolo-current-rgbd.json"
+            write_json(
+                perception,
+                {
+                    "status": "success",
+                    "result_type": "scene_analyzed_yolo",
+                    "perception_backend": "yolo",
+                    "online_safe": True,
+                    "pickup_target_detected": False,
+                    "frontier_exists": True,
+                    "open_directions": ["forward"],
+                    "obstacle_ahead": False,
+                },
+            )
+
+            context = build_context(self.build_args(memory, perception))
+        finally:
+            if memory.exists():
+                shutil.rmtree(memory)
+
+        option_ids = [item["option_id"] for item in context["option_set"]["options"]]
+        self.assertIn("explore:waypoint:x0_z2", option_ids)
+        self.assertIn("explore_plan", context)
+        self.assertEqual(context["explore_plan"]["mode"], "break_rotation_loop")
+        self.assertIn("explore:waypoint:x0_z2", context["option_set"]["primary_options"])
+        self.assertIn("explore:waypoint:x0_z2", context["option_set"]["explore_waypoint_options"])
+        waypoint_index = option_ids.index("explore:waypoint:x0_z2")
+        move_index = option_ids.index("move:moveahead")
+        self.assertLess(waypoint_index, move_index)
+
+    def test_rotation_loop_without_translation_exposes_planner_recovery(self) -> None:
+        memory = WORKSPACE_ROOT / "memory" / "decision-context-planner-recovery-fixture"
+        if memory.exists():
+            shutil.rmtree(memory)
+        try:
+            write_json(memory / "mission-state.json", {"enabled": True, "mode": "SERVICE", "max_steps": 80})
+            write_json(memory / "room-state.json", {"room_name": "current_room", "room_complete": False})
+            write_json(memory / "patrol-state.json", {"enabled": True, "mode": "SERVICE", "step_count": 15})
+            write_json(
+                memory / "service-task-state.json",
+                {"phase": "SEARCH_PICKUP_TARGET", "holding_object": False, "pickup_surface_policy": "floor-only"},
+            )
+            write_json(
+                memory / "navigation-costmap.json",
+                {
+                    "status": "success",
+                    "action_safety": {
+                        "MoveAhead": {"safe": False, "reason": "inflated_obstacle_in_swept_volume"},
+                        "MoveLeft": {"safe": False, "reason": "unknown_swept_volume"},
+                        "MoveRight": {"safe": False, "reason": "unknown_swept_volume"},
+                        "MoveBack": {"safe": False, "reason": "unknown_swept_volume"},
+                        "RotateLeft": {"safe": True, "reason": "clear_swept_volume"},
+                        "RotateRight": {"safe": True, "reason": "clear_swept_volume"},
+                    },
+                },
+            )
+            write_json(
+                memory / "position-map.json",
+                {
+                    "pose": {"cell": "0,3", "heading": "west"},
+                    "frontiers": ["-1,3", "0,2"],
+                    "cells": {
+                        "0,3": {"state": "free", "visited": True},
+                        "-1,3": {"state": "unknown", "visited": False},
+                        "0,2": {"state": "free", "visited": True},
+                    },
+                    "recent_actions": ["RotateRight", "RotateLeft", "RotateRight", "RotateLeft", "RotateRight"],
+                    "stats": {"visited_cell_count": 4, "collision_count": 0},
+                },
+            )
+            write_json(memory / "global-plan.json", {"status": "success"})
+            perception = memory / "yolo-current-rgbd.json"
+            write_json(
+                perception,
+                {
+                    "status": "success",
+                    "result_type": "scene_analyzed_yolo",
+                    "perception_backend": "yolo",
+                    "online_safe": True,
+                    "pickup_target_detected": False,
+                    "frontier_exists": True,
+                    "open_directions": [],
+                    "obstacle_ahead": True,
+                },
+            )
+
+            context = build_context(self.build_args(memory, perception))
+        finally:
+            if memory.exists():
+                shutil.rmtree(memory)
+
+        option_ids = [item["option_id"] for item in context["option_set"]["options"]]
+        self.assertEqual(context["explore_plan"]["mode"], "rotation_loop_scan_limited")
+        self.assertIn("recover:lookup", option_ids)
+        self.assertIn("recover:lookup", context["option_set"]["recovery_options"])
+        self.assertEqual(context["option_set"]["primary_options"][0], "recover:lookup")
+
+    def test_dead_end_context_exposes_recovery_options(self) -> None:
+        memory = WORKSPACE_ROOT / "memory" / "decision-context-dead-end-fixture"
+        if memory.exists():
+            shutil.rmtree(memory)
+        try:
+            write_json(memory / "mission-state.json", {"enabled": True, "mode": "SERVICE", "max_steps": 80})
+            write_json(memory / "room-state.json", {"room_name": "current_room", "room_complete": False})
+            write_json(memory / "patrol-state.json", {"enabled": True, "mode": "SERVICE", "step_count": 11})
+            write_json(
+                memory / "service-task-state.json",
+                {"phase": "SEARCH_PICKUP_TARGET", "holding_object": False, "pickup_surface_policy": "floor-only"},
+            )
+            blocked = {"safe": False, "reason": "inflated_obstacle_in_swept_volume", "observed_ratio": 1.0}
+            write_json(
+                memory / "navigation-costmap.json",
+                {
+                    "status": "success",
+                    "action_safety": {
+                        "MoveAhead": dict(blocked),
+                        "MoveBack": dict(blocked),
+                        "MoveLeft": dict(blocked),
+                        "MoveRight": dict(blocked),
+                        "RotateLeft": dict(blocked),
+                        "RotateRight": dict(blocked),
+                        "LookDown": {"safe": True, "reason": "camera_pitch_action"},
+                        "LookUp": {"safe": True, "reason": "camera_pitch_action"},
+                    },
+                },
+            )
+            write_json(
+                memory / "position-map.json",
+                {
+                    "pose": {"cell": "1,4", "heading": "east"},
+                    "frontiers": ["1,5"],
+                    "cells": {"1,4": {"state": "free", "visited": True}, "1,5": {"state": "unknown"}},
+                    "recent_actions": ["MoveAhead"],
+                    "stats": {"visited_cell_count": 6, "collision_count": 0},
+                },
+            )
+            perception = memory / "yolo-current-rgbd.json"
+            write_json(
+                perception,
+                {
+                    "status": "success",
+                    "result_type": "scene_analyzed_yolo",
+                    "perception_backend": "yolo",
+                    "online_safe": True,
+                    "pickup_target_detected": False,
+                    "frontier_exists": True,
+                    "obstacle_ahead": True,
+                },
+            )
+
+            context = build_context(self.build_args(memory, perception))
+        finally:
+            if memory.exists():
+                shutil.rmtree(memory)
+
+        self.assertTrue(context["exploration"]["dead_end"]["active"])
+        option_ids = [item["option_id"] for item in context["option_set"]["options"]]
+        self.assertIn("recover:lookdown", option_ids)
+        self.assertIn("recover:lookup", option_ids)
+        self.assertIn("recover:lookdown", context["option_set"]["primary_options"])
+        self.assertIn("recover:lookdown", context["option_set"]["recovery_options"])
+        self.assertEqual(context["option_set"]["rule_baseline_option_id"], "recover:lookdown")
+        recover = next(item for item in context["option_set"]["options"] if item["option_id"] == "recover:lookdown")
+        self.assertEqual(recover["kind"], "recovery_action")
+        self.assertEqual(recover["action"], "LookDown")
+        self.assertEqual(recover["dead_end_context"]["current_cell"], "1,4")
+
+    def test_camera_posture_normalization_exposes_recover_lookdown(self) -> None:
+        memory = WORKSPACE_ROOT / "memory" / "decision-context-camera-posture-fixture"
+        if memory.exists():
+            shutil.rmtree(memory)
+        try:
+            write_json(memory / "mission-state.json", {"enabled": True, "mode": "SERVICE", "max_steps": 80})
+            write_json(memory / "room-state.json", {"room_name": "current_room", "room_complete": False})
+            write_json(memory / "patrol-state.json", {"enabled": True, "mode": "SERVICE", "step_count": 12})
+            write_json(
+                memory / "service-task-state.json",
+                {"phase": "SEARCH_PICKUP_TARGET", "holding_object": False, "pickup_surface_policy": "floor-only"},
+            )
+            write_json(
+                memory / "navigation-costmap.json",
+                {
+                    "status": "success",
+                    "action_safety": {
+                        "MoveAhead": {"safe": True, "reason": "clear_swept_volume", "observed_ratio": 1.0},
+                        "RotateLeft": {"safe": True, "reason": "clear_swept_volume"},
+                        "RotateRight": {"safe": True, "reason": "clear_swept_volume"},
+                        "LookDown": {"safe": True, "reason": "camera_pitch_action"},
+                    },
+                },
+            )
+            write_json(
+                memory / "position-map.json",
+                {
+                    "pose": {"cell": "1,4", "heading": "east"},
+                    "frontiers": ["1,5"],
+                    "cells": {"1,4": {"state": "free", "visited": True}, "1,5": {"state": "unknown"}},
+                    "recent_actions": ["LookUp", "RotateRight"],
+                    "stats": {"visited_cell_count": 6, "collision_count": 0},
+                },
+            )
+            perception = memory / "yolo-current-rgbd.json"
+            write_json(
+                perception,
+                {
+                    "status": "success",
+                    "result_type": "scene_analyzed_yolo",
+                    "perception_backend": "yolo",
+                    "online_safe": True,
+                    "pickup_target_detected": False,
+                    "frontier_exists": True,
+                    "obstacle_ahead": False,
+                },
+            )
+
+            context = build_context(self.build_args(memory, perception))
+        finally:
+            if memory.exists():
+                shutil.rmtree(memory)
+
+        self.assertTrue(context["exploration"]["camera_posture"]["needs_normalization"])
+        option_ids = [item["option_id"] for item in context["option_set"]["options"]]
+        self.assertIn("recover:lookdown", option_ids)
+        self.assertEqual(context["option_set"]["primary_options"][0], "recover:lookdown")
+        self.assertIn("recover:lookdown", context["option_set"]["recovery_options"])
+        recover = next(item for item in context["option_set"]["options"] if item["option_id"] == "recover:lookdown")
+        self.assertEqual(recover["reason"], "restore_default_camera_pitch_before_navigation")
+        self.assertEqual(recover["camera_posture"]["normalize_action"], "LookDown")
 
     def test_fresh_perception_with_unchanged_mission_state_skew_is_advisory(self) -> None:
         warnings = build_consistency_warnings(

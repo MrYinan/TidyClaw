@@ -22,14 +22,21 @@ class PrepareDecisionTurnTests(unittest.TestCase):
     @patch("scripts.prepare_decision_turn.run_script")
     @patch("scripts.prepare_decision_turn.update_local_costmap_from_refresh")
     @patch("scripts.prepare_decision_turn.run_observe_refresh")
+    @patch("scripts.prepare_decision_turn.ensure_tool_mission_active")
     @patch("scripts.prepare_decision_turn.append_trace")
     def test_prepare_success_reuses_observe_and_context_builder(
         self,
         _trace,
+        ensure_active,
         observe_refresh,
         update_costmap,
         run_script,
     ) -> None:
+        ensure_active.return_value = {
+            "status": "success",
+            "result_type": "tool_mission_already_active",
+            "activated": False,
+        }
         observe_refresh.return_value = {
             "status": "success",
             "result_type": "observe_refresh_executed",
@@ -75,20 +82,29 @@ class PrepareDecisionTurnTests(unittest.TestCase):
         self.assertEqual(result["rule_baseline_option_id"], "move:moveahead")
         self.assertEqual(result["option_count"], 1)
         self.assertEqual(result["local_costmap"]["result_type"], "local_costmap_updated")
+        self.assertEqual(result["mission_activation"]["status"], "success")
+        ensure_active.assert_called_once()
         observe_refresh.assert_called_once()
         update_costmap.assert_called_once()
         self.assertIn("--task-mode", run_script.call_args.args[1])
 
     @patch("scripts.prepare_decision_turn.run_script")
     @patch("scripts.prepare_decision_turn.run_observe_refresh")
+    @patch("scripts.prepare_decision_turn.ensure_tool_mission_active")
     @patch("scripts.prepare_decision_turn.append_trace")
-    def test_observe_failure_does_not_build_context(self, _trace, observe_refresh, run_script) -> None:
+    def test_observe_failure_does_not_build_context(self, _trace, ensure_active, observe_refresh, run_script) -> None:
+        ensure_active.return_value = {
+            "status": "success",
+            "result_type": "tool_mission_activated",
+            "activated": True,
+        }
         observe_refresh.return_value = {"status": "error", "result_type": "observe_refresh_vision_failed"}
 
         result = prepare_decision_turn(args())
 
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["stage"], "observe_refresh")
+        self.assertEqual(result["mission_activation"]["result_type"], "tool_mission_activated")
         self.assertEqual(result["required_next"], "retry_prepare_decision_turn_or_stop")
         run_script.assert_not_called()
 

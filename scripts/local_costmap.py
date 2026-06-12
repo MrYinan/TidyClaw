@@ -142,8 +142,27 @@ class LocalCostmap:
         self.translation_step_m = max(0.05, env_float("ROBOT_LOCAL_COSTMAP_TRANSLATION_STEP_M", 0.25))
         self.rotation_extra_margin_m = max(0.0, env_float("ROBOT_LOCAL_COSTMAP_ROTATION_EXTRA_MARGIN_M", 0.08))
         self.hard_block_confidence = clamp(env_float("ROBOT_LOCAL_COSTMAP_HARD_BLOCK_CONFIDENCE", 0.20))
-        self.min_translation_observed_ratio = clamp(env_float("ROBOT_LOCAL_COSTMAP_MIN_TRANSLATION_OBSERVED_RATIO", 0.15))
-        self.rear_min_observed_ratio = clamp(env_float("ROBOT_LOCAL_COSTMAP_REAR_MIN_OBSERVED_RATIO", 0.60))
+        legacy_min_observed = clamp(env_float("ROBOT_LOCAL_COSTMAP_MIN_TRANSLATION_OBSERVED_RATIO", 0.15))
+        legacy_env_set = os.getenv("ROBOT_LOCAL_COSTMAP_MIN_TRANSLATION_OBSERVED_RATIO") is not None
+        self.forward_min_observed_ratio = clamp(
+            env_float(
+                "ROBOT_LOCAL_COSTMAP_FORWARD_MIN_OBSERVED_RATIO",
+                legacy_min_observed if legacy_env_set else 0.30,
+            )
+        )
+        self.lateral_min_observed_ratio = clamp(
+            env_float(
+                "ROBOT_LOCAL_COSTMAP_LATERAL_MIN_OBSERVED_RATIO",
+                legacy_min_observed if legacy_env_set else 0.50,
+            )
+        )
+        self.rear_min_observed_ratio = clamp(
+            env_float(
+                "ROBOT_LOCAL_COSTMAP_REAR_MIN_OBSERVED_RATIO",
+                legacy_min_observed if legacy_env_set else 0.60,
+            )
+        )
+        self.min_translation_observed_ratio = self.forward_min_observed_ratio
         self.front_corridor_offset_m = max(
             self.resolution_m,
             env_float("ROBOT_LOCAL_COSTMAP_FRONT_CORRIDOR_OFFSET_M", 0.20),
@@ -286,6 +305,15 @@ class LocalCostmap:
         if action in ROTATE_ACTIONS:
             return self._footprint_cells(rotation_margin_cells)
         return set()
+
+    def _min_observed_ratio_for_action(self, action: str) -> float:
+        if action == "MoveBack":
+            return self.rear_min_observed_ratio
+        if action in {"MoveLeft", "MoveRight"}:
+            return self.lateral_min_observed_ratio
+        if action == "MoveAhead":
+            return self.forward_min_observed_ratio
+        return 0.0
 
     def _held_footprint_extra(self, labels: Sequence[str], analysis: JsonDict) -> Tuple[float, str]:
         """Return a conservative carried-object footprint extension.
@@ -537,7 +565,7 @@ class LocalCostmap:
             return {"safe": True, "confidence": 0.0, "reason": "no_swept_volume", "blocked_cell_count": 0, "observed_ratio": 0.0}
         blocked = corridor & inflated
         observed_ratio = float(len(corridor & observed)) / float(max(1, len(corridor)))
-        min_observed = self.rear_min_observed_ratio if action == "MoveBack" else self.min_translation_observed_ratio
+        min_observed = self._min_observed_ratio_for_action(action)
         unknown = bool(action in TRANSLATION_ACTIONS and observed_ratio < min_observed)
         confidence = clamp(observed_ratio + (0.35 if blocked else 0.0) + (0.80 if unknown else 0.0))
         safe = bool((not blocked) and not unknown)
@@ -584,7 +612,7 @@ class LocalCostmap:
         corridor = {(offset_cells, iz) for iz in range(1, step_cells + 1)}
         blocked = corridor & inflated
         observed_ratio = float(len(corridor & observed)) / float(max(1, len(corridor)))
-        unknown = bool(observed_ratio < self.min_translation_observed_ratio)
+        unknown = bool(observed_ratio < self.forward_min_observed_ratio)
         safe = bool((not blocked) and not unknown)
         if blocked:
             reason = "inflated_obstacle_in_lane"
@@ -600,7 +628,7 @@ class LocalCostmap:
             "reason": reason,
             "blocked_cell_count": len(blocked),
             "observed_ratio": round(observed_ratio, 4),
-            "min_observed_ratio": round(self.min_translation_observed_ratio, 4),
+            "min_observed_ratio": round(self.forward_min_observed_ratio, 4),
         }
         if blocked:
             record["blocked_cells"] = [[cell[0], cell[1]] for cell in sorted(blocked)[:12]]

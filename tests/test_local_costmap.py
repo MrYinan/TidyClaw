@@ -173,6 +173,44 @@ class LocalCostmapTests(unittest.TestCase):
             self.assertEqual(result["status"], "skipped")
             self.assertEqual(result["result_type"], "local_costmap_no_depth")
 
+    def test_lateral_move_requires_stronger_observed_ratio_than_before(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = LocalCostmap(Path(tmp))
+            sparse = manager._safety_record(
+                action="MoveLeft",
+                inflated=set(),
+                observed={(-1, 0)},
+                radius_m=manager.robot_radius_m,
+            )
+            self.assertFalse(sparse["safe"])
+            self.assertEqual(sparse["reason"], "unknown_swept_volume")
+            self.assertEqual(sparse["observed_ratio"], 0.2)
+            self.assertEqual(sparse["min_observed_ratio"], 0.5)
+
+            supported = manager._safety_record(
+                action="MoveLeft",
+                inflated=set(),
+                observed={(-1, 0), (-2, 0), (-3, 0)},
+                radius_m=manager.robot_radius_m,
+            )
+            self.assertTrue(supported["safe"])
+            self.assertEqual(supported["reason"], "clear_swept_volume")
+            self.assertEqual(supported["observed_ratio"], 0.6)
+
+    def test_forward_move_requires_more_than_twenty_percent_observed_ratio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = LocalCostmap(Path(tmp))
+            result = manager._safety_record(
+                action="MoveAhead",
+                inflated=set(),
+                observed={(0, 1)},
+                radius_m=manager.robot_radius_m,
+            )
+            self.assertFalse(result["safe"])
+            self.assertEqual(result["reason"], "unknown_swept_volume")
+            self.assertEqual(result["observed_ratio"], 0.2)
+            self.assertEqual(result["min_observed_ratio"], 0.3)
+
 
 if __name__ == "__main__":
     unittest.main()

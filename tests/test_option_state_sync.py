@@ -4,7 +4,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from scripts.option_state_sync import sync_option_result
+from scripts.option_state_sync import ensure_tool_mission_active, sync_option_result
 
 
 TEST_TMP_ROOT = Path(__file__).resolve().parents[1] / ".test-tmp"
@@ -52,6 +52,87 @@ def write_active_state(memory_dir: Path, *, step_count: int) -> None:
 
 
 class OptionStateSyncTests(unittest.TestCase):
+    def test_move_sync_activates_idle_tool_mission_before_recording_step(self) -> None:
+        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        memory_dir = make_memory_dir("activate-move")
+        self.addCleanup(shutil.rmtree, memory_dir, ignore_errors=True)
+        write_json(
+            memory_dir / "patrol-state.json",
+            {"enabled": False, "mode": "IDLE", "step_count": 0, "max_steps": 100},
+        )
+        write_json(
+            memory_dir / "mission-state.json",
+            {
+                "enabled": False,
+                "mode": "IDLE",
+                "current_room": "current_room",
+                "total_steps_completed": 0,
+                "max_steps": 100,
+            },
+        )
+        write_json(
+            memory_dir / "room-state.json",
+            {"room_name": "current_room", "room_complete": False, "explored_steps": 0},
+        )
+
+        result = sync_option_result(
+            context={"generated_at": "2026-06-11T20:00:00+08:00"},
+            option={"kind": "move_action", "action": "MoveAhead"},
+            candidate=None,
+            execution={"status": "success", "result_type": "move_executed", "lastActionSuccess": True},
+            success=True,
+            memory_dir=memory_dir,
+        )
+
+        self.assertEqual(result["status"], "success")
+        state_manager = result["state_manager"]
+        self.assertEqual(state_manager["mode"], "SERVICE")
+        self.assertEqual(state_manager["step_count"], 1)
+        self.assertEqual(
+            state_manager["mission_activation"]["result_type"],
+            "tool_mission_activated",
+        )
+        patrol = json.loads((memory_dir / "patrol-state.json").read_text(encoding="utf-8"))
+        mission = json.loads((memory_dir / "mission-state.json").read_text(encoding="utf-8"))
+        self.assertTrue(patrol["enabled"])
+        self.assertEqual(patrol["mode"], "SERVICE")
+        self.assertEqual(patrol["step_count"], 1)
+        self.assertTrue(mission["enabled"])
+        self.assertEqual(mission["mode"], "SERVICE")
+        self.assertEqual(mission["total_steps_completed"], 1)
+
+    def test_tool_mission_activation_preserves_existing_counters(self) -> None:
+        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        memory_dir = make_memory_dir("activate-existing")
+        self.addCleanup(shutil.rmtree, memory_dir, ignore_errors=True)
+        write_json(
+            memory_dir / "patrol-state.json",
+            {"enabled": False, "mode": "IDLE", "step_count": 7, "max_steps": 100},
+        )
+        write_json(
+            memory_dir / "mission-state.json",
+            {
+                "enabled": False,
+                "mode": "IDLE",
+                "current_room": "current_room",
+                "total_steps_completed": 7,
+                "max_steps": 100,
+            },
+        )
+        write_json(
+            memory_dir / "room-state.json",
+            {"room_name": "current_room", "room_complete": False, "explored_steps": 7},
+        )
+
+        result = ensure_tool_mission_active(memory_dir=memory_dir, mode="SERVICE")
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["activated"])
+        self.assertEqual(result["step_count"], 7)
+        patrol = json.loads((memory_dir / "patrol-state.json").read_text(encoding="utf-8"))
+        self.assertEqual(patrol["step_count"], 7)
+        self.assertEqual(patrol["mode"], "SERVICE")
+
     def test_pickup_success_sets_held_object_context(self) -> None:
         TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
         memory_dir = make_memory_dir("pickup")

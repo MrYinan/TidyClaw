@@ -23,6 +23,7 @@ PLACE_PRECHECK_CACHE_NAME = "place-precheck-cache.json"
 SERVICE_INITIAL_PHASE = "SEARCH_PICKUP_TARGET"
 HELD_FOOD_LABELS = {"apple", "banana", "lettuce", "orange", "potato", "tomato"}
 RECENTLY_PLACED_SUPPRESSION_STEPS = 12
+TERMINAL_MODES = {"RECOVER", "ROOM_COMPLETE", "MISSION_REPORT", "DONE"}
 
 
 JsonDict = dict[str, Any]
@@ -338,6 +339,10 @@ def record_state_manager_step(
     try:
         from scripts.state_manager_core import StateManager
 
+        activation = ensure_tool_mission_active(memory_dir=memory_dir, mode=mode)
+        if activation.get("status") != "success":
+            return activation
+
         state = StateManager(memory_dir).record_step(
             action=action,
             mode=mode,
@@ -353,11 +358,92 @@ def record_state_manager_step(
             "result_type": "state_manager_step_recorded",
             "step_count": state.patrol.get("step_count"),
             "mode": state.patrol.get("mode"),
+            "mission_activation": activation,
         }
     except Exception as exc:
         return {
             "status": "error",
             "result_type": "error_state_manager_step_failed",
+            "message": str(exc),
+        }
+
+
+def ensure_tool_mission_active(
+    *,
+    memory_dir: Path = MEMORY_DIR,
+    mode: str = "SERVICE",
+    room_name: str = "current_room",
+    max_steps: int | None = None,
+) -> JsonDict:
+    """Ensure tool-driven OpenClaw turns have an active state-manager mission.
+
+    patrol_runner owns this lifecycle in runner mode.  The OpenClaw Tool loop
+    calls prepare/execute directly, so it needs a small activation shim that
+    preserves existing maps and memories while enabling step accounting.
+    """
+
+    try:
+        from scripts.state_manager_core import DEFAULT_MAX_STEPS, StateManager
+
+        manager = StateManager(memory_dir)
+        state = manager.load_state()
+        patrol = state.patrol
+        mission = state.mission
+        patrol_mode = str(patrol.get("mode") or "IDLE")
+        mission_mode = str(mission.get("mode") or "IDLE")
+        if patrol_mode in TERMINAL_MODES or mission_mode in TERMINAL_MODES:
+            return {
+                "status": "blocked",
+                "result_type": "tool_mission_terminal_state",
+                "patrol_mode": patrol_mode,
+                "mission_mode": mission_mode,
+                "required_next": "robot_cleaner_report_or_stop",
+            }
+
+        active = bool(patrol.get("enabled")) and bool(mission.get("enabled"))
+        target_mode = str(mode or "SERVICE")
+        if active and patrol_mode == target_mode and mission_mode == target_mode:
+            return {
+                "status": "success",
+                "result_type": "tool_mission_already_active",
+                "activated": False,
+                "mode": target_mode,
+                "step_count": patrol.get("step_count"),
+            }
+
+        try:
+            resolved_max_steps = int(max_steps or patrol.get("max_steps") or mission.get("max_steps") or DEFAULT_MAX_STEPS)
+        except (TypeError, ValueError):
+            resolved_max_steps = DEFAULT_MAX_STEPS
+        resolved_room = str(
+            room_name
+            or mission.get("current_room")
+            or state.room.get("room_name")
+            or "current_room"
+        )
+        state = manager.start_mission(
+            room_name=resolved_room,
+            max_steps=max(1, resolved_max_steps),
+            reset_counters=False,
+        )
+        state.patrol["mode"] = target_mode
+        state.mission["mode"] = target_mode
+        state.patrol["enabled"] = True
+        state.mission["enabled"] = True
+        manager.save_state(state)
+        return {
+            "status": "success",
+            "result_type": "tool_mission_activated",
+            "activated": True,
+            "mode": target_mode,
+            "step_count": state.patrol.get("step_count"),
+            "room": resolved_room,
+            "max_steps": state.patrol.get("max_steps"),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "result_type": "error_tool_mission_activation_failed",
             "message": str(exc),
         }
 

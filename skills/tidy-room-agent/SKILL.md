@@ -123,3 +123,29 @@ metadata: {"openclaw":{"emoji":"robot"}}
 ```powershell
 python scripts\robot_tool_bridge.py
 ```
+
+## Recovery Rules
+
+当 `option_set.recovery_options` 非空，或 `exploration.dead_end.active=true` 时，当前轮处于局部阻塞/死角恢复状态。
+
+硬规则：
+
+- 优先从 `option_set.recovery_options` 中选择一个 `recover:*`，不要反复选择 `observe:refresh` 或 `done:probe`。
+- `recover:*` 仍然只执行一个经过执行器验证的动作；执行后下一轮必须重新调用 `robot_cleaner_prepare_decision_turn()`。
+- 如果 `robot_cleaner_execute_option` 返回 `selected_option_not_found`，说明你选择了当前 `option_set.options` 中不存在的旧 `option_id`。不要解释为系统已过期，也不要重试旧 `option_id`；必须重新调用 `robot_cleaner_prepare_decision_turn()` 并从新的 `option_set.options` 里重新选择。
+- 不要把“上一轮可前进”当成“这一轮仍可前进”。每一轮都以最新 `navigation.local_costmap.action_safety` 和当前 `option_set.options` 为准。
+- 如果只剩 `observe:refresh` 和 `done:probe`，并且 `done_readiness.can_finish` 不为 true，应先 `observe:refresh`，随后报告当前恢复受限状态，不能直接宣布房间完成。
+
+## Camera Posture Rules
+
+## Explore Planner Rules
+
+- `explore:waypoint:*` 是目标级探索选项，不是底层 `move:*`。它表示规划器发现一个安全的一步路点，常用于打破原地左右转循环。
+- 当 `explore_plan.mode=break_rotation_loop` 且 `option_set.explore_waypoint_options` 非空时，必须优先从 `explore:waypoint:*` 中选择，不要继续选择只解析成 `RotateLeft`/`RotateRight` 的 `explore:frontier:*`。
+- `explore:frontier:*` 仍然是正常 frontier 目标；但如果某些 frontier 被 `explore_plan.suppressed_frontiers` 标记，说明它们本轮容易导致转向震荡或朝向已知阻塞区域，不应绕过 planner 选择旧的底层 `move:*`。
+- 每个 `explore:waypoint:*` 和 `explore:frontier:*` 仍然只执行一个经过验证的物理动作；执行后下一轮必须重新调用 `robot_cleaner_prepare_decision_turn()`。
+
+- 如果上一轮执行过 `recover:lookup`，下一轮 `robot_cleaner_prepare_decision_turn()` 可能会返回 `exploration.camera_posture.needs_normalization=true`。
+- 当 `option_set.recovery_options` 里存在 `recover:lookdown` 时，必须优先选择 `recover:lookdown`，恢复默认/地面可见视角后再继续 `explore:frontier:*`。
+- 不要在相机仍处于 LookUp 视角时判断“没有地面可拾取物”并继续长距离探索；先恢复视角，再观察和决策。
+- `recover:lookdown` 成功后，下一轮仍必须重新调用 `robot_cleaner_prepare_decision_turn()`，不要复用上一轮的 `explore:*` 或 `move:*`。
