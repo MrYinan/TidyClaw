@@ -1,0 +1,9 @@
+{
+  "schema": "robot_cleaner_runtime_config_v1",
+  "map": {
+    "backend": "map_bundle",
+    "bundle_path": "memory/maps/current",
+    "fallback_backend": "action_odometry",
+    "fallback_if_bundle_missing": true
+  }
+}

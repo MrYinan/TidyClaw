@@ -107,6 +107,89 @@ class ExplorePlannerTests(unittest.TestCase):
             any("immediate_rotation_undo" in item["reason"] for item in plan["suppressed_frontiers"])
         )
 
+    def test_blocked_active_route_uses_recovery_and_suppresses_lateral_waypoints(self) -> None:
+        position_map = {
+            "pose": {"cell": "1,-4", "heading": "east"},
+            "cells": {
+                "1,-4": {"state": "free", "visited": True},
+                "1,-5": {"state": "unknown", "visited": False},
+                "2,-4": {"state": "unknown", "visited": False},
+            },
+            "frontiers": ["1,-5", "2,-4"],
+            "recent_actions": ["MoveRight", "MoveRight"],
+            "active_frontier_goal": {
+                "cell": "2,-4",
+                "next_action": "MoveAhead",
+                "next_cell": "2,-4",
+            },
+            "active_route": {
+                "status": "blocked",
+                "goal_cell": "2,-4",
+                "next_action": "MoveAhead",
+                "blocked_reason": "inflated_obstacle_in_swept_volume",
+            },
+            "stats": {"visited_cell_count": 12, "collision_count": 0},
+        }
+        costmap = {
+            "action_safety": {
+                "MoveAhead": {"safe": False, "reason": "inflated_obstacle_in_swept_volume"},
+                "MoveLeft": {"safe": True, "reason": "clear_swept_volume", "observed_ratio": 1.0},
+                "MoveRight": {"safe": True, "reason": "clear_swept_volume", "observed_ratio": 1.0},
+                "MoveBack": {"safe": True, "reason": "clear_swept_volume", "observed_ratio": 1.0},
+                "RotateLeft": {"safe": True, "reason": "clear_swept_volume"},
+                "RotateRight": {"safe": True, "reason": "clear_swept_volume"},
+            }
+        }
+        exploration = build_exploration_context(
+            position_map=position_map,
+            navigation_costmap=costmap,
+            global_plan={},
+        )
+
+        plan = build_explore_plan(
+            position_map=position_map,
+            navigation_costmap=costmap,
+            exploration=exploration,
+        )
+
+        self.assertEqual(plan["mode"], "route_blocked_recovery")
+        self.assertNotIn("waypoint_candidates", plan)
+        self.assertTrue(plan["recovery_actions"])
+        self.assertEqual(plan["recovery_actions"][0]["trigger"], "route_blocked_recovery")
+
+    def test_same_lateral_streak_suppresses_same_lateral_waypoint(self) -> None:
+        position_map = {
+            "pose": {"cell": "1,-3", "heading": "east"},
+            "cells": {
+                "1,-3": {"state": "free", "visited": True},
+                "1,-4": {"state": "unknown", "visited": False},
+                "1,-2": {"state": "unknown", "visited": False},
+            },
+            "frontiers": ["1,-4", "1,-2"],
+            "recent_actions": ["MoveRight", "MoveRight"],
+            "stats": {"visited_cell_count": 8, "collision_count": 0},
+        }
+        costmap = {
+            "action_safety": {
+                "MoveRight": {"safe": True, "reason": "clear_swept_volume", "observed_ratio": 1.0},
+                "MoveLeft": {"safe": True, "reason": "clear_swept_volume", "observed_ratio": 1.0},
+            }
+        }
+        exploration = build_exploration_context(
+            position_map=position_map,
+            navigation_costmap=costmap,
+            global_plan={},
+        )
+
+        plan = build_explore_plan(
+            position_map=position_map,
+            navigation_costmap=costmap,
+            exploration=exploration,
+        )
+        actions = {item["action"] for item in plan.get("waypoint_candidates", [])}
+
+        self.assertNotIn("MoveRight", actions)
+
 
 if __name__ == "__main__":
     unittest.main()

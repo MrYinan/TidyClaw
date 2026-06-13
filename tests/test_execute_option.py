@@ -66,6 +66,27 @@ def base_context() -> dict:
                     "frontier_target": {"cell": "0,1", "distance_steps": 1},
                 },
                 {
+                    "option_id": "explore:route_step:route_frontier_x0_z1_abcd1234_0",
+                    "kind": "explore_route_step",
+                    "physical_action": True,
+                    "tool": "move-robot",
+                    "action": "MoveAhead",
+                    "executable_now": True,
+                    "one_step_only": True,
+                    "resolved_step_option_id": "move:moveahead",
+                    "route_step": {
+                        "route_id": "route-frontier-x0-z1-abcd1234",
+                        "step_index": 0,
+                        "action": "MoveAhead",
+                        "current_cell": "0,0",
+                        "current_heading": "north",
+                        "target_cell": "0,1",
+                        "next_cell": "0,1",
+                        "goal_cell": "0,1",
+                        "desired_heading": "north",
+                    },
+                },
+                {
                     "option_id": "explore:waypoint:x0_z1",
                     "kind": "explore_waypoint",
                     "physical_action": True,
@@ -163,6 +184,17 @@ class ExecuteOptionTests(unittest.TestCase):
         errors = validate_option(context, option or {})
         self.assertTrue(any(item["type"] == "moveahead_blocked_by_perception" for item in errors))
 
+    def test_committed_route_step_uses_costmap_when_perception_obstacle_ahead_conflicts(self) -> None:
+        context = base_context()
+        context["perception"]["obstacle_ahead"] = True
+        option = dict(find_option(context, "explore:route_step:route_frontier_x0_z1_abcd1234_0") or {})
+        option["safety_source"] = "active-route-costmap"
+
+        errors = validate_option(context, option)
+
+        self.assertFalse(any(item["type"] == "moveahead_blocked_by_perception" for item in errors))
+        self.assertEqual(errors, [])
+
     def test_move_action_blocks_on_low_observed_ratio(self) -> None:
         context = base_context()
         context["navigation"]["local_costmap"]["action_safety"]["MoveAhead"] = {
@@ -193,6 +225,19 @@ class ExecuteOptionTests(unittest.TestCase):
             "min_observed_ratio": 0.3,
         }
         option = find_option(context, "explore:frontier:x0_z1")
+        errors = validate_option(context, option or {})
+        self.assertTrue(any(item["type"] == "move_action_low_observed_ratio" for item in errors))
+
+    def test_explore_route_step_option_reuses_move_validation(self) -> None:
+        context = base_context()
+        option = find_option(context, "explore:route_step:route_frontier_x0_z1_abcd1234_0")
+        self.assertEqual(validate_option(context, option or {}), [])
+        context["navigation"]["local_costmap"]["action_safety"]["MoveAhead"] = {
+            "safe": True,
+            "reason": "clear_swept_volume",
+            "observed_ratio": 0.2,
+            "min_observed_ratio": 0.3,
+        }
         errors = validate_option(context, option or {})
         self.assertTrue(any(item["type"] == "move_action_low_observed_ratio" for item in errors))
 
@@ -236,6 +281,38 @@ class ExecuteOptionTests(unittest.TestCase):
         self.assertTrue(result["one_step_only"])
         self.assertEqual(result["resolved_action"], "MoveAhead")
         self.assertEqual(result["frontier_target"]["cell"], "0,1")
+        run_script.assert_called_once_with(MOVE_SCRIPT, ["--action", "MoveAhead"], timeout_seconds=5)
+        synced_option = sync.call_args.kwargs["option"]
+        self.assertEqual(synced_option["kind"], "move_action")
+        self.assertEqual(synced_option["action"], "MoveAhead")
+
+    def test_explore_route_step_executes_one_resolved_move_step(self) -> None:
+        context = base_context()
+        option = find_option(context, "explore:route_step:route_frontier_x0_z1_abcd1234_0")
+        script_result = ScriptResult(
+            command=["python", str(MOVE_SCRIPT), "--action", "MoveAhead"],
+            returncode=0,
+            stdout='{"status":"success","lastActionSuccess":true}',
+            stderr="",
+            data={"status": "success", "lastActionSuccess": True},
+        )
+        with patch("scripts.execute_option.run_script", return_value=script_result) as run_script, patch(
+            "scripts.execute_option.sync_option_result",
+            return_value={"status": "success", "result_type": "move_state_synchronized"},
+        ) as sync:
+            result = run_selected_option(
+                context,
+                option or {},
+                timeout_seconds=5,
+                dry_run=False,
+                strict_visual_grounding=True,
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["result_type"], "option_explore_route_step_executed")
+        self.assertTrue(result["one_step_only"])
+        self.assertEqual(result["resolved_action"], "MoveAhead")
+        self.assertEqual(result["route_step"]["goal_cell"], "0,1")
         run_script.assert_called_once_with(MOVE_SCRIPT, ["--action", "MoveAhead"], timeout_seconds=5)
         synced_option = sync.call_args.kwargs["option"]
         self.assertEqual(synced_option["kind"], "move_action")

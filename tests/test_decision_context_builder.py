@@ -8,6 +8,7 @@ from scripts.decision_context_builder import (
     DECISION_CONTEXT_SCHEMA,
     LoadedJson,
     build_explore_frontier_options,
+    build_explore_route_step_options,
     build_explore_waypoint_options,
     build_consistency_warnings,
     build_context,
@@ -122,7 +123,14 @@ class DecisionContextBuilderTests(unittest.TestCase):
         self.assertEqual(context["schema"], DECISION_CONTEXT_SCHEMA)
         self.assertTrue(context["forbidden_private_fields_absent"])
         self.assertTrue(context["context_policy"]["full_maps_not_included"])
-        self.assertNotIn("cells", json.dumps(context["navigation"]))
+        self.assertEqual(context["navigation"]["map_backend"]["backend"], "action_odometry")
+        self.assertEqual(
+            context["navigation"]["map_backend"]["schema"],
+            "robot_cleaner_map_snapshot_v1",
+        )
+        self.assertIn("navigation_core", context)
+        self.assertEqual(context["navigation_core"]["schema"], "robot_cleaner_navigation_core_v1")
+        self.assertNotIn('"cells"', json.dumps(context["navigation"]))
         self.assertIn("exploration", context)
         self.assertIn("recent_path", context["exploration"])
         self.assertIn("frontier_candidates", context["exploration"])
@@ -294,6 +302,52 @@ class DecisionContextBuilderTests(unittest.TestCase):
         self.assertEqual(options[0]["decision_level"], "goal")
         self.assertEqual(options[0]["llm_priority"], "primary")
 
+    def test_explore_route_step_options_use_active_route(self) -> None:
+        options = build_explore_route_step_options(
+            explore_plan={
+                "active_route": {
+                    "status": "active",
+                    "route_id": "route-frontier-xm1-z3-abcd1234",
+                    "goal_cell": "-1,3",
+                    "goal_type": "frontier_cluster",
+                    "path_length": 2,
+                    "distance_to_goal": 2,
+                    "route_step": {
+                        "status": "active",
+                        "route_id": "route-frontier-xm1-z3-abcd1234",
+                        "step_index": 0,
+                        "action": "RotateLeft",
+                        "current_cell": "0,4",
+                        "current_heading": "north",
+                        "target_cell": "0,4",
+                        "next_cell": "0,3",
+                        "goal_cell": "-1,3",
+                        "desired_heading": "south",
+                        "progress_effect": "turnaround_toward_next_cell",
+                    },
+                }
+            },
+            move_options=[
+                {
+                    "option_id": "move:rotateleft",
+                    "kind": "move_action",
+                    "action": "RotateLeft",
+                    "executable_now": True,
+                    "physical_action": True,
+                    "safety_source": "navigation-costmap",
+                }
+            ],
+        )
+
+        self.assertEqual(len(options), 1)
+        self.assertTrue(options[0]["option_id"].startswith("explore:route_step:"))
+        self.assertEqual(options[0]["kind"], "explore_route_step")
+        self.assertEqual(options[0]["action"], "RotateLeft")
+        self.assertEqual(options[0]["resolved_step_option_id"], "move:rotateleft")
+        self.assertEqual(options[0]["route_step"]["next_cell"], "0,3")
+        self.assertEqual(options[0]["route_step"]["goal_cell"], "-1,3")
+        self.assertEqual(options[0]["llm_priority"], "primary")
+
     def test_build_context_exposes_waypoint_before_rotation_frontier_in_loop(self) -> None:
         memory = WORKSPACE_ROOT / "memory" / "decision-context-waypoint-fixture"
         if memory.exists():
@@ -337,7 +391,7 @@ class DecisionContextBuilderTests(unittest.TestCase):
                         "-1,2": {"state": "unknown", "visited": False},
                     },
                     "recent_actions": [
-                        "LookDown",
+                        "MoveAhead",
                         "RotateLeft",
                         "RotateRight",
                         "RotateLeft",
@@ -377,6 +431,209 @@ class DecisionContextBuilderTests(unittest.TestCase):
         waypoint_index = option_ids.index("explore:waypoint:x0_z2")
         move_index = option_ids.index("move:moveahead")
         self.assertLess(waypoint_index, move_index)
+
+    def test_build_context_exposes_committed_route_step_before_other_explore_options(self) -> None:
+        memory = WORKSPACE_ROOT / "memory" / "decision-context-route-step-fixture"
+        if memory.exists():
+            shutil.rmtree(memory)
+        try:
+            write_json(memory / "mission-state.json", {"enabled": True, "mode": "SERVICE", "max_steps": 80})
+            write_json(
+                memory / "room-state.json",
+                {
+                    "room_name": "current_room",
+                    "room_complete": False,
+                    "active_frontier_goal": {
+                        "schema": "robot_cleaner_active_frontier_goal_v1",
+                        "status": "active",
+                        "mode": "frontier_cluster",
+                        "cell": "-1,3",
+                        "path": ["0,4", "0,3", "-1,3"],
+                    },
+                    "active_route": {
+                        "schema": "robot_cleaner_active_route_v1",
+                        "status": "active",
+                        "route_id": "route-frontier-xm1-z3-abcd1234",
+                        "goal_cell": "-1,3",
+                        "goal_type": "frontier_cluster",
+                        "current_cell": "0,4",
+                        "current_heading": "north",
+                        "next_cell": "0,3",
+                        "next_action": "RotateLeft",
+                        "path": ["0,4", "0,3", "-1,3"],
+                        "route_step": {
+                            "schema": "robot_cleaner_route_step_v1",
+                            "status": "active",
+                            "route_id": "route-frontier-xm1-z3-abcd1234",
+                            "step_index": 0,
+                            "action": "RotateLeft",
+                            "current_cell": "0,4",
+                            "current_heading": "north",
+                            "target_cell": "0,4",
+                            "next_cell": "0,3",
+                            "goal_cell": "-1,3",
+                            "desired_heading": "south",
+                            "progress_effect": "turnaround_toward_next_cell",
+                        },
+                    },
+                },
+            )
+            write_json(memory / "patrol-state.json", {"enabled": True, "mode": "SERVICE", "step_count": 18})
+            write_json(
+                memory / "service-task-state.json",
+                {"phase": "SEARCH_PICKUP_TARGET", "holding_object": False, "pickup_surface_policy": "floor-only"},
+            )
+            write_json(
+                memory / "navigation-costmap.json",
+                {
+                    "status": "success",
+                    "action_safety": {
+                        "MoveAhead": {"safe": False, "reason": "inflated_obstacle_in_swept_volume"},
+                        "RotateLeft": {"safe": True, "reason": "clear_swept_volume"},
+                        "RotateRight": {"safe": True, "reason": "clear_swept_volume"},
+                    },
+                },
+            )
+            write_json(
+                memory / "position-map.json",
+                {
+                    "pose": {"cell": "0,4", "heading": "north"},
+                    "frontiers": ["-1,3"],
+                    "cells": {
+                        "0,4": {"state": "free", "visited": True},
+                        "0,3": {"state": "free", "visited": True},
+                        "-1,3": {"state": "unknown", "visited": False},
+                    },
+                    "stats": {"visited_cell_count": 2, "collision_count": 0},
+                },
+            )
+            write_json(memory / "global-plan.json", {"status": "success"})
+            perception = memory / "yolo-current-rgbd.json"
+            write_json(
+                perception,
+                {
+                    "status": "success",
+                    "result_type": "scene_analyzed_yolo",
+                    "perception_backend": "yolo",
+                    "online_safe": True,
+                    "pickup_target_detected": False,
+                    "frontier_exists": True,
+                    "open_directions": ["left", "right"],
+                    "obstacle_ahead": False,
+                },
+            )
+
+            context = build_context(self.build_args(memory, perception))
+        finally:
+            if memory.exists():
+                shutil.rmtree(memory)
+
+        option_ids = [item["option_id"] for item in context["option_set"]["options"]]
+        route_ids = [item for item in option_ids if item.startswith("explore:route_step:")]
+        self.assertEqual(len(route_ids), 1)
+        route_id = route_ids[0]
+        self.assertEqual(context["navigation"]["active_route"]["goal_cell"], "-1,3")
+        self.assertEqual(context["explore_plan"]["mode"], "committed_route")
+        self.assertIn(route_id, context["option_set"]["primary_options"])
+        self.assertIn(route_id, context["option_set"]["explore_route_options"])
+        route_option = next(item for item in context["option_set"]["options"] if item["option_id"] == route_id)
+        self.assertEqual(route_option["kind"], "explore_route_step")
+        self.assertEqual(route_option["action"], "RotateLeft")
+        self.assertEqual(route_option["route_step"]["next_cell"], "0,3")
+
+    def test_build_context_prioritizes_recovery_when_route_blocked_and_camera_low(self) -> None:
+        memory = WORKSPACE_ROOT / "memory" / "decision-context-route-blocked-recovery-fixture"
+        if memory.exists():
+            shutil.rmtree(memory)
+        try:
+            write_json(memory / "mission-state.json", {"enabled": True, "mode": "SERVICE", "max_steps": 80})
+            write_json(
+                memory / "room-state.json",
+                {
+                    "room_name": "current_room",
+                    "room_complete": False,
+                    "active_frontier_goal": {
+                        "schema": "robot_cleaner_active_frontier_goal_v1",
+                        "status": "active",
+                        "mode": "frontier_cluster",
+                        "cell": "2,-4",
+                        "path": ["1,-4", "2,-4"],
+                    },
+                    "active_route": {
+                        "schema": "robot_cleaner_active_route_v1",
+                        "status": "blocked",
+                        "route_id": "route-frontier-x2-zm4-abcd1234",
+                        "goal_cell": "2,-4",
+                        "next_action": "MoveAhead",
+                        "blocked_reason": "inflated_obstacle_in_swept_volume",
+                    },
+                },
+            )
+            write_json(memory / "patrol-state.json", {"enabled": True, "mode": "SERVICE", "step_count": 22})
+            write_json(
+                memory / "service-task-state.json",
+                {"phase": "SEARCH_PICKUP_TARGET", "holding_object": False, "pickup_surface_policy": "floor-only"},
+            )
+            write_json(
+                memory / "navigation-costmap.json",
+                {
+                    "status": "success",
+                    "action_safety": {
+                        "MoveAhead": {"safe": False, "reason": "inflated_obstacle_in_swept_volume"},
+                        "MoveRight": {"safe": True, "reason": "clear_swept_volume", "observed_ratio": 1.0},
+                        "MoveLeft": {"safe": True, "reason": "clear_swept_volume", "observed_ratio": 1.0},
+                        "MoveBack": {"safe": True, "reason": "clear_swept_volume", "observed_ratio": 1.0},
+                        "RotateLeft": {"safe": True, "reason": "clear_swept_volume"},
+                        "RotateRight": {"safe": True, "reason": "clear_swept_volume"},
+                        "LookUp": {"safe": True, "reason": "camera_pitch_action"},
+                    },
+                },
+            )
+            write_json(
+                memory / "position-map.json",
+                {
+                    "pose": {"cell": "1,-4", "heading": "east"},
+                    "frontiers": ["1,-5", "2,-4"],
+                    "cells": {
+                        "1,-4": {"state": "free", "visited": True},
+                        "1,-5": {"state": "unknown", "visited": False},
+                        "2,-4": {"state": "unknown", "visited": False},
+                    },
+                    "recent_actions": ["MoveRight", "MoveRight", "LookDown"],
+                    "stats": {"visited_cell_count": 8, "collision_count": 0},
+                },
+            )
+            write_json(memory / "global-plan.json", {"status": "success"})
+            perception = memory / "yolo-current-rgbd.json"
+            write_json(
+                perception,
+                {
+                    "status": "success",
+                    "result_type": "scene_analyzed_yolo",
+                    "perception_backend": "yolo",
+                    "online_safe": True,
+                    "pickup_target_detected": False,
+                    "frontier_exists": True,
+                    "open_directions": ["left", "right"],
+                    "obstacle_ahead": False,
+                },
+            )
+
+            context = build_context(self.build_args(memory, perception))
+        finally:
+            if memory.exists():
+                shutil.rmtree(memory)
+
+        self.assertEqual(context["explore_plan"]["mode"], "route_blocked_recovery")
+        self.assertEqual(context["exploration"]["camera_posture"]["normalize_action"], "LookUp")
+        self.assertIn("recover:lookup", context["option_set"]["recovery_options"])
+        self.assertEqual(context["option_set"]["primary_options"][0], "recover:lookup")
+        waypoint_actions = [
+            item.get("action")
+            for item in context["option_set"]["options"]
+            if item.get("kind") == "explore_waypoint"
+        ]
+        self.assertNotIn("MoveRight", waypoint_actions)
 
     def test_rotation_loop_without_translation_exposes_planner_recovery(self) -> None:
         memory = WORKSPACE_ROOT / "memory" / "decision-context-planner-recovery-fixture"
@@ -999,6 +1256,39 @@ class DecisionContextBuilderTests(unittest.TestCase):
         self.assertTrue(candidate["executor_checks"]["cached"])
         self.assertFalse(candidate["executor_checks"]["cached_source_time_matches"])
         self.assertTrue(candidate["actionability"]["place_now"])
+
+    def test_route_step_option_does_not_depend_on_raw_move_option(self) -> None:
+        options = build_explore_route_step_options(
+            explore_plan={
+                "active_route": {
+                    "status": "active",
+                    "route_id": "route-frontier-x1-z0-abcd1234",
+                    "goal_cell": "1,0",
+                    "next_action": "MoveAhead",
+                    "route_step": {
+                        "status": "active",
+                        "route_id": "route-frontier-x1-z0-abcd1234",
+                        "step_index": 2,
+                        "action": "MoveAhead",
+                        "current_cell": "0,0",
+                        "current_heading": "east",
+                        "target_cell": "1,0",
+                        "next_cell": "1,0",
+                        "goal_cell": "1,0",
+                        "desired_heading": "east",
+                        "progress_effect": "advance_to_next_cell",
+                    },
+                }
+            },
+            move_options=[],
+        )
+
+        self.assertEqual(len(options), 1)
+        self.assertEqual(options[0]["kind"], "explore_route_step")
+        self.assertEqual(options[0]["action"], "MoveAhead")
+        self.assertEqual(options[0]["safety_source"], "active-route-costmap")
+        self.assertNotIn("resolved_step_option_id", options[0])
+        self.assertEqual(options[0]["route_step"]["next_cell"], "1,0")
 
 
 if __name__ == "__main__":

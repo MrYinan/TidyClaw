@@ -147,6 +147,25 @@ class ExplorationContextTests(unittest.TestCase):
         self.assertEqual(context["camera_posture"]["normalize_action"], "LookDown")
         self.assertEqual(context["camera_posture"]["last_camera_action"], "LookUp")
 
+    def test_camera_posture_requires_lookup_after_lookdown(self) -> None:
+        position_map = {
+            "pose": {"cell": "0,0", "heading": "north"},
+            "cells": {"0,0": {"state": "free", "visited": True}},
+            "frontiers": ["0,1"],
+            "recent_actions": ["MoveAhead", "LookDown", "RotateRight"],
+            "stats": {"visited_cell_count": 1, "collision_count": 0},
+        }
+
+        context = build_exploration_context(
+            position_map=position_map,
+            navigation_costmap={},
+            global_plan={},
+        )
+
+        self.assertTrue(context["camera_posture"]["needs_normalization"])
+        self.assertEqual(context["camera_posture"]["normalize_action"], "LookUp")
+        self.assertEqual(context["camera_posture"]["last_camera_action"], "LookDown")
+
     def test_frontier_candidate_penalizes_first_step_into_visited_cell(self) -> None:
         position_map = {
             "pose": {"cell": "1,3", "heading": "west"},

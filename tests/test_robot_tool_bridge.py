@@ -12,6 +12,29 @@ class RobotToolBridgeTests(unittest.TestCase):
         self.assertIn("--task-mode", command.args)
         self.assertIn("tidy", command.args)
         self.assertIn("memory/decision-context.json", command.args)
+        self.assertEqual(command.args[command.args.index("--observe-retries") + 1], "0")
+        self.assertEqual(command.args[command.args.index("--vision-timeout") + 1], "30")
+        self.assertEqual(command.args[command.args.index("--yolo-timeout") + 1], "60")
+        self.assertEqual(command.args[command.args.index("--context-timeout") + 1], "45")
+        self.assertEqual(command.timeout_seconds, 180)
+
+    def test_prepare_endpoint_allows_explicit_observe_retry(self) -> None:
+        command = command_for_request(
+            "/tools/prepare-decision-turn",
+            {
+                "timeout_seconds": 90,
+                "vision_timeout_seconds": 20,
+                "yolo_timeout_seconds": 40,
+                "context_timeout_seconds": 25,
+                "observe_retries": 1,
+            },
+        )
+
+        self.assertEqual(command.args[command.args.index("--observe-retries") + 1], "1")
+        self.assertEqual(command.args[command.args.index("--vision-timeout") + 1], "20")
+        self.assertEqual(command.args[command.args.index("--yolo-timeout") + 1], "40")
+        self.assertEqual(command.args[command.args.index("--context-timeout") + 1], "25")
+        self.assertEqual(command.timeout_seconds, 205)
 
     def test_execute_endpoint_maps_only_option_id(self) -> None:
         command = command_for_request("/tools/execute-option", {"option_id": "move:moveahead"})
