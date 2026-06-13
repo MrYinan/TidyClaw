@@ -2616,6 +2616,21 @@ class NavigationMemory:
 
         forward_streak = self._recent_action_streak(recent_sequence, "MoveAhead")
         forward_progress_count = self._recent_forward_progress_count(recent_sequence)
+        active_frontier = room.get("active_frontier_goal") if isinstance(room.get("active_frontier_goal"), dict) else None
+        if active_frontier and str(active_frontier.get("cell") or "").strip():
+            sticky_frontier = self._recommend_global_frontier(
+                room=room,
+                cell=cell,
+                heading=heading,
+                analysis=analysis,
+                recent_actions=recent_sequence,
+                recent_failed_action=recent_failed_action,
+                goal_type=goal_type,
+                allow_backtrack=True,
+            )
+            if sticky_frontier is not None:
+                return sticky_frontier
+
         corner_bypass = self._local_front_corner_bypass(
             room=room,
             cell=cell,

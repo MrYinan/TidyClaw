@@ -29,8 +29,11 @@ from scripts.execute_option import (
     run_script,
     script_result_payload,
 )
+from scripts.exploration_goal_manager import update_exploration_goals
 from scripts.local_costmap import LocalCostmap
 from scripts.option_state_sync import ensure_tool_mission_active
+from scripts.route_manager import update_active_route
+from scripts.runtime_config import apply_runtime_environment, restore_runtime_environment
 
 
 JsonDict = dict[str, Any]
@@ -141,10 +144,12 @@ def summarize_refresh(refresh: JsonDict) -> JsonDict:
         "result_type": refresh.get("result_type"),
         "vision_status": vision_data.get("status"),
         "vision_result_type": vision_data.get("result_type"),
+        "vision_elapsed_ms": vision.get("elapsed_ms"),
         "image_path": vision_data.get("image_path"),
         "depth_path": vision_data.get("depth_path"),
         "perception_status": perception_data.get("status"),
         "perception_result_type": perception_data.get("result_type"),
+        "perception_elapsed_ms": perception.get("elapsed_ms"),
         "perception_backend": perception_data.get("perception_backend"),
         "candidate_count": perception_data.get("candidate_count"),
         "pickup_target_detected": perception_data.get("pickup_target_detected"),
@@ -155,22 +160,192 @@ def summarize_refresh(refresh: JsonDict) -> JsonDict:
     }
 
 
+def as_dict(value: Any) -> JsonDict:
+    return value if isinstance(value, dict) else {}
+
+
+def as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def bounded_items(value: Any, *, limit: int) -> list[Any]:
+    return as_list(value)[: max(0, int(limit))]
+
+
+def compact_candidate(candidate: Any) -> JsonDict:
+    data = as_dict(candidate)
+    compact = {
+        key: data.get(key)
+        for key in (
+            "candidate_id",
+            "track_id",
+            "label",
+            "object_label",
+            "target_label",
+            "surface_label",
+            "surface_type",
+            "confidence",
+            "distance_m",
+            "bearing_deg",
+            "location_hint",
+            "pickup_now",
+            "place_now",
+            "place_precheck_ready",
+            "final_place_ready",
+            "precheck_ok",
+            "needs_alignment",
+            "needs_approach",
+            "interaction_point",
+            "required_next",
+            "reason",
+        )
+        if key in data
+    }
+    placement_points = as_list(data.get("placement_points"))
+    if placement_points:
+        compact["placement_points_sample"] = placement_points[:8]
+        compact["placement_points_count"] = len(placement_points)
+    return compact
+
+
+def compact_decision_context(context: JsonDict, *, context_path: Path) -> JsonDict:
+    """Return the bounded public state that is safe to write into OpenClaw chat.
+
+    The full context remains on disk at ``context_path``. Tool responses should
+    not embed the full file because it contains large intermediate perception
+    and mapping fields that make OpenClaw session writes slow and fragile.
+    """
+
+    option_set = as_dict(context.get("option_set"))
+    navigation = as_dict(context.get("navigation"))
+    exploration = as_dict(context.get("exploration"))
+    explore_plan = as_dict(context.get("explore_plan"))
+    worklist = as_dict(context.get("worklist"))
+    current_view = as_dict(worklist.get("current_view"))
+    perception = as_dict(context.get("perception"))
+
+    return {
+        "status": context.get("status"),
+        "schema": context.get("schema"),
+        "generated_at": context.get("generated_at"),
+        "full_context_path": display_path(context_path),
+        "task": context.get("task"),
+        "mission": {
+            key: context.get(key)
+            for key in (
+                "task_mode",
+                "phase",
+                "holding_object",
+                "held_object",
+                "room_complete",
+                "done_reason",
+            )
+            if key in context
+        },
+        "perception": {
+            key: perception.get(key)
+            for key in (
+                "status",
+                "result_type",
+                "perception_backend",
+                "source_info",
+                "pickup_target_detected",
+                "place_receptacle_detected",
+                "candidate_count",
+                "source_time",
+            )
+            if key in perception
+        },
+        "navigation": {
+            "map_backend": navigation.get("map_backend"),
+            "current_pose": navigation.get("current_pose") or exploration.get("current_pose"),
+            "coverage": navigation.get("coverage") or exploration.get("coverage"),
+            "active_frontier_goal": navigation.get("active_frontier_goal")
+            or exploration.get("active_frontier_goal"),
+            "active_route": navigation.get("active_route") or exploration.get("active_route"),
+            "local_costmap": navigation.get("local_costmap"),
+        },
+        "exploration": {
+            key: exploration.get(key)
+            for key in (
+                "recent_path",
+                "revisit_counts",
+                "frontier_candidates",
+                "loop_warning",
+                "avoid_actions",
+                "low_confidence_moves",
+                "camera_posture",
+                "coverage_patrol",
+            )
+            if key in exploration
+        },
+        "explore_plan": {
+            key: explore_plan.get(key)
+            for key in (
+                "mode",
+                "status",
+                "reason",
+                "active_frontier_goal",
+                "active_route",
+                "selected_frontier",
+                "selected_option_id",
+                "suppressed_frontier_cells",
+                "required_next",
+            )
+            if key in explore_plan
+        },
+        "worklist": {
+            "held_object": worklist.get("held_object"),
+            "pickup_candidate_count": len(as_list(current_view.get("pickup_candidates"))),
+            "place_candidate_count": len(as_list(current_view.get("place_candidates"))),
+            "pickup_candidates": [
+                compact_candidate(item) for item in bounded_items(current_view.get("pickup_candidates"), limit=4)
+            ],
+            "place_candidates": [
+                compact_candidate(item) for item in bounded_items(current_view.get("place_candidates"), limit=4)
+            ],
+        },
+        "option_set": option_set,
+        "done_readiness": context.get("done_readiness"),
+        "consistency_warnings": context.get("consistency_warnings") or [],
+    }
+
+
 def build_decision_context(args: argparse.Namespace, output_path: Path) -> ScriptResult:
     return run_script(
         DECISION_CONTEXT_SCRIPT,
         build_context_command_args(args, output_path),
-        timeout_seconds=max(1, int(args.timeout)),
+        timeout_seconds=max(1, int(args.context_timeout)),
     )
 
 
 def prepare_decision_turn(args: argparse.Namespace) -> JsonDict:
     output_path = resolve_workspace_path(args.output)
+    runtime_environment = apply_runtime_environment()
+    previous_runtime_env = runtime_environment.get("previous_env") if isinstance(runtime_environment.get("previous_env"), dict) else {}
+    try:
+        return _prepare_decision_turn(args, output_path=output_path, runtime_environment=runtime_environment)
+    finally:
+        restore_runtime_environment(previous_runtime_env)
+
+
+def _prepare_decision_turn(
+    args: argparse.Namespace,
+    *,
+    output_path: Path,
+    runtime_environment: JsonDict,
+) -> JsonDict:
+    started_at = time.time()
     attempts: list[JsonDict] = []
     refresh: JsonDict = {}
     mission_activation = ensure_tool_mission_active(memory_dir=MEMORY_DIR, mode="SERVICE")
 
     for attempt_index in range(1, max(0, int(args.observe_retries)) + 2):
-        refresh = run_observe_refresh(timeout_seconds=max(1, int(args.timeout)))
+        refresh = run_observe_refresh(
+            timeout_seconds=max(1, int(args.timeout)),
+            vision_timeout_seconds=max(1, int(args.vision_timeout)),
+            yolo_timeout_seconds=max(1, int(args.yolo_timeout)),
+        )
         attempts.append(summarize_refresh(refresh))
         if refresh.get("status") == "success":
             break
@@ -180,8 +355,10 @@ def prepare_decision_turn(args: argparse.Namespace) -> JsonDict:
             "status": "error",
             "result_type": "decision_turn_prepare_failed",
             "stage": "observe_refresh",
+            "runtime_environment": runtime_environment,
             "mission_activation": mission_activation,
             "attempts": attempts,
+            "elapsed_ms": round((time.time() - started_at) * 1000, 1),
             "required_next": "retry_prepare_decision_turn_or_stop",
         }
         append_trace({"event": "decision_turn_prepare_failed", "result": result})
@@ -197,6 +374,24 @@ def prepare_decision_turn(args: argparse.Namespace) -> JsonDict:
             "message": str(exc),
         }
 
+    try:
+        exploration_goals = update_exploration_goals(memory_dir=MEMORY_DIR, persist=True)
+    except Exception as exc:
+        exploration_goals = {
+            "status": "error",
+            "result_type": "exploration_goal_update_failed",
+            "message": str(exc),
+        }
+
+    try:
+        active_route = update_active_route(memory_dir=MEMORY_DIR, persist=True)
+    except Exception as exc:
+        active_route = {
+            "status": "error",
+            "result_type": "active_route_update_failed",
+            "message": str(exc),
+        }
+
     context_result = build_decision_context(args, output_path)
     context = context_result.data if isinstance(context_result.data, dict) else {}
     if context_result.returncode != 0 or context.get("status") != "success":
@@ -204,32 +399,44 @@ def prepare_decision_turn(args: argparse.Namespace) -> JsonDict:
             "status": "error",
             "result_type": "decision_turn_prepare_failed",
             "stage": "build_decision_context",
+            "runtime_environment": runtime_environment,
             "mission_activation": mission_activation,
             "observe_refresh": attempts[-1] if attempts else {},
             "local_costmap": local_costmap,
+            "exploration_goals": exploration_goals,
+            "active_route": active_route,
             "context_builder": script_result_payload(context_result),
+            "elapsed_ms": round((time.time() - started_at) * 1000, 1),
             "required_next": "inspect_decision_context_builder",
         }
         append_trace({"event": "decision_turn_prepare_failed", "result": result})
         return result
 
     option_set = context.get("option_set") if isinstance(context.get("option_set"), dict) else {}
+    decision_context_public = compact_decision_context(context, context_path=output_path)
     result = {
         "status": "success",
         "result_type": "decision_turn_prepared",
         "schema": "robot_cleaner_decision_turn_v1",
         "prepared_at": now_iso(),
+        "runtime_environment": runtime_environment,
         "mission_activation": mission_activation,
         "context_path": display_path(output_path),
         "perception_path": display_path(DEFAULT_PERCEPTION_PATH),
         "observe_refresh": attempts[-1] if attempts else {},
         "local_costmap": local_costmap,
-        "decision_context": context,
+        "exploration_goals": exploration_goals,
+        "active_route": active_route,
+        "context_builder": script_result_payload(context_result),
+        "decision_context": decision_context_public,
+        "full_decision_context_path": display_path(output_path),
+        "full_decision_context_written": True,
         "option_set": option_set,
         "model_decision_required": True,
         "rule_baseline_option_id": option_set.get("rule_baseline_option_id"),
         "option_count": len(option_set.get("options") or []) if isinstance(option_set.get("options"), list) else 0,
         "consistency_warnings": context.get("consistency_warnings") or [],
+        "elapsed_ms": round((time.time() - started_at) * 1000, 1),
     }
     append_trace(
         {
@@ -238,9 +445,15 @@ def prepare_decision_turn(args: argparse.Namespace) -> JsonDict:
             "model_decision_required": True,
             "rule_baseline_option_id": result.get("rule_baseline_option_id"),
             "option_count": result.get("option_count"),
+            "elapsed_ms": result.get("elapsed_ms"),
             "context_path": result.get("context_path"),
+            "observe_refresh": result.get("observe_refresh"),
+            "context_builder": result.get("context_builder"),
+            "runtime_environment": runtime_environment,
             "mission_activation": mission_activation,
             "local_costmap": result.get("local_costmap"),
+            "exploration_goals": result.get("exploration_goals"),
+            "active_route": result.get("active_route"),
         }
     )
     return result
@@ -251,10 +464,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task-mode", choices=("auto", "tidy", "clean"), default="tidy")
     parser.add_argument("--output", default=str(DEFAULT_CONTEXT_PATH))
     parser.add_argument("--timeout", type=int, default=60, help="Timeout per backend script in seconds.")
+    parser.add_argument("--vision-timeout", type=int, default=30, help="Timeout for get-vision in seconds.")
+    parser.add_argument("--yolo-timeout", type=int, default=60, help="Timeout for YOLO service analysis in seconds.")
+    parser.add_argument(
+        "--context-timeout",
+        type=int,
+        default=45,
+        help="Timeout for decision_context_builder.py in seconds.",
+    )
     parser.add_argument(
         "--observe-retries",
         type=int,
-        default=1,
+        default=0,
         help="Retry observe/perception this many times before failing the turn.",
     )
     parser.add_argument("--max-candidates", type=int, default=6)

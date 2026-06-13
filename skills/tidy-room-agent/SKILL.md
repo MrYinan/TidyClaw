@@ -1,6 +1,6 @@
 ---
 name: tidy-room-agent
-description: 正式的整理房间大模型入口，只通过 robot_cleaner_* 稳定工具选择并执行当前轮 option_id。
+description: 正式的整理房间大模型入口，只通过 robot_cleaner_* 稳定工具读取当前轮状态并选择一个 option_id。
 metadata: {"openclaw":{"emoji":"robot"}}
 ---
 
@@ -8,7 +8,7 @@ metadata: {"openclaw":{"emoji":"robot"}}
 
 这是 OpenClaw 大模型参与整理房间任务的正式入口。
 
-你的职责不是直接控制机器人底层动作，而是每一轮读取稳定工具返回的公开状态，从 `option_set.options` 中选择一个已经存在的 `option_id`，再交给执行工具验证和执行。
+你的职责不是直接控制机器人底层动作，而是每一轮读取稳定工具返回的公开状态，从当前 `option_set.options` 中选择一个已经存在的 `option_id`，再交给执行工具验证和执行。
 
 ## 可用工具
 
@@ -20,7 +20,7 @@ metadata: {"openclaw":{"emoji":"robot"}}
 - `robot_cleaner_report()`
 - `robot_cleaner_stop({ reason })`
 
-不要直接调用底层机器人 skill 或脚本，包括但不限于：
+不要直接调用底层 skill、脚本或自由 `exec`，包括但不限于：
 
 - `get-vision`
 - `perceive-scene-yolo`
@@ -32,89 +32,93 @@ metadata: {"openclaw":{"emoji":"robot"}}
 - `execute-option`
 - `patrol-runner`
 
-不要使用自由 `exec` 拼接机器人命令。所有动作必须通过 `robot_cleaner_execute_option` 完成。
+所有物理动作必须通过 `robot_cleaner_execute_option({ option_id })` 完成。
 
-## 主循环
+## 每轮流程
 
-每一轮按固定流程执行：
+每一轮必须按固定流程执行：
 
 1. 调用 `robot_cleaner_prepare_decision_turn()`。
-2. 读取返回结果中的 `option_set.options`、`option_set.primary_options`、`option_set.fallback_options` 和 `option_set.selection_contract`。
-3. 只选择一个当前轮已经存在的 `option_id`。
+2. 读取返回结果中的 `navigation_core`、`option_set.options`、`option_set.primary_options`、`option_set.fallback_options` 和 `option_set.selection_contract`。
+3. 只从当前轮 `option_set.options` 里选择一个已经存在且 `executable_now=true` 的 `option_id`。
 4. 调用 `robot_cleaner_execute_option({ option_id })`。
-5. 根据执行结果决定继续、重新感知、报告或停止。
+5. 执行后下一轮必须重新调用 `robot_cleaner_prepare_decision_turn()`，不能复用旧 option。
 
-`option_set.rule_baseline_option_id` 只用于程序规则基线、调试和回归测试。它不是推荐动作，也不是必须执行的动作。
+`option_set.rule_baseline_option_id` 只用于程序基线、调试和回归测试。它不是推荐动作，也不是必须执行的动作。
 
-## 选择层级
+## 决策优先级
 
-大模型应该在目标层做决策，不要把常规探索变成直接控制底层运动。
+正常优先级：
 
-优先级顺序：
+1. 如果 `option_set.recovery_options` 非空，优先选择一个 `recover:*`。
+2. 如果存在合适的 `pick:*`，优先拾取地面或近地面可拾取物。
+3. 如果已经持有物体，优先选择 `place_precheck:*` 或 `place:*`。
+4. 如果 `navigation_core.state=following_active_route`，必须优先选择当前轮的 `explore:route_step:*`。
+5. 如果没有 pick/place/recovery/route step，再选择目标级探索选项：`explore:waypoint:*` 或 `explore:frontier:*`。
+6. 只有没有目标级 primary option，或执行失败后需要恢复时，才选择底层 `move:*`。
+7. `done:probe` 只用于检查完成条件，不能把一次放置成功当成整个房间完成。
 
-1. 如果存在合适的 `pick:*`，优先完成地面/近地面可拾取物的拾取。
-2. 如果已经持有物体，优先选择合适的 `place_precheck:*` 或 `place:*`。
-3. 如果没有立即可执行的 pick/place，并且存在 `explore:frontier:*`，必须优先从 `explore:frontier:*` 中选择探索目标。
-4. 只有在没有目标级 primary option，或者执行失败需要恢复时，才选择底层 `move:*`。
-5. `done:probe` 只用于检查完成条件，不能把一次放置成功当成房间完成。
+## Navigation Core 规则
+
+`navigation_core` 是导航状态机摘要。探索导航时必须优先相信它，而不是自己用局部文字描述重新推理路线。
 
 硬规则：
 
-- 有 `explore:frontier:*` 时，正常探索不要直接选择 `move:*`。
-- `move:*` 是底层 motor fallback，不是常规探索入口。
-- `explore:frontier:*` 表示选择一个当前轮探索目标；执行器只会把它解析成一个经过验证的物理动作。下一轮必须重新感知和重新决策。
-- 不要发明、改写、截断或组合 `option_id`。
-- 如果 `option_set.primary_options` 非空，优先从其中选择；只有恢复或无目标级选项时才使用 `option_set.fallback_options`。
+- 当 `navigation_core.state=following_active_route` 时，说明后端已经锁定当前 frontier 路线。本轮应选择 `explore:route_step:*`，不要改选 `explore:waypoint:*`、`explore:frontier:*` 或底层 `move:*`。
+- 当 `navigation_core.state=camera_recovery_required` 时，优先选择对应的 `recover:*`，恢复相机俯仰后再探索。
+- 当 `navigation_core.state=route_blocked_recovery` 或 `planner_recovery_required` 时，优先选择 `recover:*`，不要硬走旧路线。
+- 当 `navigation_core.route_locked=true` 时，除非当前轮没有 route/recovery option，否则不要使用 fallback option。
+- `explore:route_step:*` 仍然只执行一个经过验证的物理动作；执行后下一轮必须重新 prepare。
 
 ## Option 类型
 
 - `observe:refresh`：刷新 RGB-D 观察和结构化感知，不是物理动作。
-- `pick:*`：执行一个已验证的拾取动作。
-- `place_precheck:*`：只做放置预检查，不执行放置。预检查成功后，下一轮必须重新调用 `robot_cleaner_prepare_decision_turn()`，等待新的 `place:*` 进入 option set。
-- `place:*`：执行一个已通过执行层检查的放置动作。成功只表示一个整理子任务完成，不表示整个房间完成。
+- `pick:*`：执行一个已经验证的拾取动作。
+- `place_precheck:*`：只做放置预检查，不执行放置。成功后下一轮重新 prepare，等待新的 `place:*`。
+- `place:*`：执行一个已经通过执行层检查的放置动作。成功只表示一个整理子任务完成。
+- `explore:route_step:*`：继续当前锁定 frontier 路线的一步动作，是常规探索时最优先的导航 option。
+- `explore:waypoint:*`：规划器给出的安全一步路点，通常用于摆脱旋转循环或补充局部探索。
 - `explore:frontier:*`：选择一个 frontier 探索目标，本轮只执行一个解析后的安全动作。
-- `move:*`：底层运动动作，只作为 fallback/recovery 使用。
+- `move:*`：底层运动动作，只作为 fallback 或 recovery 使用。
 - `done:probe`：检查是否满足房间完成条件。
 
-## 选择时必须检查
+## 选择前检查
+
+选择 option 前必须检查：
 
 - 当前是否持有物体。
-- 当前阶段是在寻找拾取物，还是寻找放置面。
-- `option_id` 是否确实在当前轮 `option_set.options` 中。
+- 当前阶段是在找拾取物，还是找放置面。
+- `option_id` 是否确实存在于当前轮 `option_set.options`。
 - `executable_now` 是否为 `true`。
-- `fallback_only` 是否为 `true`。如果是，除非处于恢复或没有目标级选项，否则不要选。
-- `llm_priority` 和 `decision_level`。优先选择 `decision_level` 为 `task` 或 `goal` 的 option。
+- `fallback_only` 是否为 `true`。如果是，除非没有 primary option 或处于恢复状态，否则不要选。
+- `navigation_core.state` 和 `navigation_core.required_next`。
 - `exploration.loop_warning`、`exploration.recent_path`、`exploration.avoid_actions`，避免重复进入刚走过或刚碰撞的位置。
 
-## 结果处理
+## 执行结果处理
 
 如果 `robot_cleaner_execute_option` 返回成功：
 
-- 对于物理动作，继续下一轮 `robot_cleaner_prepare_decision_turn()`。
-- 对于 `observe:refresh`，继续下一轮 `robot_cleaner_prepare_decision_turn()`。
-- 对于 `place_precheck:*`，继续下一轮 `robot_cleaner_prepare_decision_turn()`。
+- 对于物理动作，下一轮继续调用 `robot_cleaner_prepare_decision_turn()`。
+- 对于 `observe:refresh`，下一轮继续调用 `robot_cleaner_prepare_decision_turn()`。
+- 对于 `place_precheck:*`，下一轮继续调用 `robot_cleaner_prepare_decision_turn()`。
 - 对于 `done:probe`，只有结果明确表示房间完成时，才调用 `robot_cleaner_report()`。
 
 如果返回失败：
 
 - 如果结果包含 `required_next`，优先按 `required_next` 处理。
 - 如果提示 context 过期、状态不一致或候选不可执行，重新调用 `robot_cleaner_prepare_decision_turn()`。
-- 如果连续失败且没有可恢复动作，调用 `robot_cleaner_status()` 查看状态，并向用户说明当前阻塞点。
-
-## 状态和报告
-
-- 用户问当前进度时，调用 `robot_cleaner_status()`。
-- 用户要求总结、验收或任务可能完成时，调用 `robot_cleaner_report()`。
-- 用户要求停止、暂停或继续执行不安全时，调用 `robot_cleaner_stop({ reason })`。
+- 如果返回 `selected_option_not_found`，说明选了旧 option。不要重试旧 option，必须重新 prepare。
+- 如果连续失败且没有可恢复动作，调用 `robot_cleaner_status()` 查看状态，并向用户说明阻塞点。
 
 ## 上下文边界
 
 不要读取完整地图、完整语义地图、完整对象记忆或完整历史轨迹。
 
-大模型只应该依赖稳定工具返回的公开摘要：
+大模型只依赖稳定工具返回的公开摘要：
 
 - 当前轮 `decision_context`
-- 有限的 `option_set`
+- 当前轮 `navigation_core`
+- 当前轮 `option_set`
 - 执行工具返回的验证结果
 - `robot_cleaner_status()` 和 `robot_cleaner_report()` 的摘要
 
@@ -123,29 +127,3 @@ metadata: {"openclaw":{"emoji":"robot"}}
 ```powershell
 python scripts\robot_tool_bridge.py
 ```
-
-## Recovery Rules
-
-当 `option_set.recovery_options` 非空，或 `exploration.dead_end.active=true` 时，当前轮处于局部阻塞/死角恢复状态。
-
-硬规则：
-
-- 优先从 `option_set.recovery_options` 中选择一个 `recover:*`，不要反复选择 `observe:refresh` 或 `done:probe`。
-- `recover:*` 仍然只执行一个经过执行器验证的动作；执行后下一轮必须重新调用 `robot_cleaner_prepare_decision_turn()`。
-- 如果 `robot_cleaner_execute_option` 返回 `selected_option_not_found`，说明你选择了当前 `option_set.options` 中不存在的旧 `option_id`。不要解释为系统已过期，也不要重试旧 `option_id`；必须重新调用 `robot_cleaner_prepare_decision_turn()` 并从新的 `option_set.options` 里重新选择。
-- 不要把“上一轮可前进”当成“这一轮仍可前进”。每一轮都以最新 `navigation.local_costmap.action_safety` 和当前 `option_set.options` 为准。
-- 如果只剩 `observe:refresh` 和 `done:probe`，并且 `done_readiness.can_finish` 不为 true，应先 `observe:refresh`，随后报告当前恢复受限状态，不能直接宣布房间完成。
-
-## Camera Posture Rules
-
-## Explore Planner Rules
-
-- `explore:waypoint:*` 是目标级探索选项，不是底层 `move:*`。它表示规划器发现一个安全的一步路点，常用于打破原地左右转循环。
-- 当 `explore_plan.mode=break_rotation_loop` 且 `option_set.explore_waypoint_options` 非空时，必须优先从 `explore:waypoint:*` 中选择，不要继续选择只解析成 `RotateLeft`/`RotateRight` 的 `explore:frontier:*`。
-- `explore:frontier:*` 仍然是正常 frontier 目标；但如果某些 frontier 被 `explore_plan.suppressed_frontiers` 标记，说明它们本轮容易导致转向震荡或朝向已知阻塞区域，不应绕过 planner 选择旧的底层 `move:*`。
-- 每个 `explore:waypoint:*` 和 `explore:frontier:*` 仍然只执行一个经过验证的物理动作；执行后下一轮必须重新调用 `robot_cleaner_prepare_decision_turn()`。
-
-- 如果上一轮执行过 `recover:lookup`，下一轮 `robot_cleaner_prepare_decision_turn()` 可能会返回 `exploration.camera_posture.needs_normalization=true`。
-- 当 `option_set.recovery_options` 里存在 `recover:lookdown` 时，必须优先选择 `recover:lookdown`，恢复默认/地面可见视角后再继续 `explore:frontier:*`。
-- 不要在相机仍处于 LookUp 视角时判断“没有地面可拾取物”并继续长距离探索；先恢复视角，再观察和决策。
-- `recover:lookdown` 成功后，下一轮仍必须重新调用 `robot_cleaner_prepare_decision_turn()`，不要复用上一轮的 `explore:*` 或 `move:*`。

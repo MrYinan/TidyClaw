@@ -15,6 +15,7 @@ The project still contains legacy "robot-cleaner" names, but the active V2 line 
 - Local control service: `http://127.0.0.1:5000`
 - Default vision image: `D:\photos\openclaw_robot_vision.jpg`
 - Default workspace Python: `D:\Anaconda\envs\robot\python.exe`
+- ⚠️ 需要 open3d/ultralytics/torch 等模块的服务必须用 `D:\Anaconda\envs\robot\python.exe` 启动，不能用系统默认 Python(D:\Python\python.exe)
 
 ## Core Skills And Scripts
 

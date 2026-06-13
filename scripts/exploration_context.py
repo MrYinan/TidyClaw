@@ -54,6 +54,11 @@ except ImportError:  # pragma: no cover - direct script execution
         right_heading,
     )
 
+try:
+    from scripts.map_backend import load_map_backend
+except ImportError:  # pragma: no cover - direct script execution
+    from map_backend import load_map_backend
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MEMORY_DIR = REPO_ROOT / "memory"
@@ -402,15 +407,21 @@ def build_camera_posture(recent_actions: Sequence[Any]) -> JsonDict:
             offset -= 1
         offset = max(-2, min(2, offset))
     last_camera_action = camera_actions[-1] if camera_actions else ""
-    needs_normalization = bool(last_camera_action == "LookUp" or offset > 0)
-    normalize_action = "LookDown" if needs_normalization else ""
+    needs_normalization = bool(offset != 0)
+    normalize_action = "LookDown" if offset > 0 else "LookUp" if offset < 0 else ""
+    if offset > 0:
+        reason = "camera_pitch_above_default"
+    elif offset < 0:
+        reason = "camera_pitch_below_default"
+    else:
+        reason = ""
     return clean_empty(
         {
             "last_camera_action": last_camera_action,
             "pitch_offset_steps": offset,
             "needs_normalization": needs_normalization,
             "normalize_action": normalize_action,
-            "reason": "last_camera_action_looked_up" if needs_normalization else "",
+            "reason": reason,
         }
     )
 
@@ -472,6 +483,7 @@ def build_frontier_candidates(
     cluster_sizes = _frontier_cluster_sizes(frontiers)
     recent_cells = {str(item.get("cell")) for item in recent_path[-8:] if item.get("cell")}
     selected_goal = str(global_plan.get("selected_goal_cell") or "")
+    active_goal = str(as_dict(position_map.get("active_frontier_goal")).get("cell") or "")
     planner_next_action = str(global_plan.get("next_action") or "")
     candidates: list[JsonDict] = []
     for frontier in frontiers:
@@ -486,6 +498,7 @@ def build_frontier_candidates(
         recent_penalty = 1.0 if frontier in recent_cells else 0.0
         seen_penalty = 0.35 * float(visited_or_seen_count(cells, frontier))
         planner_selected = frontier == selected_goal
+        active_selected = frontier == active_goal
         first_action = frontier_first_action_hint(
             current_heading=current_heading,
             direction=direction,
@@ -517,6 +530,7 @@ def build_frontier_candidates(
             - seen_penalty
             - backtrack_penalty
             + (1.2 if planner_selected else 0.0)
+            + (3.0 if active_selected else 0.0)
         )
         reasons: list[str] = []
         if unknown_gain >= 2:
@@ -533,6 +547,8 @@ def build_frontier_candidates(
             reasons.append("first_step_enters_visited_cell")
         if planner_selected:
             reasons.append("matches_existing_global_plan")
+        if active_selected:
+            reasons.append("active_frontier_goal")
         candidates.append(
             clean_empty(
                 {
@@ -543,6 +559,7 @@ def build_frontier_candidates(
                     "unknown_neighbor_count": unknown_gain,
                     "cluster_size": cluster,
                     "planner_selected": planner_selected,
+                    "active_frontier_goal": active_selected,
                     "score": round(score, 3),
                     "reasons": reasons,
                     "first_action_policy": "rotate_or_forward_only",
@@ -998,6 +1015,8 @@ def build_exploration_context(
     )
 
     stats = as_dict(position_map.get("stats"))
+    active_frontier_goal = as_dict(position_map.get("active_frontier_goal"))
+    coverage_patrol = as_dict(position_map.get("coverage_patrol"))
     return clean_empty(
         {
             "schema": EXPLORATION_CONTEXT_SCHEMA,
@@ -1013,6 +1032,23 @@ def build_exploration_context(
                 "visited_cell_count": number_or_none(stats.get("visited_cell_count")),
                 "frontier_count": len(as_list(position_map.get("frontiers"))),
                 "collision_count": number_or_none(stats.get("collision_count")),
+            },
+            "active_frontier_goal": {
+                "cell": active_frontier_goal.get("cell"),
+                "cluster_size": active_frontier_goal.get("cluster_size"),
+                "next_action": active_frontier_goal.get("next_action"),
+                "next_cell": active_frontier_goal.get("next_cell"),
+                "last_distance": active_frontier_goal.get("last_distance"),
+                "stale_count": active_frontier_goal.get("stale_count"),
+                "reason": active_frontier_goal.get("reason"),
+            },
+            "coverage_patrol": {
+                "active": coverage_patrol.get("active"),
+                "mode": coverage_patrol.get("mode"),
+                "target_cell": coverage_patrol.get("target_cell"),
+                "frontier_count": coverage_patrol.get("frontier_count"),
+                "visited_cell_count": coverage_patrol.get("visited_cell_count"),
+                "reason": coverage_patrol.get("reason"),
             },
             "recent_path": recent_path,
             "revisit_counts": revisit_counts,
@@ -1052,8 +1088,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     memory_dir = Path(args.memory_dir)
+    map_snapshot = load_map_backend(memory_dir).load_snapshot()
     result = build_exploration_context(
-        position_map=load_json(memory_dir / "position-map.json"),
+        position_map=map_snapshot.to_position_status(),
         navigation_costmap=load_json(memory_dir / "navigation-costmap.json"),
         global_plan=load_json(memory_dir / "global-plan.json"),
         max_frontier_candidates=max(1, int(args.max_frontiers)),

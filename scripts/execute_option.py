@@ -39,6 +39,7 @@ DECISION_CONTEXT_SCHEMA = "robot_cleaner_decision_context_v1"
 PLACE_PRECHECK_CACHE_SCHEMA = "robot_cleaner_place_precheck_cache_v1"
 PHYSICAL_KINDS = {
     "move_action",
+    "explore_route_step",
     "explore_frontier",
     "explore_waypoint",
     "recovery_action",
@@ -83,6 +84,7 @@ class ScriptResult:
     stdout: str
     stderr: str
     data: JsonDict
+    elapsed_ms: float = 0.0
 
 
 def now_iso() -> str:
@@ -211,6 +213,7 @@ def run_script(script: Path, args: Sequence[str], *, timeout_seconds: int) -> Sc
     command = [sys.executable, str(script), *args]
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
+    started_at = time.time()
     try:
         completed = subprocess.run(
             command,
@@ -232,6 +235,7 @@ def run_script(script: Path, args: Sequence[str], *, timeout_seconds: int) -> Sc
             stdout=completed.stdout,
             stderr=completed.stderr,
             data=data,
+            elapsed_ms=round((time.time() - started_at) * 1000, 1),
         )
     except subprocess.TimeoutExpired as exc:
         return ScriptResult(
@@ -244,6 +248,7 @@ def run_script(script: Path, args: Sequence[str], *, timeout_seconds: int) -> Sc
                 "result_type": "error_script_timeout",
                 "message": f"script timed out after {timeout_seconds}s",
             },
+            elapsed_ms=round((time.time() - started_at) * 1000, 1),
         )
 
 
@@ -262,6 +267,7 @@ def script_result_payload(result: ScriptResult) -> JsonDict:
         "command": short_command(result.command),
         "returncode": result.returncode,
         "data": result.data,
+        "elapsed_ms": result.elapsed_ms,
         "stderr_tail": result.stderr[-1000:] if result.stderr else "",
     }
 
@@ -356,6 +362,16 @@ def option_allows_bootstrap_moveahead(option: JsonDict, action: str) -> bool:
         return True
     step_source = str(as_dict(option.get("exploration_effect")).get("safety_source") or "")
     return step_source == "perception-navigation-bootstrap"
+
+
+def option_uses_committed_route_costmap(option: JsonDict, action: str, action_safety: JsonDict) -> bool:
+    return (
+        action == "MoveAhead"
+        and option.get("kind") == "explore_route_step"
+        and action_safety.get("safe") is True
+        and str(option.get("safety_source") or "") in {"active-route-costmap", "navigation-costmap"}
+        and as_dict(option.get("route_step")).get("status", "active") == "active"
+    )
 
 
 def place_candidate_executor_ready(candidate: JsonDict) -> bool:
@@ -495,7 +511,11 @@ def validate_resolved_move_safety(context: JsonDict, action: str, option: JsonDi
                         "required_next": "observe_or_rotate_before_translation",
                     }
                 )
-    if action == "MoveAhead" and as_dict(context.get("perception")).get("obstacle_ahead") is True:
+    if (
+        action == "MoveAhead"
+        and as_dict(context.get("perception")).get("obstacle_ahead") is True
+        and not option_uses_committed_route_costmap(option, action, action_safety)
+    ):
         errors.append({"type": "moveahead_blocked_by_perception"})
     return errors
 
@@ -550,6 +570,16 @@ def validate_option(
             errors.append({"type": "explore_frontier_missing_target_cell"})
         if not str(option.get("option_id") or "").startswith("explore:frontier:"):
             errors.append({"type": "invalid_explore_frontier_option_id", "option_id": option_id})
+        errors.extend(validate_resolved_move_safety(context, action, option))
+    if option.get("kind") == "explore_route_step":
+        action = resolved_move_action_for_option(context, option)
+        route_step = as_dict(option.get("route_step"))
+        if not route_step.get("route_id"):
+            errors.append({"type": "explore_route_step_missing_route_id"})
+        if not route_step.get("goal_cell"):
+            errors.append({"type": "explore_route_step_missing_goal_cell"})
+        if not str(option.get("option_id") or "").startswith("explore:route_step:"):
+            errors.append({"type": "invalid_explore_route_step_option_id", "option_id": option_id})
         errors.extend(validate_resolved_move_safety(context, action, option))
     if option.get("kind") == "explore_waypoint":
         action = resolved_move_action_for_option(context, option)
@@ -836,8 +866,15 @@ def write_place_precheck_cache(
     )
 
 
-def run_observe_refresh(*, timeout_seconds: int) -> JsonDict:
-    vision = run_script(GET_VISION_SCRIPT, [], timeout_seconds=timeout_seconds)
+def run_observe_refresh(
+    *,
+    timeout_seconds: int,
+    vision_timeout_seconds: int | None = None,
+    yolo_timeout_seconds: int | None = None,
+) -> JsonDict:
+    vision_timeout = max(1, int(vision_timeout_seconds or timeout_seconds))
+    yolo_timeout = max(1, int(yolo_timeout_seconds or timeout_seconds))
+    vision = run_script(GET_VISION_SCRIPT, [], timeout_seconds=vision_timeout)
     if vision.returncode != 0 or vision.data.get("status") != "success":
         return {
             "status": "error",
@@ -852,13 +889,13 @@ def run_observe_refresh(*, timeout_seconds: int) -> JsonDict:
             "vision": script_result_payload(vision),
         }
     camera = vision.data.get("camera") if isinstance(vision.data.get("camera"), dict) else {}
-    yolo_args = ["--image", image_path]
+    yolo_args = ["--image", image_path, "--timeout", str(yolo_timeout)]
     depth_path = str(vision.data.get("depth_path") or "")
     if depth_path:
         yolo_args.extend(["--depth", depth_path])
     if camera:
         yolo_args.extend(["--camera-json", json.dumps(camera, ensure_ascii=False, separators=(",", ":"))])
-    analysis = run_script(YOLO_SCRIPT, yolo_args, timeout_seconds=timeout_seconds)
+    analysis = run_script(YOLO_SCRIPT, yolo_args, timeout_seconds=yolo_timeout + 10)
     if analysis.data:
         MEMORY_DIR.mkdir(parents=True, exist_ok=True)
         (MEMORY_DIR / "yolo-current-rgbd.json").write_text(
@@ -963,6 +1000,21 @@ def run_selected_option(
             result_type="option_explore_frontier_step_executed",
             extra={
                 "frontier_target": as_dict(option.get("frontier_target")),
+                "resolved_step_option_id": option.get("resolved_step_option_id"),
+                "one_step_only": True,
+            },
+        )
+    if kind == "explore_route_step":
+        resolved_action = resolved_move_action_for_option(context, option)
+        return run_move_step(
+            context,
+            option,
+            action=resolved_action,
+            timeout_seconds=timeout_seconds,
+            result_type="option_explore_route_step_executed",
+            extra={
+                "route_step": as_dict(option.get("route_step")),
+                "active_route": as_dict(option.get("active_route")),
                 "resolved_step_option_id": option.get("resolved_step_option_id"),
                 "one_step_only": True,
             },

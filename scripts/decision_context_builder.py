@@ -28,6 +28,16 @@ try:
 except ImportError:  # pragma: no cover - direct script execution
     from explore_planner import build_explore_plan
 
+try:
+    from scripts.map_backend import BackendUnavailableError, load_map_backend
+except ImportError:  # pragma: no cover - direct script execution
+    from map_backend import BackendUnavailableError, load_map_backend
+
+try:
+    from scripts.navigation_core import build_navigation_core_state
+except ImportError:  # pragma: no cover - direct script execution
+    from navigation_core import build_navigation_core_state
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MEMORY_DIR = REPO_ROOT / "memory"
@@ -90,6 +100,7 @@ GOAL_LEVEL_OPTION_KINDS = {
     "service_action",
     "place_precheck",
     "clean_action",
+    "explore_route_step",
     "explore_frontier",
     "explore_waypoint",
     "recovery_action",
@@ -929,6 +940,7 @@ def build_navigation_summary(
     room: JsonDict,
     position_map: JsonDict,
     global_plan: JsonDict,
+    map_backend_summary: JsonDict | None = None,
 ) -> JsonDict:
     action_safety = {}
     raw_safety = as_dict(costmap.get("action_safety"))
@@ -955,7 +967,17 @@ def build_navigation_summary(
     frontiers = as_list(position_map.get("frontiers"))
     return clean_empty(
         {
+            "map_backend": clean_empty(as_dict(map_backend_summary)),
             "pose": clean_empty(as_dict(position_map.get("pose"))),
+            "active_frontier_goal": clean_empty(
+                as_dict(position_map.get("active_frontier_goal")) or as_dict(room.get("active_frontier_goal"))
+            ),
+            "active_route": clean_empty(
+                as_dict(position_map.get("active_route")) or as_dict(room.get("active_route"))
+            ),
+            "coverage_patrol": clean_empty(
+                as_dict(position_map.get("coverage_patrol")) or as_dict(room.get("coverage_patrol"))
+            ),
             "coverage": clean_empty(
                 {
                     "coverage_estimate": number_or_none(room.get("coverage_estimate")),
@@ -1048,6 +1070,10 @@ def waypoint_option_id(cell: Any) -> str:
         return f"explore:waypoint:x{encode(x)}_z{encode(z)}"
     except (TypeError, ValueError):
         return option_id("explore:waypoint", str(cell or "waypoint"))
+
+
+def route_step_option_id(route_id: Any, step_index: Any) -> str:
+    return option_id("explore:route_step", f"{route_id or 'route'}:{step_index or 0}")
 
 
 def candidate_ref(candidate: JsonDict) -> JsonDict:
@@ -1284,8 +1310,13 @@ def annotate_option_selection_contract(options: list[JsonDict]) -> JsonDict:
     explore_option_ids = [
         str(option.get("option_id"))
         for option in options
-        if option.get("kind") in {"explore_frontier", "explore_waypoint"}
+        if option.get("kind") in {"explore_route_step", "explore_frontier", "explore_waypoint"}
         and option.get("executable_now") is True
+    ]
+    explore_route_option_ids = [
+        str(option.get("option_id"))
+        for option in options
+        if option.get("kind") == "explore_route_step" and option.get("executable_now") is True
     ]
     recovery_option_ids = [
         str(option.get("option_id"))
@@ -1320,10 +1351,20 @@ def annotate_option_selection_contract(options: list[JsonDict]) -> JsonDict:
             continue
 
         option["fallback_only"] = False
-        if kind in {"explore_frontier", "explore_waypoint"}:
+        if kind == "explore_route_step":
             option["decision_level"] = "goal"
             option["llm_priority"] = "primary"
-            option["allowed_when"] = "no_immediate_pick_place_goal_or_as_exploration_target"
+            option["allowed_when"] = "continue_committed_active_frontier_route"
+        elif kind in {"explore_frontier", "explore_waypoint"}:
+            option["decision_level"] = "goal"
+            if explore_route_option_ids:
+                option["llm_priority"] = "fallback"
+                option["fallback_only"] = True
+                option["allowed_when"] = "active_route_unavailable_blocked_or_recovery_required"
+                fallback_options.append(oid)
+                continue
+            option["llm_priority"] = "primary"
+            option["allowed_when"] = "no_committed_route_or_as_exploration_target"
         elif kind == "recovery_action":
             option["decision_level"] = "recovery"
             option["llm_priority"] = "primary"
@@ -1357,6 +1398,7 @@ def annotate_option_selection_contract(options: list[JsonDict]) -> JsonDict:
             "fallback_options": fallback_options,
             "goal_options": goal_option_ids,
             "explore_goal_options": explore_option_ids,
+            "explore_route_options": explore_route_option_ids,
             "explore_frontier_options": [
                 str(option.get("option_id"))
                 for option in options
@@ -1478,6 +1520,7 @@ def build_options(
     costmap: JsonDict,
     exploration: JsonDict | None = None,
     explore_plan: JsonDict | None = None,
+    navigation_core: JsonDict | None = None,
     worklist: JsonDict,
     done_readiness: JsonDict,
     max_options: int,
@@ -1504,6 +1547,7 @@ def build_options(
     surface_candidates = as_list(current_view.get("surface_candidates"))
     cleanable_candidates = as_list(current_view.get("cleanable_candidates"))
     action_effects = as_dict(as_dict(exploration).get("action_effects"))
+    nav_core = as_dict(navigation_core)
 
     if structured_ok and not holding and phase in SERVICE_PICKUP_PHASES | {""}:
         for candidate in pickup_candidates:
@@ -1627,19 +1671,28 @@ def build_options(
         move_options=move_options,
     )
     options.extend(recovery_options)
-    options.extend(
-        build_explore_waypoint_options(
-            explore_plan=as_dict(explore_plan),
-            move_options=move_options,
-        )
+    route_options = build_explore_route_step_options(
+        explore_plan=as_dict(explore_plan),
+        move_options=move_options,
     )
-    options.extend(
-        build_explore_frontier_options(
-            exploration=as_dict(exploration),
-            move_options=move_options,
-            explore_plan=as_dict(explore_plan),
-        )
+    options.extend(route_options)
+    route_locked = bool(route_options) or (
+        nav_core.get("route_locked") is True and bool(recovery_options)
     )
+    if not route_locked:
+        options.extend(
+            build_explore_waypoint_options(
+                explore_plan=as_dict(explore_plan),
+                move_options=move_options,
+            )
+        )
+        options.extend(
+            build_explore_frontier_options(
+                exploration=as_dict(exploration),
+                move_options=move_options,
+                explore_plan=as_dict(explore_plan),
+            )
+        )
     options.extend(move_options)
 
     options.append(
@@ -1673,8 +1726,9 @@ def build_options(
             "raw_move_policy": "fallback_only_when_goal_level_options_exist",
             "explore_policy": (
                 "when no pick/place option is appropriate and explore goal options exist, "
-                "choose explore:waypoint/explore:frontier before raw move:*; "
-                "during rotation loops, choose explore:waypoint before rotation-only frontier options"
+                "choose explore:route_step first when present, then explore:waypoint/explore:frontier before raw move:*; "
+                "during rotation loops, choose explore:waypoint before rotation-only frontier options; "
+                "when navigation.active_frontier_goal is active, prefer options that advance it unless recovery is required"
             ),
             "raw_move_allowed_when": "no goal-level option exists or recovery after failure requires it",
             "recovery_policy": (
@@ -1687,6 +1741,86 @@ def build_options(
         "low_confidence_moves": low_confidence_moves,
         "options": options,
     }
+
+
+def build_explore_route_step_options(
+    *,
+    explore_plan: JsonDict,
+    move_options: list[JsonDict],
+) -> list[JsonDict]:
+    active_route = as_dict(explore_plan.get("active_route"))
+    route_step = as_dict(active_route.get("route_step"))
+    if active_route.get("status") != "active" or route_step.get("status") != "active":
+        return []
+    action = str(route_step.get("action") or active_route.get("next_action") or "").strip()
+    if not action:
+        return []
+    move_by_action = {
+        str(option.get("action") or ""): option
+        for option in move_options
+        if option.get("kind") == "move_action" and option.get("executable_now") is True
+    }
+    step_option = as_dict(move_by_action.get(action))
+    route_id = str(active_route.get("route_id") or route_step.get("route_id") or "route")
+    step_index = route_step.get("step_index", active_route.get("step_index", 0))
+    safety_source = step_option.get("safety_source") if step_option else "active-route-costmap"
+    return [
+        clean_empty(
+            {
+                "option_id": route_step_option_id(route_id, step_index),
+                "kind": "explore_route_step",
+                "physical_action": True,
+                "tool": "move-robot",
+                "action": action,
+                "executable_now": True,
+                "decision_level": "goal",
+                "llm_priority": "primary",
+                "fallback_only": False,
+                "allowed_when": "continue_committed_active_frontier_route",
+                "one_step_only": True,
+                "resolved_step_option_id": step_option.get("option_id"),
+                "navigation_core_source": "active_route",
+                "route_step": {
+                    "route_id": route_id,
+                    "step_index": step_index,
+                    "action": action,
+                    "current_cell": route_step.get("current_cell"),
+                    "current_heading": route_step.get("current_heading"),
+                    "target_cell": route_step.get("target_cell"),
+                    "next_cell": route_step.get("next_cell"),
+                    "goal_cell": route_step.get("goal_cell") or active_route.get("goal_cell"),
+                    "desired_heading": route_step.get("desired_heading"),
+                    "heading_after_action": route_step.get("heading_after_action"),
+                    "turns_remaining": route_step.get("turns_remaining"),
+                    "progress_effect": route_step.get("progress_effect"),
+                    "path_remaining": route_step.get("path_remaining"),
+                    "source": "active_route",
+                },
+                "active_route": {
+                    "route_id": route_id,
+                    "goal_cell": active_route.get("goal_cell"),
+                    "goal_type": active_route.get("goal_type"),
+                    "path_length": active_route.get("path_length"),
+                    "distance_to_goal": active_route.get("distance_to_goal"),
+                },
+                "exploration_effect": as_dict(step_option.get("exploration_effect"))
+                or clean_empty(
+                    {
+                        "action": action,
+                        "effect": route_step.get("progress_effect"),
+                        "target_cell": route_step.get("target_cell") or route_step.get("next_cell"),
+                        "next_cell": route_step.get("next_cell"),
+                        "goal_cell": route_step.get("goal_cell") or active_route.get("goal_cell"),
+                    }
+                ),
+                "reason": (
+                    f"Continue committed route {route_id} toward frontier "
+                    f"{active_route.get('goal_cell')}; execute one validated {action} step."
+                ),
+                "safety_source": safety_source,
+            }
+        )
+    ]
 
 
 def build_explore_waypoint_options(
@@ -1742,6 +1876,10 @@ def build_explore_waypoint_options(
                         "nearest_frontier_distance_delta": candidate.get(
                             "nearest_frontier_distance_delta"
                         ),
+                        "active_frontier_goal_cell": candidate.get("active_frontier_goal_cell"),
+                        "active_frontier_distance_delta": candidate.get("active_frontier_distance_delta"),
+                        "coverage_patrol_target_cell": candidate.get("coverage_patrol_target_cell"),
+                        "coverage_patrol_distance_delta": candidate.get("coverage_patrol_distance_delta"),
                         "reasons": candidate.get("reasons"),
                     },
                     "exploration_effect": as_dict(step_option.get("exploration_effect")),
@@ -1906,6 +2044,9 @@ def choose_rule_baseline_option(
                 return str(option["option_id"])
     for option in options:
         if option.get("kind") == "recovery_action":
+            return str(option["option_id"])
+    for option in options:
+        if option.get("kind") == "explore_route_step":
             return str(option["option_id"])
     for option in options:
         if option.get("kind") == "explore_waypoint":
@@ -2116,13 +2257,29 @@ def build_context(args: argparse.Namespace) -> JsonDict:
     if not perception_path.is_absolute():
         perception_path = REPO_ROOT / perception_path
 
+    try:
+        map_snapshot = load_map_backend(memory_dir).load_snapshot()
+    except BackendUnavailableError as exc:
+        return {
+            "status": "error",
+            "result_type": "error_map_backend_unavailable",
+            "schema": DECISION_CONTEXT_SCHEMA,
+            "schema_version": 1,
+            "generated_at": now_iso(),
+            "error_message": str(exc),
+        }
+
     sources = {
         "mission_state": read_json(memory_dir / "mission-state.json"),
         "room_state": read_json(memory_dir / "room-state.json"),
         "patrol_state": read_json(memory_dir / "patrol-state.json"),
         "service_task_state": read_json(memory_dir / "service-task-state.json"),
         "navigation_costmap": read_json(memory_dir / "navigation-costmap.json"),
-        "position_map": read_json(memory_dir / "position-map.json"),
+        "position_map": LoadedJson(
+            path=memory_dir / "position-map.json",
+            data=map_snapshot.to_position_status(),
+            info=map_snapshot.source_loaded_info(),
+        ),
         "object_memory": read_json(memory_dir / "object-memory.json"),
         "global_plan": read_json(memory_dir / "global-plan.json"),
         "place_precheck_cache": read_json(memory_dir / PLACE_PRECHECK_CACHE_NAME),
@@ -2165,6 +2322,7 @@ def build_context(args: argparse.Namespace) -> JsonDict:
         room=room,
         position_map=position_map,
         global_plan=global_plan,
+        map_backend_summary=map_snapshot.public_summary(),
     )
     exploration = build_exploration_context(
         position_map=position_map,
@@ -2176,6 +2334,11 @@ def build_context(args: argparse.Namespace) -> JsonDict:
         position_map=position_map,
         navigation_costmap=costmap,
         exploration=exploration,
+    )
+    navigation_core = build_navigation_core_state(
+        navigation=navigation,
+        exploration=exploration,
+        explore_plan=explore_plan,
     )
     done_readiness = build_done_readiness(
         task=task,
@@ -2189,6 +2352,7 @@ def build_context(args: argparse.Namespace) -> JsonDict:
         costmap=costmap,
         exploration=exploration,
         explore_plan=explore_plan,
+        navigation_core=navigation_core,
         worklist=worklist,
         done_readiness=done_readiness,
         max_options=max(1, args.max_options),
@@ -2220,6 +2384,7 @@ def build_context(args: argparse.Namespace) -> JsonDict:
         "task": task,
         "perception": perception_summary,
         "navigation": navigation,
+        "navigation_core": navigation_core,
         "exploration": exploration,
         "explore_plan": explore_plan,
         "worklist": worklist,

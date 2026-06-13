@@ -12,7 +12,7 @@ export type RobotToolRequest = {
 };
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8765";
-const DEFAULT_TIMEOUT_MS = 120_000;
+const DEFAULT_TIMEOUT_MS = 180_000;
 
 export async function callRobotToolBackend({
   toolName,

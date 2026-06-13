@@ -112,6 +112,14 @@ def safe_positive_int(value: Any, default: int, *, upper: int) -> int:
     return max(1, min(numeric, upper))
 
 
+def safe_nonnegative_int(value: Any, default: int, *, upper: int) -> int:
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        numeric = default
+    return max(0, min(numeric, upper))
+
+
 def safe_reason(value: Any) -> str:
     text = str(value or "user_stop").strip()
     if not text or any(char in text for char in "\r\n\t"):
@@ -133,6 +141,14 @@ def require_option_id(value: Any) -> str:
 def command_for_request(path: str, body: JsonDict) -> ToolCommand:
     timeout = safe_timeout(body.get("timeout_seconds"))
     if path == "/tools/prepare-decision-turn":
+        observe_retries = safe_nonnegative_int(body.get("observe_retries"), 0, upper=3)
+        vision_timeout = safe_positive_int(body.get("vision_timeout_seconds"), min(timeout, 30), upper=600)
+        yolo_timeout = safe_positive_int(body.get("yolo_timeout_seconds"), min(timeout, 60), upper=600)
+        context_timeout = safe_positive_int(body.get("context_timeout_seconds"), min(timeout, 45), upper=600)
+        bridge_timeout = min(
+            600,
+            (observe_retries + 1) * (vision_timeout + yolo_timeout + 15) + context_timeout + 30,
+        )
         return ToolCommand(
             tool_name="robot_cleaner_prepare_decision_turn",
             script=PREPARE_SCRIPT,
@@ -143,8 +159,14 @@ def command_for_request(path: str, body: JsonDict) -> ToolCommand:
                 "memory/decision-context.json",
                 "--timeout",
                 str(timeout),
+                "--vision-timeout",
+                str(vision_timeout),
+                "--yolo-timeout",
+                str(yolo_timeout),
+                "--context-timeout",
+                str(context_timeout),
                 "--observe-retries",
-                str(safe_positive_int(body.get("observe_retries"), 1, upper=3)),
+                str(observe_retries),
                 "--max-candidates",
                 str(safe_positive_int(body.get("max_candidates"), 6, upper=24)),
                 "--max-options",
@@ -152,7 +174,7 @@ def command_for_request(path: str, body: JsonDict) -> ToolCommand:
                 "--format",
                 "compact",
             ],
-            timeout_seconds=timeout + 15,
+            timeout_seconds=bridge_timeout,
         )
     if path == "/tools/execute-option":
         option_id = require_option_id(body.get("option_id"))
@@ -247,6 +269,8 @@ class RobotToolBridgeHandler(BaseHTTPRequestHandler):
                     "status": "success",
                     "result_type": "robot_cleaner_tool_bridge_health",
                     "service": "robot-cleaner-tool-bridge",
+                    "python_executable": sys.executable,
+                    "conda_default_env": os.getenv("CONDA_DEFAULT_ENV"),
                     "available_endpoints": [
                         "/tools/prepare-decision-turn",
                         "/tools/execute-option",
@@ -303,11 +327,17 @@ class RobotToolBridgeHandler(BaseHTTPRequestHandler):
 
     def write_json(self, status_code: int, payload: JsonDict) -> None:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        self.send_response(int(status_code))
-        self.send_header("content-type", "application/json; charset=utf-8")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(int(status_code))
+            self.send_header("content-type", "application/json; charset=utf-8")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError) as exc:
+            print(
+                f"[robot-tool-bridge] client disconnected before response was fully written: {type(exc).__name__}",
+                flush=True,
+            )
 
 
 def serve(host: str, port: int) -> None:

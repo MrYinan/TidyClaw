@@ -74,6 +74,15 @@ def eval_state():
         return json_error("error_eval_state_failed", str(e), 500)
 
 
+@app.route("/eval/map", methods=["GET"])
+def eval_map():
+    """Offline-only AI2-THOR reachable-position map endpoint."""
+    try:
+        return jsonify(env.get_groundtruth_map_snapshot())
+    except Exception as e:
+        return json_error("error_eval_map_failed", str(e), 500)
+
+
 @app.route("/vision", methods=["GET"])
 def get_vision():
     """Backward-compatible alias for /observation."""

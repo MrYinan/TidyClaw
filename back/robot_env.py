@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import math
 import os
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -366,6 +367,68 @@ class RobotEnvironment:
                     | self.place_receptacle_types
                 )
             ),
+        }
+
+    def get_groundtruth_map_snapshot(self) -> JsonDict:
+        """Return an offline-only AI2-THOR navigation map projection.
+
+        This endpoint is intentionally separate from online observation.  It is
+        meant for an offline mapping stage or controlled simulator ablation:
+        AI2-THOR reachable positions define the known traversable floor cells,
+        while online tidy decisions still consume the normalized MapBackend
+        contract instead of raw simulator metadata.
+        """
+
+        try:
+            event = self.controller.step(action="GetReachablePositions")
+            metadata = event.metadata if hasattr(event, "metadata") and isinstance(event.metadata, dict) else {}
+            reachable = metadata.get("actionReturn") or []
+            success = bool(metadata.get("lastActionSuccess", False))
+            error_message = str(metadata.get("errorMessage") or "")
+        except Exception as exc:
+            return {
+                "status": "error",
+                "schema_version": 1,
+                "result_type": "error_ai2thor_groundtruth_map_failed",
+                "message": str(exc),
+                "online_safe": False,
+                "usage_scope": "offline_mapping_only",
+                "timestamp": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            }
+
+        positions: List[JsonDict] = []
+        if isinstance(reachable, list):
+            for item in reachable:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    positions.append(
+                        {
+                            "x": round(float(item.get("x", 0.0)), 4),
+                            "y": round(float(item.get("y", 0.0)), 4),
+                            "z": round(float(item.get("z", 0.0)), 4),
+                        }
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+        return {
+            "status": "success" if success else "error",
+            "schema_version": 1,
+            "result_type": "ai2thor_groundtruth_map",
+            "scene": self.scene,
+            "mode": self.mode,
+            "scenario": self.current_scenario,
+            "robot": self.get_robot_state(),
+            "grid_size_m": float(os.getenv("ROBOT_GRID_SIZE", "0.25")),
+            "reachable_positions": positions,
+            "reachable_position_count": len(positions),
+            "lastActionSuccess": success,
+            "error_message": error_message,
+            "online_safe": False,
+            "usage_scope": "offline_mapping_only",
+            "timestamp": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            "warning": "Do not feed raw AI2-THOR metadata into online Agent decisions; use MapBackend/MapBundle output.",
         }
 
     # ------------------------------------------------------------------
