@@ -140,7 +140,7 @@ class LocalCostmap:
         self.held_medium_extra_radius_m = max(0.0, env_float("ROBOT_LOCAL_COSTMAP_HELD_MEDIUM_EXTRA_RADIUS_M", 0.10))
         self.held_large_extra_radius_m = max(0.0, env_float("ROBOT_LOCAL_COSTMAP_HELD_LARGE_EXTRA_RADIUS_M", 0.14))
         self.translation_step_m = max(0.05, env_float("ROBOT_LOCAL_COSTMAP_TRANSLATION_STEP_M", 0.25))
-        self.rotation_extra_margin_m = max(0.0, env_float("ROBOT_LOCAL_COSTMAP_ROTATION_EXTRA_MARGIN_M", 0.08))
+        self.rotation_extra_margin_m = max(0.0, env_float("ROBOT_LOCAL_COSTMAP_ROTATION_EXTRA_MARGIN_M", 0.0))
         self.hard_block_confidence = clamp(env_float("ROBOT_LOCAL_COSTMAP_HARD_BLOCK_CONFIDENCE", 0.20))
         legacy_min_observed = clamp(env_float("ROBOT_LOCAL_COSTMAP_MIN_TRANSLATION_OBSERVED_RATIO", 0.15))
         legacy_env_set = os.getenv("ROBOT_LOCAL_COSTMAP_MIN_TRANSLATION_OBSERVED_RATIO") is not None
@@ -293,7 +293,7 @@ class LocalCostmap:
         extra sweep disk for carried-object swing margin.
         """
         step_cells = max(1, int(math.ceil(self.translation_step_m / self.resolution_m)))
-        rotation_margin_cells = max(1, int(math.ceil(self.rotation_extra_margin_m / self.resolution_m)))
+        rotation_margin_cells = max(0, int(math.ceil(self.rotation_extra_margin_m / self.resolution_m)))
         if action == "MoveAhead":
             return {(0, iz) for iz in range(1, step_cells + 1)}
         if action == "MoveBack":
@@ -569,10 +569,14 @@ class LocalCostmap:
         unknown = bool(action in TRANSLATION_ACTIONS and observed_ratio < min_observed)
         confidence = clamp(observed_ratio + (0.35 if blocked else 0.0) + (0.80 if unknown else 0.0))
         safe = bool((not blocked) and not unknown)
-        if blocked:
+        if blocked and action in ROTATE_ACTIONS:
+            reason = "inflated_obstacle_in_turn_footprint"
+        elif blocked:
             reason = "inflated_obstacle_in_swept_volume"
         elif unknown:
             reason = "unknown_swept_volume"
+        elif action in ROTATE_ACTIONS:
+            reason = "clear_turn_in_place"
         else:
             reason = "clear_swept_volume"
         record = {
@@ -583,6 +587,9 @@ class LocalCostmap:
             "observed_ratio": round(observed_ratio, 4),
             "min_observed_ratio": round(min_observed, 4) if action in TRANSLATION_ACTIONS else None,
         }
+        if action in ROTATE_ACTIONS:
+            record["rotation_policy"] = "in_place_base_footprint_only"
+            record["rotation_extra_margin_m"] = round(self.rotation_extra_margin_m, 4)
         if blocked:
             ordered_blocked = sorted(blocked, key=lambda cell: (abs(cell[1]), abs(cell[0]), cell[1], cell[0]))
             record["blocked_cells"] = [[cell[0], cell[1]] for cell in ordered_blocked[:12]]

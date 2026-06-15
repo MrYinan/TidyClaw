@@ -1,6 +1,6 @@
 # HEARTBEAT.md - 家庭服务机器人 heartbeat policy
 
-heartbeat 是家庭服务机器人（原项目名 `robot-cleaner`）的**低频主动触发层**。
+heartbeat 是家庭服务机器人的**低频主动触发层**。
 
 它不负责一步步移动机器人，也不负责把任务拆成短执行段续跑。正式循环巡视交给 `patrol-runner` continuous 执行。heartbeat 主动触发时只做秒级检查：空闲时感知环境；发现服务整理目标后，用 `patrol-runner` skill 的 `--command start` 启动后台 `tidy` runner 并立即返回；后续 heartbeat 或用户询问状态时，再用 `patrol-runner --command report/status` 汇报结果。
 

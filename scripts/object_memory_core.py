@@ -21,6 +21,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+try:
+    from scripts.map_backend import BackendUnavailableError, load_map_backend
+except ImportError:  # pragma: no cover - direct script execution
+    try:
+        from map_backend import BackendUnavailableError, load_map_backend
+    except ImportError:  # pragma: no cover - isolated tests
+        BackendUnavailableError = RuntimeError  # type: ignore[assignment]
+        load_map_backend = None  # type: ignore[assignment]
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MEMORY_DIR = REPO_ROOT / "memory"
@@ -29,6 +38,7 @@ OBJECT_GOALS_PATH = MEMORY_DIR / "object-goals.json"
 POSITION_MAP_PATH = MEMORY_DIR / "position-map.json"
 
 DEFAULT_CELL_SIZE = 0.25
+DEFAULT_COORDINATE_MODE = "ai2thor_groundtruth_grid"
 OBJECT_MEMORY_SCHEMA_VERSION = 1
 OBJECT_GOALS_SCHEMA_VERSION = 1
 
@@ -146,6 +156,22 @@ def load_json(path: Path, default: JsonDict) -> JsonDict:
 
 def load_position_map_frame(memory_dir: Optional[Path] = None) -> JsonDict:
     base_dir = Path(memory_dir) if memory_dir else MEMORY_DIR
+    if load_map_backend is not None:
+        try:
+            snapshot = load_map_backend(base_dir).load_snapshot()
+            frame = snapshot.map_frame if isinstance(snapshot.map_frame, dict) else {}
+            pose = snapshot.pose if isinstance(snapshot.pose, dict) else {}
+            return {
+                "cell_size_m": float(frame.get("cell_size_m", DEFAULT_CELL_SIZE) or DEFAULT_CELL_SIZE),
+                "coordinate_mode": frame.get("coordinate_mode", DEFAULT_COORDINATE_MODE),
+                "origin_cell": frame.get("origin_cell", "0,0"),
+                "map_backend": snapshot.backend,
+                "pose_confidence": float(pose.get("pose_confidence", pose.get("confidence", 1.0)) or 1.0),
+                "position_uncertainty_cells": float(pose.get("position_uncertainty_cells", 0.0) or 0.0),
+                "heading_confidence": float(pose.get("heading_confidence", 1.0) or 1.0),
+            }
+        except BackendUnavailableError:
+            pass
     path = base_dir / "position-map.json"
     data = load_json(path, {})
     if not isinstance(data, dict):
@@ -154,7 +180,7 @@ def load_position_map_frame(memory_dir: Optional[Path] = None) -> JsonDict:
     pose = data.get("pose") if isinstance(data.get("pose"), dict) else {}
     return {
         "cell_size_m": float(frame.get("cell_size_m", DEFAULT_CELL_SIZE) or DEFAULT_CELL_SIZE),
-        "coordinate_mode": frame.get("coordinate_mode", "action_odometry_grid"),
+        "coordinate_mode": frame.get("coordinate_mode", DEFAULT_COORDINATE_MODE),
         "origin_cell": frame.get("origin_cell", "0,0"),
         "pose_confidence": float(pose.get("pose_confidence", 1.0) or 1.0),
         "position_uncertainty_cells": float(pose.get("position_uncertainty_cells", 0.0) or 0.0),
@@ -644,7 +670,7 @@ def default_object_memory() -> JsonDict:
         "schema_version": OBJECT_MEMORY_SCHEMA_VERSION,
         "map_frame": {
             "cell_size_m": DEFAULT_CELL_SIZE,
-            "coordinate_mode": "action_odometry_grid",
+            "coordinate_mode": DEFAULT_COORDINATE_MODE,
             "origin_cell": "0,0",
         },
         "tracks": {},
@@ -672,7 +698,7 @@ def default_object_goals() -> JsonDict:
         "schema_version": OBJECT_GOALS_SCHEMA_VERSION,
         "map_frame": {
             "cell_size_m": DEFAULT_CELL_SIZE,
-            "coordinate_mode": "action_odometry_grid",
+            "coordinate_mode": DEFAULT_COORDINATE_MODE,
             "origin_cell": "0,0",
         },
         "active_goal": None,
@@ -687,7 +713,7 @@ def normalize_memory(data: JsonDict) -> JsonDict:
     if not isinstance(memory.get("map_frame"), dict):
         memory["map_frame"] = default_object_memory()["map_frame"]
     memory["map_frame"].setdefault("cell_size_m", DEFAULT_CELL_SIZE)
-    memory["map_frame"].setdefault("coordinate_mode", "action_odometry_grid")
+    memory["map_frame"].setdefault("coordinate_mode", DEFAULT_COORDINATE_MODE)
     memory["map_frame"].setdefault("origin_cell", "0,0")
     if not isinstance(memory.get("tracks"), dict):
         memory["tracks"] = {}
@@ -714,7 +740,7 @@ def normalize_goals(data: JsonDict) -> JsonDict:
     if not isinstance(goals.get("map_frame"), dict):
         goals["map_frame"] = default_object_goals()["map_frame"]
     goals["map_frame"].setdefault("cell_size_m", DEFAULT_CELL_SIZE)
-    goals["map_frame"].setdefault("coordinate_mode", "action_odometry_grid")
+    goals["map_frame"].setdefault("coordinate_mode", DEFAULT_COORDINATE_MODE)
     goals["map_frame"].setdefault("origin_cell", "0,0")
     if not isinstance(goals.get("history"), list):
         goals["history"] = []
@@ -823,7 +849,7 @@ class ObjectMemory:
         frame["coordinate_mode"] = (
             nav.get("coordinate_mode")
             or frame.get("coordinate_mode")
-            or "action_odometry_grid"
+            or DEFAULT_COORDINATE_MODE
         )
         frame["origin_cell"] = (
             nav.get("origin_cell")
@@ -1231,7 +1257,7 @@ class ObjectMemory:
         cell_size = float(position_frame.get("cell_size_m") or DEFAULT_CELL_SIZE)
 
         memory["map_frame"]["cell_size_m"] = cell_size
-        memory["map_frame"]["coordinate_mode"] = position_frame.get("coordinate_mode", "action_odometry_grid")
+        memory["map_frame"]["coordinate_mode"] = position_frame.get("coordinate_mode", DEFAULT_COORDINATE_MODE)
         memory["map_frame"]["origin_cell"] = position_frame.get("origin_cell", "0,0")
         memory["map_frame"]["pose_confidence"] = round(float(position_frame.get("pose_confidence", 1.0) or 1.0), 4)
         memory["map_frame"]["position_uncertainty_cells"] = round(
@@ -1734,7 +1760,7 @@ class ObjectMemory:
                 "cell": str(current_cell),
                 "heading": str(heading),
                 "theta_deg": heading_to_theta(heading),
-                "coordinate_mode": "action_odometry_grid",
+                "coordinate_mode": goals.get("map_frame", {}).get("coordinate_mode", DEFAULT_COORDINATE_MODE),
             },
             "found_goal": bool(last_seen_step == int(step)),
             "new_goal": bool(not same_goal),

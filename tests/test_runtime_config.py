@@ -20,6 +20,11 @@ def fresh_dir(name: str) -> Path:
 
 
 class RuntimeConfigTests(unittest.TestCase):
+    def test_empty_config_defaults_to_ai2thor_groundtruth(self) -> None:
+        selection = configured_map_backend({"map": {}})
+        self.assertEqual(selection["backend"], "ai2thor_groundtruth")
+        self.assertEqual(selection["configured_backend"], "ai2thor_groundtruth")
+
     def test_map_bundle_config_is_used_when_snapshot_exists(self) -> None:
         bundle = fresh_dir("runtime-config-bundle")
         try:
@@ -71,6 +76,27 @@ class RuntimeConfigTests(unittest.TestCase):
                 self.assertEqual(os.environ["ROBOT_MAP_BACKEND"], "ai2thor_groundtruth")
                 self.assertEqual(os.environ["ROBOT_MAP_BUNDLE_PATH"], "custom/path")
                 self.assertEqual(result["env_applied"], {})
+            finally:
+                restore_runtime_environment(result["previous_env"])
+
+    def test_apply_runtime_environment_can_force_tool_backend(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "ROBOT_MAP_BACKEND": "action_odometry",
+                "ROBOT_MAP_BUNDLE_PATH": "old/path",
+                "ROBOT_AI2THOR_MAP_SOURCE": "cache",
+            },
+            clear=False,
+        ):
+            result = apply_runtime_environment(
+                {"map": {"backend": "ai2thor_groundtruth", "source_mode": "live"}},
+                override_existing=True,
+            )
+            try:
+                self.assertEqual(os.environ["ROBOT_MAP_BACKEND"], "ai2thor_groundtruth")
+                self.assertEqual(os.environ["ROBOT_AI2THOR_MAP_SOURCE"], "live")
+                self.assertEqual(result["env_applied"]["ROBOT_MAP_BACKEND"], "ai2thor_groundtruth")
             finally:
                 restore_runtime_environment(result["previous_env"])
 

@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.robot_tool_state import build_robot_report, print_json  # noqa: E402
+from scripts.runtime_config import apply_runtime_environment  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    apply_runtime_environment(override_existing=True)
     result = build_robot_report()
     print_json(result, compact=args.format == "compact")
     return 0

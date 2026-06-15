@@ -1,8 +1,10 @@
 import argparse
 import json
+import os
 import shutil
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.decision_context_builder import (
     DECISION_CONTEXT_SCHEMA,
@@ -32,6 +34,13 @@ def loaded_source(name: str, last_modified: str, data: dict | None = None) -> Lo
 
 
 class DecisionContextBuilderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._backend_env = patch.dict(os.environ, {"ROBOT_MAP_BACKEND": "action_odometry"}, clear=False)
+        self._backend_env.start()
+
+    def tearDown(self) -> None:
+        self._backend_env.stop()
+
     def build_args(self, memory_dir: Path, perception_json: Path) -> argparse.Namespace:
         return argparse.Namespace(
             memory_dir=str(memory_dir),
@@ -138,18 +147,27 @@ class DecisionContextBuilderTests(unittest.TestCase):
         self.assertNotIn("history", json.dumps(context["worklist"]))
         option_ids = [item["option_id"] for item in context["option_set"]["options"]]
         self.assertIn("pick:best_pickup_candidate_0", option_ids)
+        self.assertIn("explore:frontier_cluster:x0_z1", option_ids)
         self.assertIn("explore:frontier:x0_z1", option_ids)
         self.assertIn("move:moveahead", option_ids)
         self.assertIn("primary_options", context["option_set"])
         self.assertIn("fallback_options", context["option_set"])
         self.assertIn("goal_options", context["option_set"])
-        self.assertIn("explore:frontier:x0_z1", context["option_set"]["primary_options"])
+        self.assertIn("explore:frontier_cluster:x0_z1", context["option_set"]["primary_options"])
+        self.assertIn("explore:frontier:x0_z1", context["option_set"]["fallback_options"])
         self.assertIn("move:moveahead", context["option_set"]["fallback_options"])
+        cluster = next(
+            item for item in context["option_set"]["options"] if item["option_id"] == "explore:frontier_cluster:x0_z1"
+        )
+        self.assertEqual(cluster["kind"], "explore_frontier_cluster")
+        self.assertEqual(cluster["decision_level"], "goal")
+        self.assertEqual(cluster["llm_priority"], "primary")
+        self.assertEqual(cluster["frontier_cluster_target"]["cell"], "0,1")
         explore = next(item for item in context["option_set"]["options"] if item["option_id"] == "explore:frontier:x0_z1")
         self.assertEqual(explore["kind"], "explore_frontier")
         self.assertEqual(explore["decision_level"], "goal")
-        self.assertEqual(explore["llm_priority"], "primary")
-        self.assertFalse(explore["fallback_only"])
+        self.assertEqual(explore["llm_priority"], "fallback")
+        self.assertTrue(explore["fallback_only"])
         self.assertTrue(explore["one_step_only"])
         self.assertEqual(explore["action"], "MoveAhead")
         self.assertEqual(explore["resolved_step_option_id"], "move:moveahead")
@@ -234,6 +252,160 @@ class DecisionContextBuilderTests(unittest.TestCase):
             },
             context["option_set"]["low_confidence_moves"],
         )
+
+    def test_inspection_waypoint_options_are_primary_and_legacy_frontier_is_fallback(self) -> None:
+        memory = WORKSPACE_ROOT / "memory" / "decision-context-inspection-waypoint-fixture"
+        if memory.exists():
+            shutil.rmtree(memory)
+        try:
+            write_json(memory / "mission-state.json", {"enabled": True, "mode": "SERVICE", "max_steps": 80})
+            write_json(
+                memory / "room-state.json",
+                {
+                    "room_name": "current_room",
+                    "room_complete": False,
+                    "inspection_waypoints": [
+                        {"waypoint_id": "wp_front", "cell": "0,1", "label": "front scan"},
+                        {"waypoint_id": "wp_side", "cell": "1,0", "label": "side scan"},
+                    ],
+                },
+            )
+            write_json(memory / "patrol-state.json", {"enabled": True, "mode": "SERVICE", "step_count": 5})
+            write_json(
+                memory / "service-task-state.json",
+                {"phase": "SEARCH_PICKUP_TARGET", "holding_object": False, "pickup_surface_policy": "floor-only"},
+            )
+            write_json(
+                memory / "navigation-costmap.json",
+                {
+                    "status": "success",
+                    "action_safety": {
+                        "MoveAhead": {"safe": True, "reason": "clear_swept_volume"},
+                        "RotateLeft": {"safe": True, "reason": "clear_swept_volume"},
+                    },
+                },
+            )
+            write_json(
+                memory / "position-map.json",
+                {
+                    "pose": {"cell": "0,0", "heading": "north"},
+                    "frontiers": ["0,1"],
+                    "cells": {
+                        "0,0": {"state": "free", "visited": True},
+                        "0,1": {"state": "free"},
+                        "1,0": {"state": "free"},
+                    },
+                },
+            )
+            perception = memory / "yolo-current-rgbd.json"
+            write_json(
+                perception,
+                {
+                    "status": "success",
+                    "result_type": "scene_analyzed_yolo",
+                    "perception_backend": "yolo",
+                    "online_safe": True,
+                    "pickup_target_detected": False,
+                    "frontier_exists": True,
+                    "open_directions": ["forward"],
+                },
+            )
+
+            context = build_context(self.build_args(memory, perception))
+        finally:
+            if memory.exists():
+                shutil.rmtree(memory)
+
+        option_set = context["option_set"]
+        option_ids = [item["option_id"] for item in option_set["options"]]
+        self.assertIn("explore:inspection_waypoint:wp_front", option_ids)
+        self.assertIn("explore:inspection_waypoint:wp_side", option_ids)
+        self.assertIn("explore:inspection_waypoint:wp_front", option_set["primary_options"])
+        self.assertIn("explore:inspection_waypoint:wp_front", option_set["explore_inspection_waypoint_options"])
+        cluster = next(
+            item for item in option_set["options"] if item["option_id"] == "explore:frontier_cluster:x0_z1"
+        )
+        self.assertEqual(cluster["llm_priority"], "fallback")
+        self.assertTrue(cluster["fallback_only"])
+        self.assertIn("explore:frontier_cluster:x0_z1", option_set["fallback_options"])
+        self.assertEqual(context["coverage_waypoints"]["required_waypoint_count"], 2)
+        self.assertEqual(context["coverage_waypoints"]["pending_waypoint_count"], 2)
+
+    def test_active_inspection_waypoint_exposes_continue_option(self) -> None:
+        memory = WORKSPACE_ROOT / "memory" / "decision-context-active-waypoint-fixture"
+        if memory.exists():
+            shutil.rmtree(memory)
+        try:
+            write_json(memory / "mission-state.json", {"enabled": True, "mode": "SERVICE", "max_steps": 80})
+            write_json(
+                memory / "room-state.json",
+                {
+                    "room_name": "current_room",
+                    "room_complete": False,
+                    "inspection_waypoints": [
+                        {"waypoint_id": "wp_front", "cell": "0,1", "label": "front scan"},
+                        {"waypoint_id": "wp_side", "cell": "1,0", "label": "side scan"},
+                    ],
+                    "coverage_waypoints": {
+                        "active_waypoint_goal": {
+                            "waypoint_id": "wp_front",
+                            "cell": "0,1",
+                            "status": "active",
+                        }
+                    },
+                },
+            )
+            write_json(memory / "patrol-state.json", {"enabled": True, "mode": "SERVICE", "step_count": 5})
+            write_json(
+                memory / "service-task-state.json",
+                {"phase": "SEARCH_PICKUP_TARGET", "holding_object": False, "pickup_surface_policy": "floor-only"},
+            )
+            write_json(
+                memory / "navigation-costmap.json",
+                {
+                    "status": "success",
+                    "action_safety": {
+                        "MoveAhead": {"safe": True, "reason": "clear_swept_volume"},
+                    },
+                },
+            )
+            write_json(
+                memory / "position-map.json",
+                {
+                    "pose": {"cell": "0,0", "heading": "north"},
+                    "frontiers": ["0,1"],
+                    "cells": {
+                        "0,0": {"state": "free", "visited": True},
+                        "0,1": {"state": "free"},
+                        "1,0": {"state": "free"},
+                    },
+                },
+            )
+            perception = memory / "yolo-current-rgbd.json"
+            write_json(
+                perception,
+                {
+                    "status": "success",
+                    "result_type": "scene_analyzed_yolo",
+                    "perception_backend": "yolo",
+                    "online_safe": True,
+                    "pickup_target_detected": False,
+                    "frontier_exists": True,
+                    "open_directions": ["forward"],
+                },
+            )
+
+            context = build_context(self.build_args(memory, perception))
+        finally:
+            if memory.exists():
+                shutil.rmtree(memory)
+
+        option_set = context["option_set"]
+        option = next(item for item in option_set["options"] if item["option_id"] == "continue:active_waypoint_goal")
+        self.assertEqual(option["kind"], "continue_active_waypoint_goal")
+        self.assertEqual(option["active_waypoint_goal"]["waypoint_id"], "wp_front")
+        self.assertIn("continue:active_waypoint_goal", option_set["primary_options"])
+        self.assertIn("continue:active_waypoint_goal", option_set["continue_active_waypoint_options"])
 
     def test_explore_frontier_can_be_synthesized_from_safe_move_effect(self) -> None:
         options = build_explore_frontier_options(
@@ -426,13 +598,14 @@ class DecisionContextBuilderTests(unittest.TestCase):
         self.assertIn("explore:waypoint:x0_z2", option_ids)
         self.assertIn("explore_plan", context)
         self.assertEqual(context["explore_plan"]["mode"], "break_rotation_loop")
-        self.assertIn("explore:waypoint:x0_z2", context["option_set"]["primary_options"])
+        self.assertIn("explore:frontier_cluster:xm1_z3", context["option_set"]["primary_options"])
+        self.assertIn("explore:waypoint:x0_z2", context["option_set"]["fallback_options"])
         self.assertIn("explore:waypoint:x0_z2", context["option_set"]["explore_waypoint_options"])
         waypoint_index = option_ids.index("explore:waypoint:x0_z2")
         move_index = option_ids.index("move:moveahead")
         self.assertLess(waypoint_index, move_index)
 
-    def test_build_context_exposes_committed_route_step_before_other_explore_options(self) -> None:
+    def test_build_context_exposes_frontier_cluster_before_committed_route_step(self) -> None:
         memory = WORKSPACE_ROOT / "memory" / "decision-context-route-step-fixture"
         if memory.exists():
             shutil.rmtree(memory)
@@ -529,15 +702,25 @@ class DecisionContextBuilderTests(unittest.TestCase):
                 shutil.rmtree(memory)
 
         option_ids = [item["option_id"] for item in context["option_set"]["options"]]
+        cluster_id = "explore:frontier_cluster:xm1_z3"
+        self.assertIn(cluster_id, option_ids)
         route_ids = [item for item in option_ids if item.startswith("explore:route_step:")]
         self.assertEqual(len(route_ids), 1)
         route_id = route_ids[0]
         self.assertEqual(context["navigation"]["active_route"]["goal_cell"], "-1,3")
         self.assertEqual(context["explore_plan"]["mode"], "committed_route")
-        self.assertIn(route_id, context["option_set"]["primary_options"])
+        self.assertIn(cluster_id, context["option_set"]["primary_options"])
+        self.assertIn(cluster_id, context["option_set"]["explore_frontier_cluster_options"])
+        self.assertIn(route_id, context["option_set"]["fallback_options"])
         self.assertIn(route_id, context["option_set"]["explore_route_options"])
+        cluster_option = next(item for item in context["option_set"]["options"] if item["option_id"] == cluster_id)
+        self.assertEqual(cluster_option["kind"], "explore_frontier_cluster")
+        self.assertEqual(cluster_option["action"], "RotateLeft")
+        self.assertEqual(cluster_option["frontier_cluster_target"]["cell"], "-1,3")
+        self.assertEqual(cluster_option["route_step"]["next_cell"], "0,3")
         route_option = next(item for item in context["option_set"]["options"] if item["option_id"] == route_id)
         self.assertEqual(route_option["kind"], "explore_route_step")
+        self.assertTrue(route_option["fallback_only"])
         self.assertEqual(route_option["action"], "RotateLeft")
         self.assertEqual(route_option["route_step"]["next_cell"], "0,3")
 
@@ -626,8 +809,10 @@ class DecisionContextBuilderTests(unittest.TestCase):
 
         self.assertEqual(context["explore_plan"]["mode"], "route_blocked_recovery")
         self.assertEqual(context["exploration"]["camera_posture"]["normalize_action"], "LookUp")
-        self.assertIn("recover:lookup", context["option_set"]["recovery_options"])
-        self.assertEqual(context["option_set"]["primary_options"][0], "recover:lookup")
+        self.assertIn("recover:rotateleft", context["option_set"]["recovery_options"])
+        self.assertIn("recover:rotateright", context["option_set"]["recovery_options"])
+        self.assertNotIn("recover:lookup", context["option_set"]["recovery_options"])
+        self.assertEqual(context["option_set"]["primary_options"][0], "recover:rotateleft")
         waypoint_actions = [
             item.get("action")
             for item in context["option_set"]["options"]
@@ -698,9 +883,11 @@ class DecisionContextBuilderTests(unittest.TestCase):
 
         option_ids = [item["option_id"] for item in context["option_set"]["options"]]
         self.assertEqual(context["explore_plan"]["mode"], "rotation_loop_scan_limited")
-        self.assertIn("recover:lookup", option_ids)
-        self.assertIn("recover:lookup", context["option_set"]["recovery_options"])
-        self.assertEqual(context["option_set"]["primary_options"][0], "recover:lookup")
+        self.assertIn("recover:rotateleft", option_ids)
+        self.assertIn("recover:rotateright", option_ids)
+        self.assertNotIn("recover:lookup", option_ids)
+        self.assertIn("recover:rotateleft", context["option_set"]["recovery_options"])
+        self.assertEqual(context["option_set"]["primary_options"][0], "recover:rotateleft")
 
     def test_dead_end_context_exposes_recovery_options(self) -> None:
         memory = WORKSPACE_ROOT / "memory" / "decision-context-dead-end-fixture"
@@ -827,12 +1014,11 @@ class DecisionContextBuilderTests(unittest.TestCase):
 
         self.assertTrue(context["exploration"]["camera_posture"]["needs_normalization"])
         option_ids = [item["option_id"] for item in context["option_set"]["options"]]
-        self.assertIn("recover:lookdown", option_ids)
-        self.assertEqual(context["option_set"]["primary_options"][0], "recover:lookdown")
-        self.assertIn("recover:lookdown", context["option_set"]["recovery_options"])
-        recover = next(item for item in context["option_set"]["options"] if item["option_id"] == "recover:lookdown")
-        self.assertEqual(recover["reason"], "restore_default_camera_pitch_before_navigation")
-        self.assertEqual(recover["camera_posture"]["normalize_action"], "LookDown")
+        self.assertNotIn("recover:lookdown", option_ids)
+        self.assertNotIn("recover:lookdown", context["option_set"].get("recovery_options", []))
+        self.assertTrue(
+            any(item.get("kind") in {"explore_frontier_cluster", "move_action"} for item in context["option_set"]["options"])
+        )
 
     def test_fresh_perception_with_unchanged_mission_state_skew_is_advisory(self) -> None:
         warnings = build_consistency_warnings(

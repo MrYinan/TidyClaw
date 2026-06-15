@@ -44,6 +44,7 @@ from scripts.navigation_memory_core import NavigationMemory, local_costmap_motio
 from scripts.object_memory_core import ObjectMemory  # noqa: E402
 from scripts.placement_viewpoint_planner import PlacementViewpointPlanner  # noqa: E402
 from scripts.local_costmap import LocalCostmap  # noqa: E402
+from scripts.map_backend import BackendUnavailableError, load_map_backend  # noqa: E402
 from scripts.perception_action_validator import (  # noqa: E402
     DEFAULT_BACKEND_BASE_URL,
     short_backend_candidate,
@@ -4777,7 +4778,27 @@ class PatrolRunner:
 
     def navigation_status_for_memory(self) -> JsonDict:
         try:
-            return self.navigation.status()
+            snapshot = load_map_backend(MEMORY_DIR).load_snapshot()
+            status = snapshot.to_position_status()
+            frame = status.get("map_frame") if isinstance(status.get("map_frame"), dict) else {}
+            pose = status.get("pose") if isinstance(status.get("pose"), dict) else {}
+            return {
+                **status,
+                "last_cell": pose.get("cell") or status.get("last_cell"),
+                "last_heading": pose.get("heading") or status.get("last_heading"),
+                "cell_size": frame.get("cell_size_m"),
+                "cell_size_m": frame.get("cell_size_m"),
+                "coordinate_mode": frame.get("coordinate_mode"),
+                "origin_cell": frame.get("origin_cell"),
+                "map_backend": snapshot.backend,
+                "navigation_source": "map_backend_snapshot",
+            }
+        except BackendUnavailableError:
+            pass
+        try:
+            status = self.navigation.status()
+            status["navigation_source"] = "legacy_navigation_memory_fallback"
+            return status
         except Exception:
             return {
                 "last_cell": "0,0",
@@ -4786,6 +4807,7 @@ class PatrolRunner:
                 "visited_cells": [],
                 "frontier_cells": [],
                 "blocked_edges": [],
+                "navigation_source": "empty_fallback",
             }
 
     def observe_object_memory(self, vision: JsonDict, analysis: JsonDict) -> None:

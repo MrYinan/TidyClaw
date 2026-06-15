@@ -16,6 +16,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = REPO_ROOT / "configs" / "robot_cleaner_runtime.json"
 RUNTIME_CONFIG_SCHEMA = "robot_cleaner_runtime_config_v1"
+DEFAULT_MAP_BACKEND = "ai2thor_groundtruth"
 
 JsonDict = dict[str, Any]
 
@@ -41,13 +42,13 @@ def resolve_workspace_path(value: Any, *, base: Path = REPO_ROOT) -> Path:
 
 def normalize_backend(value: Any) -> str:
     text = str(value or "").strip().lower().replace("-", "_")
-    return text or "action_odometry"
+    return text or DEFAULT_MAP_BACKEND
 
 
 def load_runtime_config(path: Path | str = CONFIG_PATH) -> JsonDict:
     config = read_json(Path(path))
     if not config:
-        return {"schema": RUNTIME_CONFIG_SCHEMA, "map": {"backend": "action_odometry"}}
+        return {"schema": RUNTIME_CONFIG_SCHEMA, "map": {"backend": DEFAULT_MAP_BACKEND}}
     config.setdefault("schema", RUNTIME_CONFIG_SCHEMA)
     config.setdefault("map", {})
     return config
@@ -56,7 +57,7 @@ def load_runtime_config(path: Path | str = CONFIG_PATH) -> JsonDict:
 def configured_map_backend(config: JsonDict | None = None) -> JsonDict:
     config = config if isinstance(config, dict) else load_runtime_config()
     map_config = as_dict(config.get("map"))
-    backend = normalize_backend(map_config.get("backend") or "action_odometry")
+    backend = normalize_backend(map_config.get("backend") or DEFAULT_MAP_BACKEND)
     bundle_path_text = str(map_config.get("bundle_path") or "memory/maps/current")
     bundle_path = resolve_workspace_path(bundle_path_text)
     fallback_backend = normalize_backend(map_config.get("fallback_backend") or "action_odometry")
@@ -76,6 +77,8 @@ def configured_map_backend(config: JsonDict | None = None) -> JsonDict:
         "bundle_path_display": display_path(bundle_path),
         "fallback_backend": fallback_backend,
         "fallback_reason": fallback_reason,
+        "ai2thor_source_mode": str(map_config.get("source_mode") or "").strip(),
+        "ai2thor_map_url": str(map_config.get("map_url") or map_config.get("endpoint") or "").strip(),
         "config_path": display_path(CONFIG_PATH),
     }
 
@@ -87,21 +90,34 @@ def display_path(path: Path) -> str:
         return str(path)
 
 
-def apply_runtime_environment(config: JsonDict | None = None) -> JsonDict:
-    """Apply runtime config to process environment unless explicitly overridden."""
+def apply_runtime_environment(config: JsonDict | None = None, *, override_existing: bool = False) -> JsonDict:
+    """Apply runtime config to process environment.
+
+    By default this preserves explicit operator environment variables. Stable
+    tool entrypoints pass ``override_existing=True`` so separate Python
+    subprocesses cannot silently use different map backends.
+    """
 
     selection = configured_map_backend(config)
     previous_env = {
         "ROBOT_MAP_BACKEND": os.environ.get("ROBOT_MAP_BACKEND"),
         "ROBOT_MAP_BUNDLE_PATH": os.environ.get("ROBOT_MAP_BUNDLE_PATH"),
+        "ROBOT_AI2THOR_MAP_SOURCE": os.environ.get("ROBOT_AI2THOR_MAP_SOURCE"),
+        "ROBOT_AI2THOR_MAP_URL": os.environ.get("ROBOT_AI2THOR_MAP_URL"),
     }
     env_overrides: JsonDict = {}
-    if not os.getenv("ROBOT_MAP_BACKEND"):
+    if override_existing or not os.getenv("ROBOT_MAP_BACKEND"):
         os.environ["ROBOT_MAP_BACKEND"] = str(selection["backend"])
         env_overrides["ROBOT_MAP_BACKEND"] = str(selection["backend"])
-    if not os.getenv("ROBOT_MAP_BUNDLE_PATH"):
+    if override_existing or not os.getenv("ROBOT_MAP_BUNDLE_PATH"):
         os.environ["ROBOT_MAP_BUNDLE_PATH"] = str(selection["bundle_path"])
         env_overrides["ROBOT_MAP_BUNDLE_PATH"] = str(selection["bundle_path"])
+    if selection.get("ai2thor_source_mode") and (override_existing or not os.getenv("ROBOT_AI2THOR_MAP_SOURCE")):
+        os.environ["ROBOT_AI2THOR_MAP_SOURCE"] = str(selection["ai2thor_source_mode"])
+        env_overrides["ROBOT_AI2THOR_MAP_SOURCE"] = str(selection["ai2thor_source_mode"])
+    if selection.get("ai2thor_map_url") and (override_existing or not os.getenv("ROBOT_AI2THOR_MAP_URL")):
+        os.environ["ROBOT_AI2THOR_MAP_URL"] = str(selection["ai2thor_map_url"])
+        env_overrides["ROBOT_AI2THOR_MAP_URL"] = str(selection["ai2thor_map_url"])
     return {
         "status": "success",
         "result_type": "runtime_environment_applied",
@@ -111,12 +127,14 @@ def apply_runtime_environment(config: JsonDict | None = None) -> JsonDict:
         "env_existing": {
             "ROBOT_MAP_BACKEND": os.getenv("ROBOT_MAP_BACKEND"),
             "ROBOT_MAP_BUNDLE_PATH": os.getenv("ROBOT_MAP_BUNDLE_PATH"),
+            "ROBOT_AI2THOR_MAP_SOURCE": os.getenv("ROBOT_AI2THOR_MAP_SOURCE"),
+            "ROBOT_AI2THOR_MAP_URL": os.getenv("ROBOT_AI2THOR_MAP_URL"),
         },
     }
 
 
 def restore_runtime_environment(previous_env: JsonDict) -> None:
-    for key in ("ROBOT_MAP_BACKEND", "ROBOT_MAP_BUNDLE_PATH"):
+    for key in ("ROBOT_MAP_BACKEND", "ROBOT_MAP_BUNDLE_PATH", "ROBOT_AI2THOR_MAP_SOURCE", "ROBOT_AI2THOR_MAP_URL"):
         value = previous_env.get(key)
         if value is None:
             os.environ.pop(key, None)

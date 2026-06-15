@@ -1,8 +1,10 @@
 import json
+import os
 import shutil
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.exploration_goal_manager import update_exploration_goals
 from scripts.explore_planner import build_explore_plan
@@ -24,6 +26,13 @@ def write_json(path: Path, data: dict) -> None:
 
 
 class ExplorationGoalManagerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._backend_env = patch.dict(os.environ, {"ROBOT_MAP_BACKEND": "action_odometry"}, clear=False)
+        self._backend_env.start()
+
+    def tearDown(self) -> None:
+        self._backend_env.stop()
+
     def test_selects_and_persists_active_frontier_goal(self) -> None:
         memory = make_tmp_dir("active-frontier-goal")
         self.addCleanup(shutil.rmtree, memory, ignore_errors=True)

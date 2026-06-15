@@ -30,7 +30,16 @@ from scripts.execute_option import (
     script_result_payload,
 )
 from scripts.exploration_goal_manager import update_exploration_goals
+from scripts.coverage_waypoint_state import (
+    load_room_state,
+    mark_waypoint_observed,
+    normalize_coverage_waypoint_state,
+    save_room_state,
+)
+from scripts.inspection_waypoints import build_inspection_waypoints, waypoint_by_id
 from scripts.local_costmap import LocalCostmap
+from scripts.map_backend import BackendUnavailableError, load_map_backend
+from scripts.authoritative_map_sync import sync_authoritative_room_state
 from scripts.option_state_sync import ensure_tool_mission_active
 from scripts.route_manager import update_active_route
 from scripts.runtime_config import apply_runtime_environment, restore_runtime_environment
@@ -142,6 +151,7 @@ def summarize_refresh(refresh: JsonDict) -> JsonDict:
     return {
         "status": refresh.get("status"),
         "result_type": refresh.get("result_type"),
+        "perception_mode": refresh.get("perception_mode"),
         "vision_status": vision_data.get("status"),
         "vision_result_type": vision_data.get("result_type"),
         "vision_elapsed_ms": vision.get("elapsed_ms"),
@@ -157,6 +167,86 @@ def summarize_refresh(refresh: JsonDict) -> JsonDict:
         "frontier_exists": perception_data.get("frontier_exists"),
         "recommended_action": perception_data.get("recommended_action"),
         "perception_written": refresh.get("perception_written"),
+    }
+
+
+def current_map_cell(memory_dir: Path) -> str:
+    try:
+        snapshot = load_map_backend(memory_dir).load_snapshot()
+    except BackendUnavailableError:
+        position = read_json_file(memory_dir / "position-map.json")
+        pose = as_dict(position.get("pose"))
+        return str(pose.get("cell") or position.get("last_cell") or "").strip()
+    pose = as_dict(snapshot.pose)
+    position = snapshot.to_position_status()
+    return str(pose.get("cell") or position.get("last_cell") or "").strip()
+
+
+def decide_perception_mode(args: argparse.Namespace, *, memory_dir: Path = MEMORY_DIR) -> JsonDict:
+    requested = str(getattr(args, "perception_mode", "auto") or "auto").strip().lower()
+    if requested in {"full", "full_task", "full-task"}:
+        return {
+            "mode": "full",
+            "source": "cli",
+            "reason": "perception_mode_forced_full",
+        }
+    if requested in {"navigation_only", "navigation-only", "nav_only", "nav-only"}:
+        return {
+            "mode": "navigation_only",
+            "source": "cli",
+            "reason": "perception_mode_forced_navigation_only",
+        }
+
+    service_state = read_json_file(memory_dir / "service-task-state.json")
+    if bool(service_state.get("holding_object")):
+        return {
+            "mode": "full",
+            "source": "auto",
+            "reason": "holding_object_requires_place_perception",
+        }
+    phase = str(service_state.get("phase") or "").strip()
+    if phase in {"SEARCH_RECEPTACLE", "LOCK_RECEPTACLE", "ALIGN_RECEPTACLE", "PLACE_OBJECT"}:
+        return {
+            "mode": "full",
+            "source": "auto",
+            "reason": "place_phase_requires_surface_perception",
+        }
+
+    room = read_json_file(memory_dir / "room-state.json")
+    coverage = as_dict(room.get("coverage_waypoints"))
+    active = as_dict(coverage.get("active_waypoint_goal"))
+    waypoint_id = str(active.get("waypoint_id") or "").strip()
+    target_cell = str(active.get("cell") or "").strip()
+    status = str(active.get("status") or "").strip().lower()
+    if not waypoint_id or status in {"blocked", "failed", "observed"}:
+        return {
+            "mode": "full",
+            "source": "auto",
+            "reason": "no_active_waypoint_goal_requires_task_observe",
+        }
+    current_cell = current_map_cell(memory_dir)
+    if current_cell and target_cell and current_cell == target_cell:
+        return {
+            "mode": "full",
+            "source": "auto",
+            "reason": "active_waypoint_reached_requires_task_observe",
+            "active_waypoint_goal": {
+                "waypoint_id": waypoint_id,
+                "cell": target_cell,
+                "status": status or active.get("status"),
+            },
+            "current_cell": current_cell,
+        }
+    return {
+        "mode": "navigation_only",
+        "source": "auto",
+        "reason": "continue_active_waypoint_route_uses_depth_costmap_only",
+        "active_waypoint_goal": {
+            "waypoint_id": waypoint_id,
+            "cell": target_cell,
+            "status": status or active.get("status"),
+        },
+        "current_cell": current_cell,
     }
 
 
@@ -220,6 +310,8 @@ def compact_decision_context(context: JsonDict, *, context_path: Path) -> JsonDi
     navigation = as_dict(context.get("navigation"))
     exploration = as_dict(context.get("exploration"))
     explore_plan = as_dict(context.get("explore_plan"))
+    coverage_waypoints = as_dict(context.get("coverage_waypoints"))
+    inspection_waypoints = as_dict(context.get("inspection_waypoints"))
     worklist = as_dict(context.get("worklist"))
     current_view = as_dict(worklist.get("current_view"))
     perception = as_dict(context.get("perception"))
@@ -294,6 +386,33 @@ def compact_decision_context(context: JsonDict, *, context_path: Path) -> JsonDi
             )
             if key in explore_plan
         },
+        "coverage_waypoints": {
+            key: coverage_waypoints.get(key)
+            for key in (
+                "schema",
+                "waypoint_source",
+                "map_backend",
+                "required_waypoint_count",
+                "observed_waypoint_count",
+                "blocked_waypoint_count",
+                "pending_waypoint_count",
+                "sweep_coverage_rate",
+                "active_waypoint_goal",
+                "next_unobserved_waypoints",
+            )
+            if key in coverage_waypoints
+        },
+        "inspection_waypoints": {
+            key: inspection_waypoints.get(key)
+            for key in (
+                "schema",
+                "source",
+                "map_backend",
+                "required_waypoint_count",
+                "coverage_radius_cells",
+            )
+            if key in inspection_waypoints
+        },
         "worklist": {
             "held_object": worklist.get("held_object"),
             "pickup_candidate_count": len(as_list(current_view.get("pickup_candidates"))),
@@ -311,6 +430,102 @@ def compact_decision_context(context: JsonDict, *, context_path: Path) -> JsonDi
     }
 
 
+def observe_reached_active_waypoint(refresh: JsonDict) -> JsonDict:
+    """Mark the active inspection waypoint observed after a successful prepare observe."""
+
+    if refresh.get("status") != "success":
+        return {
+            "status": "skipped",
+            "result_type": "waypoint_observation_not_recorded",
+            "reason": "observe_refresh_failed",
+        }
+    try:
+        snapshot = load_map_backend(MEMORY_DIR).load_snapshot()
+    except BackendUnavailableError as exc:
+        return {
+            "status": "error",
+            "result_type": "waypoint_observation_record_failed",
+            "reason": "map_backend_unavailable",
+            "message": str(exc),
+        }
+
+    room = load_room_state(MEMORY_DIR)
+    waypoint_set = build_inspection_waypoints(snapshot)
+    pose = as_dict(snapshot.pose)
+    current_cell = str(
+        pose.get("cell")
+        or snapshot.to_position_status().get("last_cell")
+        or room.get("last_cell")
+        or ""
+    ).strip()
+    coverage = normalize_coverage_waypoint_state(
+        waypoint_set,
+        as_dict(room.get("coverage_waypoints")),
+        current_cell=current_cell,
+    )
+    active = as_dict(coverage.get("active_waypoint_goal"))
+    waypoint_id = str(active.get("waypoint_id") or "").strip()
+    if not waypoint_id:
+        return {
+            "status": "skipped",
+            "result_type": "waypoint_observation_not_recorded",
+            "reason": "no_active_waypoint_goal",
+            "coverage_waypoints": {
+                "sweep_coverage_rate": coverage.get("sweep_coverage_rate"),
+                "pending_waypoint_count": coverage.get("pending_waypoint_count"),
+                "observed_waypoint_count": coverage.get("observed_waypoint_count"),
+                "required_waypoint_count": coverage.get("required_waypoint_count"),
+            },
+        }
+
+    waypoint = waypoint_by_id(waypoint_set).get(waypoint_id) or {}
+    target_cell = str(active.get("cell") or waypoint.get("cell") or "").strip()
+    if not current_cell or not target_cell or current_cell != target_cell:
+        return {
+            "status": "skipped",
+            "result_type": "waypoint_observation_not_recorded",
+            "reason": "active_waypoint_not_reached",
+            "active_waypoint_goal": {
+                "waypoint_id": waypoint_id,
+                "cell": target_cell,
+                "status": active.get("status"),
+            },
+            "current_cell": current_cell,
+        }
+
+    perception = as_dict(refresh.get("perception"))
+    perception_data = as_dict(perception.get("data"))
+    vision = as_dict(refresh.get("vision"))
+    vision_data = as_dict(vision.get("data"))
+    observation_id = str(
+        perception_data.get("observation_id")
+        or vision_data.get("image_path")
+        or perception_data.get("image_path")
+        or refresh.get("perception_written")
+        or now_iso()
+    )
+    updated = mark_waypoint_observed(
+        coverage,
+        waypoint_id,
+        observation_id=observation_id,
+    )
+    room["coverage_waypoints"] = updated
+    save_room_state(room, MEMORY_DIR)
+    return {
+        "status": "success",
+        "result_type": "active_waypoint_observed",
+        "waypoint_id": waypoint_id,
+        "cell": target_cell,
+        "current_cell": current_cell,
+        "observation_id": observation_id,
+        "sweep_coverage_rate": updated.get("sweep_coverage_rate"),
+        "observed_waypoint_count": updated.get("observed_waypoint_count"),
+        "blocked_waypoint_count": updated.get("blocked_waypoint_count"),
+        "pending_waypoint_count": updated.get("pending_waypoint_count"),
+        "required_waypoint_count": updated.get("required_waypoint_count"),
+    }
+
+
 def build_decision_context(args: argparse.Namespace, output_path: Path) -> ScriptResult:
     return run_script(
         DECISION_CONTEXT_SCRIPT,
@@ -321,7 +536,7 @@ def build_decision_context(args: argparse.Namespace, output_path: Path) -> Scrip
 
 def prepare_decision_turn(args: argparse.Namespace) -> JsonDict:
     output_path = resolve_workspace_path(args.output)
-    runtime_environment = apply_runtime_environment()
+    runtime_environment = apply_runtime_environment(override_existing=True)
     previous_runtime_env = runtime_environment.get("previous_env") if isinstance(runtime_environment.get("previous_env"), dict) else {}
     try:
         return _prepare_decision_turn(args, output_path=output_path, runtime_environment=runtime_environment)
@@ -339,12 +554,14 @@ def _prepare_decision_turn(
     attempts: list[JsonDict] = []
     refresh: JsonDict = {}
     mission_activation = ensure_tool_mission_active(memory_dir=MEMORY_DIR, mode="SERVICE")
+    perception_mode = decide_perception_mode(args, memory_dir=MEMORY_DIR)
 
     for attempt_index in range(1, max(0, int(args.observe_retries)) + 2):
         refresh = run_observe_refresh(
             timeout_seconds=max(1, int(args.timeout)),
             vision_timeout_seconds=max(1, int(args.vision_timeout)),
             yolo_timeout_seconds=max(1, int(args.yolo_timeout)),
+            perception_mode=str(perception_mode.get("mode") or "full"),
         )
         attempts.append(summarize_refresh(refresh))
         if refresh.get("status") == "success":
@@ -357,6 +574,7 @@ def _prepare_decision_turn(
             "stage": "observe_refresh",
             "runtime_environment": runtime_environment,
             "mission_activation": mission_activation,
+            "perception_mode": perception_mode,
             "attempts": attempts,
             "elapsed_ms": round((time.time() - started_at) * 1000, 1),
             "required_next": "retry_prepare_decision_turn_or_stop",
@@ -392,6 +610,24 @@ def _prepare_decision_turn(
             "message": str(exc),
         }
 
+    try:
+        authoritative_map_sync = sync_authoritative_room_state(MEMORY_DIR)
+    except Exception as exc:
+        authoritative_map_sync = {
+            "status": "error",
+            "result_type": "authoritative_map_sync_failed",
+            "message": str(exc),
+        }
+
+    try:
+        waypoint_observation = observe_reached_active_waypoint(refresh)
+    except Exception as exc:
+        waypoint_observation = {
+            "status": "error",
+            "result_type": "waypoint_observation_record_failed",
+            "message": str(exc),
+        }
+
     context_result = build_decision_context(args, output_path)
     context = context_result.data if isinstance(context_result.data, dict) else {}
     if context_result.returncode != 0 or context.get("status") != "success":
@@ -401,10 +637,13 @@ def _prepare_decision_turn(
             "stage": "build_decision_context",
             "runtime_environment": runtime_environment,
             "mission_activation": mission_activation,
+            "perception_mode": perception_mode,
             "observe_refresh": attempts[-1] if attempts else {},
             "local_costmap": local_costmap,
             "exploration_goals": exploration_goals,
             "active_route": active_route,
+            "authoritative_map_sync": authoritative_map_sync,
+            "waypoint_observation": waypoint_observation,
             "context_builder": script_result_payload(context_result),
             "elapsed_ms": round((time.time() - started_at) * 1000, 1),
             "required_next": "inspect_decision_context_builder",
@@ -421,12 +660,15 @@ def _prepare_decision_turn(
         "prepared_at": now_iso(),
         "runtime_environment": runtime_environment,
         "mission_activation": mission_activation,
+        "perception_mode": perception_mode,
         "context_path": display_path(output_path),
         "perception_path": display_path(DEFAULT_PERCEPTION_PATH),
         "observe_refresh": attempts[-1] if attempts else {},
         "local_costmap": local_costmap,
         "exploration_goals": exploration_goals,
         "active_route": active_route,
+        "authoritative_map_sync": authoritative_map_sync,
+        "waypoint_observation": waypoint_observation,
         "context_builder": script_result_payload(context_result),
         "decision_context": decision_context_public,
         "full_decision_context_path": display_path(output_path),
@@ -451,9 +693,12 @@ def _prepare_decision_turn(
             "context_builder": result.get("context_builder"),
             "runtime_environment": runtime_environment,
             "mission_activation": mission_activation,
+            "perception_mode": perception_mode,
             "local_costmap": result.get("local_costmap"),
             "exploration_goals": result.get("exploration_goals"),
             "active_route": result.get("active_route"),
+            "authoritative_map_sync": result.get("authoritative_map_sync"),
+            "waypoint_observation": result.get("waypoint_observation"),
         }
     )
     return result
@@ -477,6 +722,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Retry observe/perception this many times before failing the turn.",
+    )
+    parser.add_argument(
+        "--perception-mode",
+        choices=("auto", "full", "navigation_only"),
+        default="auto",
+        help=(
+            "auto uses full task perception for pick/place/waypoint observe, "
+            "and depth-only navigation perception while continuing an active waypoint."
+        ),
     )
     parser.add_argument("--max-candidates", type=int, default=6)
     parser.add_argument("--max-options", type=int, default=12)

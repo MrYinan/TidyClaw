@@ -13,6 +13,7 @@ from scripts.execute_option import (
     mark_context_stale_after_execution,
     run_selected_option,
     validate_context,
+    validate_context_runtime_backend,
     validate_option,
 )
 
@@ -53,6 +54,28 @@ def base_context() -> dict:
                     "physical_action": False,
                     "tool": "state-manager/report",
                     "executable_now": True,
+                },
+                {
+                    "option_id": "explore:frontier_cluster:x0_z1",
+                    "kind": "explore_frontier_cluster",
+                    "physical_action": True,
+                    "tool": "move-robot",
+                    "action": "MoveAhead",
+                    "executable_now": True,
+                    "one_step_only": True,
+                    "resolved_step_option_id": "move:moveahead",
+                    "frontier_cluster_target": {"cell": "0,1", "cluster_size": 2},
+                    "route_step": {
+                        "route_id": "route-frontier-x0-z1-abcd1234",
+                        "step_index": 0,
+                        "action": "MoveAhead",
+                        "current_cell": "0,0",
+                        "current_heading": "north",
+                        "target_cell": "0,1",
+                        "next_cell": "0,1",
+                        "goal_cell": "0,1",
+                        "desired_heading": "north",
+                    },
                 },
                 {
                     "option_id": "explore:frontier:x0_z1",
@@ -96,6 +119,26 @@ def base_context() -> dict:
                     "one_step_only": True,
                     "resolved_step_option_id": "move:moveahead",
                     "waypoint_target": {"cell": "0,1", "purpose": "break_rotation_loop_via_safe_translation"},
+                },
+                {
+                    "option_id": "explore:inspection_waypoint:wp_front",
+                    "kind": "explore_inspection_waypoint",
+                    "physical_action": True,
+                    "tool": "waypoint-planner + move-robot",
+                    "action": "plan-to-inspection-waypoint",
+                    "executable_now": True,
+                    "one_step_only": True,
+                    "waypoint_target": {"waypoint_id": "wp_front", "cell": "0,1", "purpose": "coverage_scan"},
+                },
+                {
+                    "option_id": "continue:active_waypoint_goal",
+                    "kind": "continue_active_waypoint_goal",
+                    "physical_action": True,
+                    "tool": "waypoint-planner + move-robot",
+                    "action": "continue-active-waypoint-goal",
+                    "executable_now": True,
+                    "one_step_only": True,
+                    "active_waypoint_goal": {"waypoint_id": "wp_front", "cell": "0,1", "status": "active"},
                 },
                 {
                     "option_id": "recover:lookdown",
@@ -170,6 +213,19 @@ class ExecuteOptionTests(unittest.TestCase):
         context["consistency_warnings"] = [{"type": "source_time_skew", "blocking": False}]
         option = find_option(context, "move:moveahead")
         self.assertEqual(validate_option(context, option or {}), [])
+
+    def test_context_runtime_backend_mismatch_requires_fresh_prepare(self) -> None:
+        context = base_context()
+        context["navigation"]["map_backend"] = {"backend": "map_bundle"}
+
+        error = validate_context_runtime_backend(
+            context,
+            {"map_backend": {"backend": "ai2thor_groundtruth"}},
+        )
+
+        self.assertIsNotNone(error)
+        self.assertEqual(error["type"], "decision_context_map_backend_mismatch")
+        self.assertEqual(error["required_next"], "robot_cleaner_prepare_decision_turn")
 
     def test_done_probe_not_blocked_by_consistency_warning(self) -> None:
         context = base_context()
@@ -254,6 +310,43 @@ class ExecuteOptionTests(unittest.TestCase):
         errors = validate_option(context, option or {})
         self.assertTrue(any(item["type"] == "move_action_low_observed_ratio" for item in errors))
 
+    def test_inspection_waypoint_option_validates_goal_id(self) -> None:
+        context = base_context()
+        option = find_option(context, "explore:inspection_waypoint:wp_front")
+        self.assertEqual(validate_option(context, option or {}), [])
+
+    def test_continue_active_waypoint_option_validates_active_goal(self) -> None:
+        context = base_context()
+        option = find_option(context, "continue:active_waypoint_goal")
+        self.assertEqual(validate_option(context, option or {}), [])
+
+    def test_continue_active_waypoint_allows_navigation_only_perception(self) -> None:
+        context = base_context()
+        context["perception"] = {
+            "status": "success",
+            "result_type": "navigation_only_observed",
+            "perception_mode": "navigation_only",
+            "structured_perception_available": False,
+            "online_safe": True,
+        }
+        option = find_option(context, "continue:active_waypoint_goal")
+
+        self.assertEqual(validate_option(context, option or {}), [])
+
+    def test_raw_move_still_blocks_on_navigation_only_perception(self) -> None:
+        context = base_context()
+        context["perception"] = {
+            "status": "success",
+            "result_type": "navigation_only_observed",
+            "perception_mode": "navigation_only",
+            "structured_perception_available": False,
+            "online_safe": True,
+        }
+        option = find_option(context, "move:moveahead")
+        errors = validate_option(context, option or {})
+
+        self.assertTrue(any(item["type"] == "structured_perception_unavailable" for item in errors))
+
     def test_explore_frontier_executes_one_resolved_move_step(self) -> None:
         context = base_context()
         option = find_option(context, "explore:frontier:x0_z1")
@@ -281,6 +374,134 @@ class ExecuteOptionTests(unittest.TestCase):
         self.assertTrue(result["one_step_only"])
         self.assertEqual(result["resolved_action"], "MoveAhead")
         self.assertEqual(result["frontier_target"]["cell"], "0,1")
+        run_script.assert_called_once_with(MOVE_SCRIPT, ["--action", "MoveAhead"], timeout_seconds=5)
+        synced_option = sync.call_args.kwargs["option"]
+        self.assertEqual(synced_option["kind"], "move_action")
+        self.assertEqual(synced_option["action"], "MoveAhead")
+
+    def test_explore_inspection_waypoint_executes_planned_one_step(self) -> None:
+        context = base_context()
+        option = find_option(context, "explore:inspection_waypoint:wp_front")
+        plan = {
+            "status": "active",
+            "result_type": "waypoint_plan_ready",
+            "waypoint": {"waypoint_id": "wp_front", "cell": "0,1"},
+            "next_action": "MoveAhead",
+            "next_cell": "0,1",
+            "route": {
+                "status": "active",
+                "waypoint_id": "wp_front",
+                "goal_cell": "0,1",
+                "next_action": "MoveAhead",
+                "route_step": {"route_id": "route-wp-front", "goal_cell": "0,1", "action": "MoveAhead"},
+            },
+        }
+        script_result = ScriptResult(
+            command=["python", str(MOVE_SCRIPT), "--action", "MoveAhead"],
+            returncode=0,
+            stdout='{"status":"success","lastActionSuccess":true}',
+            stderr="",
+            data={"status": "success", "lastActionSuccess": True},
+        )
+        with patch("scripts.execute_option.plan_to_inspection_waypoint", return_value=plan) as planner, patch(
+            "scripts.execute_option.run_script", return_value=script_result
+        ) as run_script, patch(
+            "scripts.execute_option.sync_option_result",
+            return_value={"status": "success", "result_type": "move_state_synchronized"},
+        ) as sync:
+            result = run_selected_option(
+                context,
+                option or {},
+                timeout_seconds=5,
+                dry_run=False,
+                strict_visual_grounding=True,
+            )
+
+        planner.assert_called_once()
+        self.assertEqual(planner.call_args.args[0], "wp_front")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["result_type"], "option_explore_inspection_waypoint_step_executed")
+        self.assertTrue(result["one_step_only"])
+        self.assertEqual(result["resolved_action"], "MoveAhead")
+        self.assertEqual(result["waypoint_plan"]["waypoint"]["waypoint_id"], "wp_front")
+        run_script.assert_called_once_with(MOVE_SCRIPT, ["--action", "MoveAhead"], timeout_seconds=5)
+        synced_option = sync.call_args.kwargs["option"]
+        self.assertEqual(synced_option["kind"], "move_action")
+        self.assertEqual(synced_option["action"], "MoveAhead")
+
+    def test_continue_active_waypoint_executes_planned_one_step(self) -> None:
+        context = base_context()
+        option = find_option(context, "continue:active_waypoint_goal")
+        plan = {
+            "status": "active",
+            "result_type": "waypoint_plan_ready",
+            "waypoint": {"waypoint_id": "wp_front", "cell": "0,1"},
+            "next_action": "MoveAhead",
+            "next_cell": "0,1",
+            "route": {
+                "status": "active",
+                "waypoint_id": "wp_front",
+                "goal_cell": "0,1",
+                "next_action": "MoveAhead",
+                "route_step": {"route_id": "route-wp-front", "goal_cell": "0,1", "action": "MoveAhead"},
+            },
+        }
+        script_result = ScriptResult(
+            command=["python", str(MOVE_SCRIPT), "--action", "MoveAhead"],
+            returncode=0,
+            stdout='{"status":"success","lastActionSuccess":true}',
+            stderr="",
+            data={"status": "success", "lastActionSuccess": True},
+        )
+        with patch("scripts.execute_option.continue_active_waypoint_goal", return_value=plan) as planner, patch(
+            "scripts.execute_option.run_script", return_value=script_result
+        ) as run_script, patch(
+            "scripts.execute_option.sync_option_result",
+            return_value={"status": "success", "result_type": "move_state_synchronized"},
+        ):
+            result = run_selected_option(
+                context,
+                option or {},
+                timeout_seconds=5,
+                dry_run=False,
+                strict_visual_grounding=True,
+            )
+
+        planner.assert_called_once()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["result_type"], "option_continue_active_waypoint_step_executed")
+        self.assertTrue(result["one_step_only"])
+        self.assertEqual(result["resolved_action"], "MoveAhead")
+        run_script.assert_called_once_with(MOVE_SCRIPT, ["--action", "MoveAhead"], timeout_seconds=5)
+
+    def test_explore_frontier_cluster_executes_one_resolved_move_step(self) -> None:
+        context = base_context()
+        option = find_option(context, "explore:frontier_cluster:x0_z1")
+        script_result = ScriptResult(
+            command=["python", str(MOVE_SCRIPT), "--action", "MoveAhead"],
+            returncode=0,
+            stdout='{"status":"success","lastActionSuccess":true}',
+            stderr="",
+            data={"status": "success", "lastActionSuccess": True},
+        )
+        with patch("scripts.execute_option.run_script", return_value=script_result) as run_script, patch(
+            "scripts.execute_option.sync_option_result",
+            return_value={"status": "success", "result_type": "move_state_synchronized"},
+        ) as sync:
+            result = run_selected_option(
+                context,
+                option or {},
+                timeout_seconds=5,
+                dry_run=False,
+                strict_visual_grounding=True,
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["result_type"], "option_explore_frontier_cluster_step_executed")
+        self.assertTrue(result["one_step_only"])
+        self.assertEqual(result["resolved_action"], "MoveAhead")
+        self.assertEqual(result["frontier_cluster_target"]["cell"], "0,1")
+        self.assertEqual(result["route_step"]["goal_cell"], "0,1")
         run_script.assert_called_once_with(MOVE_SCRIPT, ["--action", "MoveAhead"], timeout_seconds=5)
         synced_option = sync.call_args.kwargs["option"]
         self.assertEqual(synced_option["kind"], "move_action")

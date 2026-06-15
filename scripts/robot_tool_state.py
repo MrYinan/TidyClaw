@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.state_manager_core import StateManager  # noqa: E402
+from scripts.map_backend import BackendUnavailableError, load_map_backend  # noqa: E402
 
 
 JsonDict = dict[str, Any]
@@ -57,6 +58,10 @@ def as_list(value: Any) -> list[Any]:
     if isinstance(value, tuple):
         return list(value)
     return [value]
+
+
+def as_dict(value: Any) -> JsonDict:
+    return value if isinstance(value, dict) else {}
 
 
 def unique_strings(values: Iterable[Any]) -> list[str]:
@@ -201,6 +206,42 @@ def service_summary(memory_dir: Path = MEMORY_DIR) -> JsonDict:
     }
 
 
+def navigation_summary(memory_dir: Path, room: JsonDict) -> JsonDict:
+    try:
+        snapshot = load_map_backend(memory_dir).load_snapshot()
+    except BackendUnavailableError as exc:
+        return {
+            "last_cell": room.get("last_cell"),
+            "last_heading": room.get("last_heading"),
+            "coverage_estimate": room.get("coverage_estimate"),
+            "frontier_count": len(as_list(room.get("frontier_cells")) or as_list(room.get("known_frontier_cells"))),
+            "collision_count": int(room.get("collision_count", 0) or 0),
+            "oscillation_count": int(room.get("oscillation_count", 0) or 0),
+            "pose_confidence": room.get("pose_confidence"),
+            "position_uncertainty_cells": room.get("position_uncertainty_cells"),
+            "heading_confidence": room.get("heading_confidence"),
+            "map_backend": room.get("map_backend") or "room_state_fallback",
+            "coordinate_mode": as_dict(room.get("map_frame")).get("coordinate_mode"),
+            "fallback_reason": str(exc),
+        }
+    pose = as_dict(snapshot.pose)
+    coverage = as_dict(snapshot.coverage)
+    return {
+        "last_cell": pose.get("cell"),
+        "last_heading": pose.get("heading"),
+        "coverage_estimate": coverage.get("coverage_estimate"),
+        "frontier_count": len(snapshot.frontiers),
+        "collision_count": int(coverage.get("collision_count", room.get("collision_count", 0)) or 0),
+        "oscillation_count": int(room.get("oscillation_count", 0) or 0),
+        "pose_confidence": pose.get("pose_confidence", pose.get("confidence")),
+        "position_uncertainty_cells": pose.get("position_uncertainty_cells"),
+        "heading_confidence": pose.get("heading_confidence"),
+        "map_backend": snapshot.backend,
+        "coordinate_mode": as_dict(snapshot.map_frame).get("coordinate_mode"),
+        "source": "map_backend_snapshot",
+    }
+
+
 def build_robot_status(memory_dir: Path = MEMORY_DIR) -> JsonDict:
     state = load_state(memory_dir)
     patrol = state.get("patrol", {}) if isinstance(state.get("patrol"), dict) else {}
@@ -221,6 +262,7 @@ def build_robot_status(memory_dir: Path = MEMORY_DIR) -> JsonDict:
     step_count = int(patrol.get("step_count") or mission.get("total_steps_completed") or room.get("explored_steps") or 0)
     max_steps = int(patrol.get("max_steps") or mission.get("max_steps") or 0)
     room_complete = bool(room.get("room_complete"))
+    navigation = navigation_summary(memory_dir, room)
 
     return {
         "status": "success",
@@ -253,17 +295,7 @@ def build_robot_status(memory_dir: Path = MEMORY_DIR) -> JsonDict:
             "visual_candidates_count": len(detected),
             "visual_candidates": short_list(detected, limit=12),
         },
-        "navigation": {
-            "last_cell": room.get("last_cell"),
-            "last_heading": room.get("last_heading"),
-            "coverage_estimate": room.get("coverage_estimate"),
-            "frontier_count": len(as_list(room.get("frontier_cells")) or as_list(room.get("known_frontier_cells"))),
-            "collision_count": int(room.get("collision_count", 0) or 0),
-            "oscillation_count": int(room.get("oscillation_count", 0) or 0),
-            "pose_confidence": room.get("pose_confidence"),
-            "position_uncertainty_cells": room.get("position_uncertainty_cells"),
-            "heading_confidence": room.get("heading_confidence"),
-        },
+        "navigation": navigation,
         "perception": perception_summary(memory_dir),
         "decision_context": decision_context_summary(memory_dir),
         "raw_state_paths": {

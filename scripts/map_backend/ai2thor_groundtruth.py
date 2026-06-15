@@ -159,9 +159,11 @@ def reachable_cell_records(positions: list[Any], *, cell_size_m: float) -> dict[
 
 def existing_visited_cells(position_map: JsonDict, room_state: JsonDict) -> set[str]:
     visited: set[str] = set()
-    for cell, rec in as_dict(position_map.get("cells")).items():
-        if as_dict(rec).get("visited") is True:
-            visited.add(str(cell))
+    # In groundtruth mode, legacy position-map/action-odometry cells are not an
+    # authoritative trajectory. Only room-state visited cells that were written
+    # by this backend are reused across turns.
+    if str(room_state.get("map_backend") or "") != "ai2thor_groundtruth":
+        return visited
     for cell in as_list(room_state.get("visited_cells")):
         text = str(cell or "").strip()
         if text:
@@ -283,9 +285,9 @@ class AI2ThorGroundTruthMapBackend:
         visited_in_map = {cell for cell in visited if cell in cells}
         frontiers = build_frontiers(cells, visited_in_map)
         open_edges = known_open_edges(cells)
-        existing_edges = as_dict(position_map.get("edges"))
-        blocked_edges = unique_strings(existing_edges.get("blocked_edges"), room_state.get("blocked_edges"))
-        hard_blocked = unique_strings(existing_edges.get("hard_blocked_edges"), room_state.get("hard_blocked_edges"))
+        room_is_groundtruth = str(room_state.get("map_backend") or "") == self.backend_name
+        blocked_edges = unique_strings(room_state.get("blocked_edges")) if room_is_groundtruth else []
+        hard_blocked = unique_strings(room_state.get("hard_blocked_edges")) if room_is_groundtruth else []
         blocked_set = set(blocked_edges) | set(hard_blocked)
         open_edges = [edge for edge in open_edges if edge not in blocked_set]
         free_count = len(cells)

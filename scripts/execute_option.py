@@ -39,6 +39,9 @@ DECISION_CONTEXT_SCHEMA = "robot_cleaner_decision_context_v1"
 PLACE_PRECHECK_CACHE_SCHEMA = "robot_cleaner_place_precheck_cache_v1"
 PHYSICAL_KINDS = {
     "move_action",
+    "explore_inspection_waypoint",
+    "continue_active_waypoint_goal",
+    "explore_frontier_cluster",
     "explore_route_step",
     "explore_frontier",
     "explore_waypoint",
@@ -46,6 +49,7 @@ PHYSICAL_KINDS = {
     "service_action",
     "clean_action",
 }
+NAVIGATION_ONLY_WAYPOINT_KINDS = {"explore_inspection_waypoint", "continue_active_waypoint_goal"}
 SURFACE_REGION_SOURCES = {
     "pointcloud_plane",
     "pointcloud_plane_completion",
@@ -75,6 +79,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.option_state_sync import sync_option_result
+from scripts.runtime_config import apply_runtime_environment, restore_runtime_environment
+from scripts.waypoint_planner import continue_active_waypoint_goal, plan_to_inspection_waypoint
 
 
 @dataclass
@@ -332,6 +338,19 @@ def resolved_move_action_for_option(context: JsonDict, option: JsonDict) -> str:
     return str(step_option.get("action") or "").strip()
 
 
+def waypoint_id_for_option(option: JsonDict) -> str:
+    target = as_dict(option.get("waypoint_target"))
+    waypoint_id = str(target.get("waypoint_id") or "").strip()
+    if waypoint_id:
+        return waypoint_id
+    option_id = str(option.get("option_id") or "")
+    prefix = "explore:inspection_waypoint:"
+    if option_id.startswith(prefix):
+        return option_id[len(prefix) :].strip()
+    active = as_dict(option.get("active_waypoint_goal"))
+    return str(active.get("waypoint_id") or "").strip()
+
+
 def move_action_safety_record(context: JsonDict, action: str) -> JsonDict:
     navigation = as_dict(context.get("navigation"))
     return as_dict(as_dict(as_dict(navigation.get("local_costmap")).get("action_safety")).get(action))
@@ -367,10 +386,13 @@ def option_allows_bootstrap_moveahead(option: JsonDict, action: str) -> bool:
 def option_uses_committed_route_costmap(option: JsonDict, action: str, action_safety: JsonDict) -> bool:
     return (
         action == "MoveAhead"
-        and option.get("kind") == "explore_route_step"
+        and option.get("kind") in {"explore_route_step", "explore_frontier_cluster"}
         and action_safety.get("safe") is True
         and str(option.get("safety_source") or "") in {"active-route-costmap", "navigation-costmap"}
-        and as_dict(option.get("route_step")).get("status", "active") == "active"
+        and (
+            option.get("kind") == "explore_frontier_cluster"
+            or as_dict(option.get("route_step")).get("status", "active") == "active"
+        )
     )
 
 
@@ -466,8 +488,46 @@ def validate_context(context: JsonDict) -> list[JsonDict]:
     return errors
 
 
+def context_map_backend(context: JsonDict) -> str:
+    backend = as_dict(as_dict(context.get("navigation")).get("map_backend")).get("backend")
+    return str(backend or "").strip()
+
+
+def runtime_map_backend(runtime_environment: JsonDict) -> str:
+    backend = as_dict(runtime_environment.get("map_backend")).get("backend")
+    return str(backend or "").strip()
+
+
+def validate_context_runtime_backend(context: JsonDict, runtime_environment: JsonDict) -> JsonDict | None:
+    context_backend = context_map_backend(context)
+    runtime_backend = runtime_map_backend(runtime_environment)
+    if not context_backend or not runtime_backend or context_backend == runtime_backend:
+        return None
+    return {
+        "type": "decision_context_map_backend_mismatch",
+        "context_backend": context_backend,
+        "runtime_backend": runtime_backend,
+        "required_next": "robot_cleaner_prepare_decision_turn",
+        "message": "Decision context was prepared with a different map backend than the executor is using.",
+    }
+
+
 def warning_blocks_physical_action(warning: JsonDict) -> bool:
     return warning.get("blocking") is not False
+
+
+def navigation_only_perception_allows_option(perception: JsonDict, option: JsonDict) -> bool:
+    """Allow waypoint navigation with depth/costmap perception, but not task actions."""
+    if str(option.get("kind") or "") not in NAVIGATION_ONLY_WAYPOINT_KINDS:
+        return False
+    mode = str(perception.get("perception_mode") or "").strip().lower()
+    result_type = str(perception.get("result_type") or "").strip()
+    return (
+        mode in {"navigation_only", "navigation-only", "nav_only", "nav-only"}
+        and result_type == "navigation_only_observed"
+        and perception.get("status") == "success"
+        and perception.get("online_safe") is True
+    )
 
 
 def validate_resolved_move_safety(context: JsonDict, action: str, option: JsonDict) -> list[JsonDict]:
@@ -540,7 +600,10 @@ def validate_option(
     physical = bool(option.get("physical_action")) or str(option.get("kind") or "") in PHYSICAL_KINDS
     if physical:
         perception = as_dict(context.get("perception"))
-        if perception.get("structured_perception_available") is False:
+        if (
+            perception.get("structured_perception_available") is False
+            and not navigation_only_perception_allows_option(perception, option)
+        ):
             errors.append(
                 {
                     "type": "structured_perception_unavailable",
@@ -562,6 +625,29 @@ def validate_option(
             )
     if option.get("kind") == "move_action":
         action = resolved_move_action_for_option(context, option)
+        errors.extend(validate_resolved_move_safety(context, action, option))
+    if option.get("kind") == "explore_inspection_waypoint":
+        waypoint_id = waypoint_id_for_option(option)
+        if not waypoint_id:
+            errors.append({"type": "inspection_waypoint_missing_waypoint_id"})
+        if not str(option.get("option_id") or "").startswith("explore:inspection_waypoint:"):
+            errors.append({"type": "invalid_inspection_waypoint_option_id", "option_id": option_id})
+    if option.get("kind") == "continue_active_waypoint_goal":
+        active_goal = as_dict(option.get("active_waypoint_goal"))
+        if option_id != "continue:active_waypoint_goal":
+            errors.append({"type": "invalid_continue_active_waypoint_option_id", "option_id": option_id})
+        if not str(active_goal.get("waypoint_id") or "").strip():
+            errors.append({"type": "continue_active_waypoint_missing_goal"})
+    if option.get("kind") == "explore_frontier_cluster":
+        action = resolved_move_action_for_option(context, option)
+        target = as_dict(option.get("frontier_cluster_target"))
+        route_step = as_dict(option.get("route_step"))
+        if not target.get("cell"):
+            errors.append({"type": "explore_frontier_cluster_missing_target_cell"})
+        if not str(option.get("option_id") or "").startswith("explore:frontier_cluster:"):
+            errors.append({"type": "invalid_explore_frontier_cluster_option_id", "option_id": option_id})
+        if route_step and not route_step.get("goal_cell"):
+            errors.append({"type": "explore_frontier_cluster_route_step_missing_goal_cell"})
         errors.extend(validate_resolved_move_safety(context, action, option))
     if option.get("kind") == "explore_frontier":
         action = resolved_move_action_for_option(context, option)
@@ -871,6 +957,7 @@ def run_observe_refresh(
     timeout_seconds: int,
     vision_timeout_seconds: int | None = None,
     yolo_timeout_seconds: int | None = None,
+    perception_mode: str = "full",
 ) -> JsonDict:
     vision_timeout = max(1, int(vision_timeout_seconds or timeout_seconds))
     yolo_timeout = max(1, int(yolo_timeout_seconds or timeout_seconds))
@@ -889,6 +976,49 @@ def run_observe_refresh(
             "vision": script_result_payload(vision),
         }
     camera = vision.data.get("camera") if isinstance(vision.data.get("camera"), dict) else {}
+    mode = str(perception_mode or "full").strip().lower()
+    if mode in {"navigation_only", "navigation-only", "nav_only", "nav-only"}:
+        depth_path = str(vision.data.get("depth_path") or "")
+        navigation_data = {
+            "status": "success",
+            "result_type": "navigation_only_observed",
+            "perception_mode": "navigation_only",
+            "perception_backend": "depth_local_costmap",
+            "online_safe": True,
+            "image_path": image_path,
+            "depth_path": depth_path,
+            "camera": camera,
+            "candidate_count": 0,
+            "pickup_target_detected": False,
+            "place_receptacle_detected": False,
+            "direct_pickup_detected": False,
+            "direct_place_detected": False,
+            "floor_trash_detected": False,
+            "frontier_exists": None,
+            "recommended_action": None,
+            "reason": "Skipped semantic YOLO/pointcloud task perception while continuing an active waypoint route.",
+        }
+        MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+        (MEMORY_DIR / "yolo-current-rgbd.json").write_text(
+            json.dumps(navigation_data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        analysis = ScriptResult(
+            command=["navigation-only-perception"],
+            returncode=0,
+            stdout=json.dumps(navigation_data, ensure_ascii=False),
+            stderr="",
+            data=navigation_data,
+        )
+        return {
+            "status": "success",
+            "result_type": "observe_refresh_executed",
+            "physical_action_executed": False,
+            "perception_mode": "navigation_only",
+            "vision": script_result_payload(vision),
+            "perception": script_result_payload(analysis),
+            "perception_written": str(MEMORY_DIR / "yolo-current-rgbd.json"),
+        }
     yolo_args = ["--image", image_path, "--timeout", str(yolo_timeout)]
     depth_path = str(vision.data.get("depth_path") or "")
     if depth_path:
@@ -906,6 +1036,7 @@ def run_observe_refresh(
         "status": "success" if analysis.returncode == 0 and analysis.data.get("status") == "success" else "error",
         "result_type": "observe_refresh_executed",
         "physical_action_executed": False,
+        "perception_mode": "full",
         "vision": script_result_payload(vision),
         "perception": script_result_payload(analysis),
         "perception_written": str(MEMORY_DIR / "yolo-current-rgbd.json") if analysis.data else "",
@@ -951,6 +1082,53 @@ def run_move_step(
     return payload
 
 
+def run_waypoint_plan_step(
+    context: JsonDict,
+    option: JsonDict,
+    *,
+    plan: JsonDict,
+    timeout_seconds: int,
+    result_type: str,
+) -> JsonDict:
+    status = str(plan.get("status") or "")
+    route = as_dict(plan.get("route"))
+    action = str(plan.get("next_action") or route.get("next_action") or "").strip()
+    if status == "active" and action:
+        return run_move_step(
+            context,
+            option,
+            action=action,
+            timeout_seconds=timeout_seconds,
+            result_type=result_type,
+            extra={
+                "waypoint_plan": plan,
+                "waypoint_target": as_dict(option.get("waypoint_target")),
+                "active_waypoint_goal": as_dict(option.get("active_waypoint_goal")),
+                "route_step": as_dict(route.get("route_step")),
+                "active_route": route,
+                "one_step_only": True,
+            },
+        )
+    if status == "reached":
+        return {
+            "status": "success",
+            "result_type": "option_inspection_waypoint_reached",
+            "option_id": option.get("option_id"),
+            "physical_action_executed": False,
+            "required_next": "observe:refresh",
+            "message": "Inspection waypoint cell is reached; refresh perception to mark/inspect this waypoint.",
+            "waypoint_plan": plan,
+        }
+    return {
+        "status": "error",
+        "result_type": "option_inspection_waypoint_plan_unavailable",
+        "option_id": option.get("option_id"),
+        "physical_action_executed": False,
+        "required_next": plan.get("required_next") or "recover_or_choose_new_waypoint",
+        "waypoint_plan": plan,
+    }
+
+
 def run_selected_option(
     context: JsonDict,
     option: JsonDict,
@@ -989,6 +1167,48 @@ def run_selected_option(
             action=resolved_move_action_for_option(context, option),
             timeout_seconds=timeout_seconds,
             result_type="option_move_executed",
+        )
+    if kind == "explore_inspection_waypoint":
+        waypoint_id = waypoint_id_for_option(option)
+        plan = plan_to_inspection_waypoint(
+            waypoint_id,
+            memory_dir=MEMORY_DIR,
+            persist=True,
+        )
+        return run_waypoint_plan_step(
+            context,
+            option,
+            plan=plan,
+            timeout_seconds=timeout_seconds,
+            result_type="option_explore_inspection_waypoint_step_executed",
+        )
+    if kind == "continue_active_waypoint_goal":
+        plan = continue_active_waypoint_goal(
+            memory_dir=MEMORY_DIR,
+            persist=True,
+        )
+        return run_waypoint_plan_step(
+            context,
+            option,
+            plan=plan,
+            timeout_seconds=timeout_seconds,
+            result_type="option_continue_active_waypoint_step_executed",
+        )
+    if kind == "explore_frontier_cluster":
+        resolved_action = resolved_move_action_for_option(context, option)
+        return run_move_step(
+            context,
+            option,
+            action=resolved_action,
+            timeout_seconds=timeout_seconds,
+            result_type="option_explore_frontier_cluster_step_executed",
+            extra={
+                "frontier_cluster_target": as_dict(option.get("frontier_cluster_target")),
+                "route_step": as_dict(option.get("route_step")),
+                "active_route": as_dict(option.get("active_route")),
+                "resolved_step_option_id": option.get("resolved_step_option_id"),
+                "one_step_only": True,
+            },
         )
     if kind == "explore_frontier":
         resolved_action = resolved_move_action_for_option(context, option)
@@ -1173,75 +1393,88 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    option_id = selected_option_id(args)
-    if not option_id:
-        result = {
-            "status": "error",
-            "result_type": "error_missing_option_id",
-            "message": "Pass --option-id or --selection-json with selected_option_id.",
-        }
-        json_print(result, compact=args.format == "compact")
-        return 2
-
-    context_path = Path(args.context)
-    if not context_path.is_absolute():
-        context_path = REPO_ROOT / context_path
-    context = load_json(context_path)
-    context_errors = validate_context(context)
-    option = find_option(context, option_id) if not context_errors else None
-    if option is None and not context_errors:
-        context_errors.append(
-            {
-                "type": "selected_option_not_found",
-                "selected_option_id": option_id,
-                "available_option_ids": [str(item.get("option_id") or "") for item in option_list(context)],
-            }
-        )
-    option_errors = (
-        validate_option(context, option or {}, allow_stale_context=bool(args.allow_stale_context))
-        if option is not None
-        else []
+    runtime_environment = apply_runtime_environment(override_existing=True)
+    previous_runtime_env = (
+        runtime_environment.get("previous_env") if isinstance(runtime_environment.get("previous_env"), dict) else {}
     )
-    if context_errors or option_errors:
+    option_id = selected_option_id(args)
+    try:
+        if not option_id:
+            result = {
+                "status": "error",
+                "result_type": "error_missing_option_id",
+                "message": "Pass --option-id or --selection-json with selected_option_id.",
+                "runtime_environment": runtime_environment,
+            }
+            json_print(result, compact=args.format == "compact")
+            return 2
+
+        context_path = Path(args.context)
+        if not context_path.is_absolute():
+            context_path = REPO_ROOT / context_path
+        context = load_json(context_path)
+        context_errors = validate_context(context)
+        backend_mismatch = validate_context_runtime_backend(context, runtime_environment)
+        if backend_mismatch:
+            context_errors.append(backend_mismatch)
+        option = find_option(context, option_id) if not context_errors else None
+        if option is None and not context_errors:
+            context_errors.append(
+                {
+                    "type": "selected_option_not_found",
+                    "selected_option_id": option_id,
+                    "available_option_ids": [str(item.get("option_id") or "") for item in option_list(context)],
+                }
+            )
+        option_errors = (
+            validate_option(context, option or {}, allow_stale_context=bool(args.allow_stale_context))
+            if option is not None
+            else []
+        )
+        if context_errors or option_errors:
+            result = {
+                "status": "error",
+                "result_type": "error_option_validation_failed",
+                "selected_option_id": option_id,
+                "context_path": str(context_path),
+                "context_errors": context_errors,
+                "option_errors": option_errors,
+                "runtime_environment": runtime_environment,
+            }
+            append_trace({"event": "option_validation_failed", "result": result})
+            json_print(result, compact=args.format == "compact")
+            return 1
+
+        execution = run_selected_option(
+            context,
+            option,
+            timeout_seconds=max(1, int(args.timeout)),
+            dry_run=bool(args.dry_run),
+            strict_visual_grounding=not bool(args.no_strict_visual_grounding),
+        )
+        context_lifecycle_update: JsonDict = {}
+        if not bool(args.dry_run) and execution.get("result_type") != "done_probe_result":
+            context_lifecycle_update = mark_context_stale_after_execution(
+                context_path,
+                option_id=option_id,
+                execution=execution,
+            )
         result = {
-            "status": "error",
-            "result_type": "error_option_validation_failed",
+            "status": execution.get("status", "error"),
+            "result_type": "selected_option_handled",
             "selected_option_id": option_id,
             "context_path": str(context_path),
-            "context_errors": context_errors,
-            "option_errors": option_errors,
+            "runtime_environment": runtime_environment,
+            "option": option,
+            "execution": execution,
+            "context_lifecycle_update": context_lifecycle_update,
+            "trace_path": str(TRACE_PATH),
         }
-        append_trace({"event": "option_validation_failed", "result": result})
+        append_trace({"event": "selected_option_handled", "result": result})
         json_print(result, compact=args.format == "compact")
-        return 1
-
-    execution = run_selected_option(
-        context,
-        option,
-        timeout_seconds=max(1, int(args.timeout)),
-        dry_run=bool(args.dry_run),
-        strict_visual_grounding=not bool(args.no_strict_visual_grounding),
-    )
-    context_lifecycle_update: JsonDict = {}
-    if not bool(args.dry_run) and execution.get("result_type") != "done_probe_result":
-        context_lifecycle_update = mark_context_stale_after_execution(
-            context_path,
-            option_id=option_id,
-            execution=execution,
-        )
-    result = {
-        "status": execution.get("status", "error"),
-        "result_type": "selected_option_handled",
-        "selected_option_id": option_id,
-        "context_path": str(context_path),
-        "option": option,
-        "execution": execution,
-        "context_lifecycle_update": context_lifecycle_update,
-        "trace_path": str(TRACE_PATH),
-    }
-    append_trace({"event": "selected_option_handled", "result": result})
-    json_print(result, compact=args.format == "compact")
-    return 0 if result["status"] == "success" else 1
+        return 0 if result["status"] == "success" else 1
+    finally:
+        restore_runtime_environment(previous_runtime_env)
 
 
 if __name__ == "__main__":

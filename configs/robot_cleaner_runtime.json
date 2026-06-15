@@ -1,9 +1,10 @@
 {
   "schema": "robot_cleaner_runtime_config_v1",
   "map": {
-    "backend": "map_bundle",
+    "backend": "ai2thor_groundtruth",
     "bundle_path": "memory/maps/current",
     "fallback_backend": "action_odometry",
-    "fallback_if_bundle_missing": true
+    "fallback_if_bundle_missing": false,
+    "source_mode": "live"
   }
 }

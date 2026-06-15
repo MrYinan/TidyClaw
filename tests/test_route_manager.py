@@ -1,8 +1,10 @@
 import json
+import os
 import shutil
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.route_manager import update_active_route
 
@@ -61,6 +63,13 @@ def write_route_fixture(
 
 
 class RouteManagerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._backend_env = patch.dict(os.environ, {"ROBOT_MAP_BACKEND": "action_odometry"}, clear=False)
+        self._backend_env.start()
+
+    def tearDown(self) -> None:
+        self._backend_env.stop()
+
     def test_committed_route_turnaround_uses_deterministic_left_turn_not_goal_drift(self) -> None:
         memory = make_tmp_dir("route-turnaround")
         self.addCleanup(shutil.rmtree, memory, ignore_errors=True)
