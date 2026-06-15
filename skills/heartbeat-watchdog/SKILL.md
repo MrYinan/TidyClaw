@@ -1,6 +1,6 @@
 ---
 name: heartbeat-watchdog
-description: OpenClaw heartbeat 触发时做空闲感知，并在发现服务整理目标时通过 patrol-runner skill 启动后台 tidy 巡视。
+description: OpenClaw heartbeat 触发时做空闲感知，并在发现服务整理目标时请求 OpenClaw 启动/交接给非 heartbeat 的 tidy-room-agent 任务。
 metadata:
   {
     "openclaw":
@@ -19,11 +19,12 @@ metadata:
 
 ```text
 heartbeat-watchdog
--> 检查 patrol-runner 是否正在运行
+-> 检查是否已有整理任务正在运行
 -> 空闲时做一次轻量感知和结构化分析
--> 如果发现服务整理目标，调用 patrol-runner skill 的 --command start --task-mode tidy 启动后台 runner，并返回启动通知
--> 如果上一轮后台巡视已有可汇报结果，调用 patrol-runner skill 的 --command report，并返回用户可见总结
--> runner 正在运行时只观察和记录，不打扰用户
+-> 如果发现服务整理目标，返回 heartbeat_tidy_agent_run_requested 和 agent_run_request
+-> OpenClaw 把 agent_run_request 交给非 heartbeat 的 tidy-room-agent 会话或 taskflow
+-> 如果兼容模式下使用 patrol-runner，则仍可启动后台 runner 并在后续 heartbeat 转发报告
+-> 已有任务运行时只观察和记录，不打扰用户
 ```
 
 ## 使用场景
@@ -31,7 +32,7 @@ heartbeat-watchdog
 当 OpenClaw heartbeat 被触发时，优先执行：
 
 ```bash
-python C:\Users\天涯\.openclaw\workspace-robot-cleaner\skills\heartbeat-watchdog\scripts\heartbeat_watchdog.py --task-mode tidy
+python C:\Users\天涯\.openclaw\workspace-robot-cleaner\skills\heartbeat-watchdog\scripts\heartbeat_watchdog.py --task-mode tidy --launch-mode agent-request
 ```
 
 ## Runtime JSON Contract
@@ -48,7 +49,8 @@ python C:\Users\天涯\.openclaw\workspace-robot-cleaner\skills\heartbeat-watchd
 可能的 `result_type`：
 
 - `heartbeat_runner_alive`：runner 正在运行，不做动作
-- `heartbeat_target_found_started`：空闲感知发现服务整理目标，已调用 `patrol-runner` skill 的 `--command start` 启动后台 tidy 巡视
+- `heartbeat_tidy_agent_run_requested`：空闲感知发现服务整理目标，已请求 OpenClaw 启动/交接给非 heartbeat 的 `tidy-room-agent` 任务
+- `heartbeat_target_found_started`：兼容模式下，空闲感知发现服务整理目标，已调用 `patrol-runner` skill 的 `--command start` 启动后台 tidy 巡视
 - `heartbeat_target_found_start_failed`：空闲感知发现目标，但启动后台巡视失败
 - `heartbeat_room_report_ready`：上一轮后台巡视已有可汇报结果，已调用 `patrol-runner --command report` 生成总结
 - `heartbeat_room_report_failed`：上一轮后台巡视可能有结果，但 report 命令失败
@@ -62,6 +64,7 @@ python C:\Users\天涯\.openclaw\workspace-robot-cleaner\skills\heartbeat-watchd
 - `should_notify_user = true`：OpenClaw Agent 应把 `user_message` 发到聊天框
 - `notify_user = true`：与其他 runner skill 的通知字段保持一致，表示本次结果应通知用户
 - `user_message`：用于“主动发现目标并启动 runner”或“后台巡视已有结果”等状态变化
+- `agent_run_request`：当 `result_type = heartbeat_tidy_agent_run_requested` 时出现，包含要交给 OpenClaw 的 `tidy-room-agent` 启动请求和 prompt
 - `runner_start`：当 `result_type = heartbeat_target_found_started` 时出现，包含 `patrol-runner --command start` 的返回结果
 - `runner_report`：当 `result_type = heartbeat_room_report_ready` 时出现，包含 `patrol-runner --command report` 的返回结果
 
@@ -72,8 +75,9 @@ OpenClaw heartbeat 触发时：
 1. 调用本 skill。
 2. 如果返回 `should_notify_user = true` 或 `notify_user = true`，优先把 `user_message` 原样或略微润色后发给用户。
 3. 如果返回 `heartbeat_runner_alive`、`heartbeat_idle_no_task`、`heartbeat_idle_no_scan`、`heartbeat_state_observed_no_action`，回复 `HEARTBEAT_OK`。
-4. 如果返回 `heartbeat_target_found_started`，把 `user_message` 发到聊天框，说明后台 runner 已启动；不要在本 heartbeat 回合继续等待完整巡视结束。
-5. 如果返回 `heartbeat_room_report_ready`，把 `user_message` 发到聊天框；该文本来自 `patrol-runner --command report`。
+4. 如果返回 `heartbeat_tidy_agent_run_requested`，heartbeat 回合只负责交接：把 `agent_run_request` 交给非 heartbeat 的 `tidy-room-agent` 会话或 taskflow。不要在 heartbeat 回合中直接调用 `robot_cleaner_prepare_decision_turn()` 或 `robot_cleaner_execute_option()`。
+5. 如果返回 `heartbeat_target_found_started`，说明当前使用兼容 `patrol-runner` 模式；把 `user_message` 发到聊天框，不要在本 heartbeat 回合继续等待完整巡视结束。
+6. 如果返回 `heartbeat_room_report_ready`，把 `user_message` 发到聊天框；该文本来自 `patrol-runner --command report`。
 
 不要在 heartbeat 回合中手工循环调用移动、拾取、放置或清扫 skill。
 不要在 heartbeat 回合中使用 `patrol-runner --command segment` 做周期续跑；正式路径是启动 continuous runner。

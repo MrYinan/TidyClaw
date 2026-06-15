@@ -39,6 +39,10 @@ python skills\execute-option\scripts\execute_option.py --selection-json "{\"sele
 ## 支持的 option_id
 
 - `observe:refresh`：刷新 RGB-D 观察和 YOLO 结构化感知，不是物理动作。
+- `orient:waypoint_floor_scan`：到达 active inspection waypoint 后，执行一次原地安全信息增益转向；下一轮必须重新 prepare/full observe。
+- `continue:active_waypoint_goal`：继续当前 active inspection waypoint，执行器只解析并执行一个安全路线步。
+- `explore:inspection_waypoint:<id>`：选择一个稳定 inspection waypoint 作为巡视目标，执行器只解析并执行一个安全路线步。
+- `pursue:pickup_target:<handle>`：可见地面 pickup target 尚未 pickup-ready 时，执行一个安全对齐/接近动作；下一轮必须重新 prepare/observe。
 - `place_precheck:*`：调用 `place-object --precheck-only`，验证点云候选是否可执行；成功后写入 `memory/place-precheck-cache.json`。
 - `move:*`：调用 `move-robot`。
 - `pick:*`：调用 `pick-object`。
@@ -50,6 +54,7 @@ python skills\execute-option\scripts\execute_option.py --selection-json "{\"sele
 
 - 不要绕过这个 skill 直接运行 move/pick/place/clean 脚本。
 - 每次只提交一个 `option_id`。
+- `frontier_cluster`、`route_step`、底层 `move:*` 只作为 fallback；当存在 `pick:*`、`pursue:*`、`orient:*`、`continue:*` 或 `explore:inspection_waypoint:*` 时，不要主动改选低层 fallback。
 - 如果返回 `error_option_validation_failed`，优先按 `required_next` 重新感知或重新构建 context。
 - 如果 `place_precheck:*` 成功，下一步先重新运行 `build-decision-context`，再选择新的 `place:*`。
 - 执行成功不等于房间完成；`place-object` 成功只表示一个整理子任务完成。

@@ -12,6 +12,7 @@ from scripts.decision_context_builder import (
     build_explore_frontier_options,
     build_explore_route_step_options,
     build_explore_waypoint_options,
+    build_inspection_waypoint_options,
     build_consistency_warnings,
     build_context,
 )
@@ -337,9 +338,11 @@ class DecisionContextBuilderTests(unittest.TestCase):
                 memory / "position-map.json",
                 {
                     "pose": {"cell": "0,1", "heading": "north"},
+                    "frontiers": ["1,1"],
                     "cells": {
                         "0,0": {"state": "free", "visited": True},
                         "0,1": {"state": "free", "visited": True},
+                        "1,1": {"state": "unknown", "visited": False},
                     },
                 },
             )
@@ -373,6 +376,138 @@ class DecisionContextBuilderTests(unittest.TestCase):
         self.assertEqual(orient["kind"], "orient_waypoint_floor_scan")
         self.assertEqual(orient["action"], "RotateRight")
         self.assertEqual(orient["active_waypoint_goal"]["waypoint_id"], "wp_front")
+        self.assertEqual(orient["floor_scan_policy"], "safe_information_gain_turn_before_full_waypoint_observe")
+        self.assertTrue(orient["information_gain"]["facing_frontier"])
+
+    def test_waypoint_floor_scan_prefers_unvisited_frontier_over_recent_path(self) -> None:
+        memory = WORKSPACE_ROOT / "memory" / "decision-context-waypoint-floor-scan-info-gain"
+        if memory.exists():
+            shutil.rmtree(memory)
+        try:
+            write_json(memory / "mission-state.json", {"enabled": True, "mode": "SERVICE", "max_steps": 80})
+            write_json(
+                memory / "room-state.json",
+                {
+                    "room_name": "current_room",
+                    "room_complete": False,
+                    "visited_cells": ["0,1", "-1,1"],
+                    "recent_navigation_cells": ["-1,1"],
+                    "frontier_cells": ["1,1"],
+                    "inspection_waypoints": [
+                        {"waypoint_id": "wp_scan", "cell": "0,1"},
+                        {"waypoint_id": "wp_other", "cell": "2,1"},
+                    ],
+                    "coverage_waypoints": {
+                        "active_waypoint_goal": {
+                            "waypoint_id": "wp_scan",
+                            "cell": "0,1",
+                            "status": "active",
+                        }
+                    },
+                },
+            )
+            write_json(memory / "patrol-state.json", {"enabled": True, "mode": "SERVICE", "step_count": 5})
+            write_json(
+                memory / "service-task-state.json",
+                {"phase": "SEARCH_PICKUP_TARGET", "holding_object": False, "pickup_surface_policy": "floor-only"},
+            )
+            write_json(
+                memory / "navigation-costmap.json",
+                {
+                    "status": "success",
+                    "action_safety": {
+                        "RotateLeft": {"safe": True, "reason": "left_clearer", "observed_ratio": 1.0},
+                        "RotateRight": {"safe": True, "reason": "right_less_clear", "observed_ratio": 0.4},
+                    },
+                },
+            )
+            write_json(
+                memory / "position-map.json",
+                {
+                    "pose": {"cell": "0,1", "heading": "north"},
+                    "frontiers": ["1,1"],
+                    "cells": {
+                        "0,1": {"state": "free", "visited": True},
+                        "-1,1": {"state": "free", "visited": True},
+                        "1,1": {"state": "unknown", "visited": False},
+                    },
+                },
+            )
+            write_json(memory / "object-memory.json", {"tracks": {}})
+            write_json(memory / "global-plan.json", {"status": "reset"})
+            perception = memory / "yolo-current-rgbd.json"
+            write_json(
+                perception,
+                {
+                    "status": "success",
+                    "result_type": "navigation_only_observed",
+                    "perception_mode": "navigation_only",
+                    "online_safe": True,
+                    "pickup_target_detected": False,
+                    "frontier_exists": True,
+                },
+            )
+
+            context = build_context(self.build_args(memory, perception))
+        finally:
+            if memory.exists():
+                shutil.rmtree(memory)
+
+        orient = next(item for item in context["option_set"]["options"] if item["option_id"] == "orient:waypoint_floor_scan")
+        self.assertEqual(orient["action"], "RotateRight")
+        self.assertEqual(orient["information_gain"]["facing_cell"], "1,1")
+        self.assertTrue(orient["information_gain"]["facing_frontier"])
+
+    def test_inspection_waypoint_options_prioritize_information_gain_over_distance(self) -> None:
+        coverage = {
+            "required_waypoint_count": 3,
+            "pending_waypoint_count": 2,
+            "observed_waypoint_count": 1,
+            "blocked_waypoint_count": 0,
+            "sweep_coverage_rate": 0.33,
+            "next_unobserved_waypoints": [
+                {
+                    "waypoint_id": "wp_near",
+                    "cell": "0,1",
+                    "last_distance_cells": 1,
+                    "coverage_estimate": 0.05,
+                    "covered_cell_count": 2,
+                    "status": "pending",
+                },
+                {
+                    "waypoint_id": "wp_gain",
+                    "cell": "3,0",
+                    "last_distance_cells": 3,
+                    "coverage_estimate": 0.20,
+                    "covered_cell_count": 8,
+                    "status": "pending",
+                },
+            ],
+        }
+        position_map = {
+            "frontiers": ["3,0"],
+            "cells": {
+                "0,1": {"state": "free", "visited": True},
+                "3,0": {"state": "unknown", "visited": False},
+            },
+        }
+        room = {"visited_cells": ["0,1"], "frontier_cells": ["3,0"], "recent_navigation_cells": ["0,1"]}
+
+        options = build_inspection_waypoint_options(
+            coverage_waypoints=coverage,
+            costmap={"action_safety": {}},
+            position_map=position_map,
+            room=room,
+            holding=False,
+            has_task_options=False,
+            max_waypoints=2,
+        )
+
+        self.assertEqual(options[0]["option_id"], "explore:inspection_waypoint:wp_gain")
+        self.assertGreater(
+            options[0]["waypoint_target"]["information_gain"]["score"],
+            options[1]["waypoint_target"]["information_gain"]["score"],
+        )
 
     def test_low_confidence_translation_move_is_not_exposed(self) -> None:
         memory = WORKSPACE_ROOT / "memory" / "decision-context-low-confidence-fixture"

@@ -45,6 +45,29 @@ try:
 except ImportError:  # pragma: no cover - direct script execution
     from navigation_core import build_navigation_core_state
 
+try:
+    from scripts.position_map_core import (
+        CELL_FREE,
+        CELL_UNKNOWN,
+        four_neighbors,
+        heading_between,
+        left_heading,
+        neighbor_cell,
+        parse_cell,
+        right_heading,
+    )
+except ImportError:  # pragma: no cover - direct script execution
+    from position_map_core import (
+        CELL_FREE,
+        CELL_UNKNOWN,
+        four_neighbors,
+        heading_between,
+        left_heading,
+        neighbor_cell,
+        parse_cell,
+        right_heading,
+    )
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MEMORY_DIR = REPO_ROOT / "memory"
@@ -1108,6 +1131,144 @@ def inspection_waypoint_option_id(waypoint_id: Any) -> str:
     return f"explore:inspection_waypoint:{safe}" if safe else "explore:inspection_waypoint:unknown"
 
 
+def parse_cell_safe(value: Any) -> tuple[int, int] | None:
+    try:
+        return parse_cell(value)
+    except Exception:
+        return None
+
+
+def cell_text(value: Any) -> str:
+    parsed = parse_cell_safe(value)
+    if parsed is None:
+        return ""
+    return f"{parsed[0]},{parsed[1]}"
+
+
+def map_cells(position_map: JsonDict | None) -> JsonDict:
+    cells = as_dict(as_dict(position_map).get("cells"))
+    return cells
+
+
+def cell_record(position_map: JsonDict | None, cell: Any) -> JsonDict:
+    key = cell_text(cell)
+    if not key:
+        return {}
+    return as_dict(map_cells(position_map).get(key))
+
+
+def cell_state(position_map: JsonDict | None, cell: Any) -> str:
+    return str(cell_record(position_map, cell).get("state") or "")
+
+
+def cell_visited(position_map: JsonDict | None, room: JsonDict | None, cell: Any) -> bool:
+    key = cell_text(cell)
+    if not key:
+        return False
+    rec = cell_record(position_map, key)
+    if rec.get("visited") is True:
+        return True
+    return key in {str(item) for item in as_list(as_dict(room).get("visited_cells"))}
+
+
+def frontier_cells(position_map: JsonDict | None, room: JsonDict | None) -> set[str]:
+    values = []
+    data = as_dict(position_map)
+    state = as_dict(room)
+    values.extend(as_list(data.get("frontiers")))
+    values.extend(as_list(data.get("frontier_cells")))
+    values.extend(as_list(state.get("frontier_cells")))
+    values.extend(as_list(state.get("known_frontier_cells")))
+    return {cell for item in values if (cell := cell_text(item))}
+
+
+def recent_navigation_cells(room: JsonDict | None, *, limit: int = 10) -> set[str]:
+    state = as_dict(room)
+    cells: set[str] = set()
+    for item in as_list(state.get("recent_navigation_cells"))[-limit:]:
+        if cell := cell_text(item):
+            cells.add(cell)
+    for action in as_list(state.get("recent_navigation_actions"))[-limit:]:
+        text = str(action or "")
+        # The action list is often action-only, but some older entries contain
+        # explicit cells; harvest them when present without relying on it.
+        for token in text.replace("->", " ").replace(":", " ").split():
+            if "," in token and (cell := cell_text(token)):
+                cells.add(cell)
+    if cell := cell_text(state.get("last_cell")):
+        cells.add(cell)
+    return cells
+
+
+def unknown_neighbor_count(position_map: JsonDict | None, cell: Any) -> int:
+    key = cell_text(cell)
+    if not key:
+        return 0
+    cells = map_cells(position_map)
+    count = 0
+    for neighbor in four_neighbors(key):
+        rec = as_dict(cells.get(neighbor))
+        if not rec or str(rec.get("state") or CELL_UNKNOWN) == CELL_UNKNOWN:
+            count += 1
+    return count
+
+
+def semantic_frontier_score(position_map: JsonDict | None, cell: Any) -> float:
+    scores = as_dict(as_dict(position_map).get("frontier_scores"))
+    item = as_dict(scores.get(cell_text(cell)))
+    value = number_or_none(item.get("exploration_score"))
+    return float(value or 0.0)
+
+
+def waypoint_information_gain(
+    waypoint: JsonDict,
+    *,
+    position_map: JsonDict | None,
+    room: JsonDict | None,
+) -> JsonDict:
+    cell = cell_text(waypoint.get("cell"))
+    frontiers = frontier_cells(position_map, room)
+    recent = recent_navigation_cells(room)
+    unknown = unknown_neighbor_count(position_map, cell)
+    visited = cell_visited(position_map, room, cell) or waypoint.get("map_visited") is True
+    frontier_bonus = 1.0 if cell in frontiers else 0.0
+    semantic_bonus = semantic_frontier_score(position_map, cell)
+    coverage = float(number_or_none(waypoint.get("coverage_estimate")) or 0.0)
+    covered_cells = float(number_or_none(waypoint.get("covered_cell_count")) or 0.0)
+    recent_penalty = 1.0 if cell in recent else 0.0
+    visited_penalty = 0.6 if visited else 0.0
+    score = (
+        1.20 * frontier_bonus
+        + 0.45 * unknown
+        + 0.70 * semantic_bonus
+        + 0.20 * coverage
+        + min(0.8, 0.03 * covered_cells)
+        - recent_penalty
+        - visited_penalty
+    )
+    return clean_empty(
+        {
+            "cell": cell,
+            "score": round(score, 6),
+            "frontier_bonus": frontier_bonus,
+            "unknown_neighbor_count": unknown,
+            "semantic_frontier_score": round(semantic_bonus, 6),
+            "coverage_estimate": waypoint.get("coverage_estimate"),
+            "covered_cell_count": waypoint.get("covered_cell_count"),
+            "visited_penalty": visited_penalty,
+            "recent_path_penalty": recent_penalty,
+            "policy": "semexp_frontier_information_gain",
+        }
+    )
+
+
+def waypoint_sort_key(item: JsonDict) -> tuple[float, int, str]:
+    gain = as_dict(item.get("information_gain"))
+    score = float(number_or_none(gain.get("score")) or 0.0)
+    distance = int(number_or_none(item.get("last_distance_cells"), digits=0) or 10**9)
+    return (-score, distance, str(item.get("waypoint_id") or ""))
+
+
 def route_step_option_id(route_id: Any, step_index: Any) -> str:
     return option_id("explore:route_step", f"{route_id or 'route'}:{step_index or 0}")
 
@@ -1123,6 +1284,7 @@ def waypoint_target_payload(item: JsonDict) -> JsonDict:
             "coverage_radius_cells": item.get("coverage_radius_cells"),
             "coverage_estimate": item.get("coverage_estimate"),
             "covered_cell_count": item.get("covered_cell_count"),
+            "information_gain": item.get("information_gain"),
             "component_id": item.get("component_id"),
             "component_size": item.get("component_size"),
             "last_distance_cells": item.get("last_distance_cells"),
@@ -1805,6 +1967,8 @@ def build_inspection_waypoint_options(
     *,
     coverage_waypoints: JsonDict | None,
     costmap: JsonDict,
+    position_map: JsonDict | None = None,
+    room: JsonDict | None = None,
     holding: bool,
     has_task_options: bool,
     max_waypoints: int = 4,
@@ -1827,6 +1991,8 @@ def build_inspection_waypoint_options(
             scan_option = build_waypoint_floor_scan_option(
                 coverage_waypoints=coverage,
                 costmap=costmap,
+                position_map=position_map,
+                room=room,
             )
             if scan_option:
                 return [scan_option]
@@ -1895,8 +2061,17 @@ def build_inspection_waypoint_options(
         ]
 
     result: list[JsonDict] = []
+    pending_waypoints = []
     for raw in as_list(coverage.get("next_unobserved_waypoints")):
-        item = as_dict(raw)
+        item = dict(as_dict(raw))
+        item["information_gain"] = waypoint_information_gain(
+            item,
+            position_map=position_map,
+            room=room,
+        )
+        pending_waypoints.append(item)
+    pending_waypoints = sorted(pending_waypoints, key=waypoint_sort_key)
+    for item in pending_waypoints:
         waypoint_id = str(item.get("waypoint_id") or "").strip()
         if not waypoint_id:
             continue
@@ -1956,13 +2131,86 @@ def active_waypoint_reached_and_unprepared(coverage_waypoints: JsonDict | None) 
     return active_goal, waypoint_id
 
 
-def choose_waypoint_floor_scan_action(costmap: JsonDict) -> tuple[str, str, JsonDict]:
+def scan_action_information_gain(
+    *,
+    action: str,
+    active_goal: JsonDict,
+    position_map: JsonDict | None,
+    room: JsonDict | None,
+) -> JsonDict:
+    current_cell = cell_text(active_goal.get("cell"))
+    if not current_cell:
+        return {}
+    pose = as_dict(as_dict(position_map).get("pose"))
+    heading = str(pose.get("heading") or as_dict(position_map).get("last_heading") or as_dict(room).get("last_heading") or "north")
+    if action == "RotateLeft":
+        scan_heading = left_heading(heading)
+    elif action == "RotateRight":
+        scan_heading = right_heading(heading)
+    else:
+        scan_heading = heading
+    try:
+        facing_cell = neighbor_cell(current_cell, scan_heading)
+    except Exception:
+        facing_cell = ""
+    frontiers = frontier_cells(position_map, room)
+    recent = recent_navigation_cells(room)
+    state = cell_state(position_map, facing_cell)
+    visited = cell_visited(position_map, room, facing_cell)
+    unknown = unknown_neighbor_count(position_map, facing_cell)
+    semantic_bonus = semantic_frontier_score(position_map, facing_cell)
+    score = (
+        (1.4 if facing_cell in frontiers else 0.0)
+        + (0.9 if not visited else 0.0)
+        + (0.45 * unknown)
+        + (0.70 * semantic_bonus)
+        + (0.5 if state in {"", CELL_UNKNOWN} else 0.0)
+        - (0.8 if facing_cell in recent else 0.0)
+    )
+    return clean_empty(
+        {
+            "action": action,
+            "scan_heading": scan_heading,
+            "facing_cell": facing_cell,
+            "facing_cell_state": state or "unknown",
+            "facing_frontier": facing_cell in frontiers,
+            "facing_cell_visited": visited,
+            "unknown_neighbor_count": unknown,
+            "semantic_frontier_score": round(semantic_bonus, 6),
+            "recent_path_penalty": 0.8 if facing_cell in recent else 0.0,
+            "score": round(score, 6),
+            "policy": "semexp_frontier_information_gain",
+        }
+    )
+
+
+def choose_waypoint_floor_scan_action(
+    costmap: JsonDict,
+    *,
+    active_goal: JsonDict | None = None,
+    position_map: JsonDict | None = None,
+    room: JsonDict | None = None,
+) -> tuple[str, str, JsonDict, JsonDict]:
     left = costmap_action_record(costmap, "RotateLeft")
     right = costmap_action_record(costmap, "RotateRight")
+    gains = {
+        "RotateLeft": scan_action_information_gain(
+            action="RotateLeft",
+            active_goal=as_dict(active_goal),
+            position_map=position_map,
+            room=room,
+        ),
+        "RotateRight": scan_action_information_gain(
+            action="RotateRight",
+            active_goal=as_dict(active_goal),
+            position_map=position_map,
+            room=room,
+        ),
+    }
 
-    def score(record: JsonDict) -> tuple[int, float]:
+    def score(action: str, record: JsonDict) -> tuple[int, float, float]:
         if record.get("safe") is False:
-            return (-1000, -1.0)
+            return (-1000, -1.0, -1.0)
         safety = 10 if record.get("safe") is True else 1
         clearance = number_or_none(
             first_present(
@@ -1973,24 +2221,32 @@ def choose_waypoint_floor_scan_action(costmap: JsonDict) -> tuple[str, str, Json
             ),
             digits=4,
         )
-        return (safety, float(clearance) if clearance is not None else 0.0)
+        gain = number_or_none(as_dict(gains.get(action)).get("score"))
+        return (safety, float(gain or 0.0), float(clearance) if clearance is not None else 0.0)
 
-    left_score = score(left)
-    right_score = score(right)
+    left_score = score("RotateLeft", left)
+    right_score = score("RotateRight", right)
     if right_score > left_score:
-        return "RotateRight", str(right.get("reason") or "right_turn_selected_for_waypoint_floor_scan"), right
-    return "RotateLeft", str(left.get("reason") or "left_turn_selected_for_waypoint_floor_scan"), left
+        return "RotateRight", str(right.get("reason") or "right_turn_selected_for_waypoint_floor_scan"), right, gains["RotateRight"]
+    return "RotateLeft", str(left.get("reason") or "left_turn_selected_for_waypoint_floor_scan"), left, gains["RotateLeft"]
 
 
 def build_waypoint_floor_scan_option(
     *,
     coverage_waypoints: JsonDict | None,
     costmap: JsonDict,
+    position_map: JsonDict | None = None,
+    room: JsonDict | None = None,
 ) -> JsonDict | None:
     active_goal, waypoint_id = active_waypoint_reached_and_unprepared(coverage_waypoints)
     if not waypoint_id:
         return None
-    action, safety_reason, action_record = choose_waypoint_floor_scan_action(costmap)
+    action, safety_reason, action_record, scan_gain = choose_waypoint_floor_scan_action(
+        costmap,
+        active_goal=active_goal,
+        position_map=position_map,
+        room=room,
+    )
     safe, costmap_reason = action_safe(costmap, action)
     if safe is False:
         fallback = "RotateRight" if action == "RotateLeft" else "RotateLeft"
@@ -2000,6 +2256,12 @@ def build_waypoint_floor_scan_option(
         action = fallback
         safety_reason = fallback_reason or "fallback_safe_turn_for_waypoint_floor_scan"
         action_record = costmap_action_record(costmap, fallback)
+        scan_gain = scan_action_information_gain(
+            action=fallback,
+            active_goal=active_goal,
+            position_map=position_map,
+            room=room,
+        )
     return clean_empty(
         {
             "option_id": "orient:waypoint_floor_scan",
@@ -2018,10 +2280,11 @@ def build_waypoint_floor_scan_option(
                 "status": active_goal.get("status"),
                 "floor_scan_prepared": False,
             },
-            "floor_scan_policy": "safe_in_place_turn_before_full_waypoint_observe",
+            "floor_scan_policy": "safe_information_gain_turn_before_full_waypoint_observe",
+            "information_gain": scan_gain,
             "reason": (
                 "Active inspection waypoint cell is reached; rotate in place once before full "
-                "YOLO/depth observation so the view is less likely to be dominated by a table, counter, or cabinet face."
+                "YOLO/depth observation, preferring a safe view toward frontier or unvisited space."
             ),
             "safety_source": "navigation-costmap",
             "costmap_reason": safety_reason or costmap_reason,
@@ -2044,6 +2307,8 @@ def build_options(
     explore_plan: JsonDict | None = None,
     navigation_core: JsonDict | None = None,
     coverage_waypoints: JsonDict | None = None,
+    position_map: JsonDict | None = None,
+    room: JsonDict | None = None,
     worklist: JsonDict,
     done_readiness: JsonDict,
     max_options: int,
@@ -2208,6 +2473,8 @@ def build_options(
     inspection_waypoint_options = build_inspection_waypoint_options(
         coverage_waypoints=as_dict(coverage_waypoints),
         costmap=costmap,
+        position_map=position_map,
+        room=room,
         holding=holding,
         has_task_options=has_task_options,
     )
@@ -3130,6 +3397,8 @@ def build_context(args: argparse.Namespace) -> JsonDict:
         explore_plan=explore_plan,
         navigation_core=navigation_core,
         coverage_waypoints=coverage_waypoints,
+        position_map=position_map,
+        room=room,
         worklist=worklist,
         done_readiness=done_readiness,
         max_options=max(1, args.max_options),

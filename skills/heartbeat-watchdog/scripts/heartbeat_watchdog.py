@@ -7,10 +7,11 @@ It only:
 
 1. checks whether patrol-runner is alive;
 2. optionally performs a single idle perception pass;
-3. starts patrol-runner in detached mode when idle perception finds a clean/task target;
-4. returns a ready patrol-runner report on a later heartbeat when the background
+3. requests an OpenClaw tidy-room-agent run when idle perception finds a task target;
+4. optionally starts patrol-runner in detached mode when explicitly configured;
+5. returns a ready patrol-runner report on a later heartbeat when the background
    runner has finished;
-5. records a heartbeat log for research/debugging.
+6. records a heartbeat log for research/debugging.
 """
 
 from __future__ import annotations
@@ -69,6 +70,7 @@ def invocation_metadata(argv: Optional[Sequence[str]], args: argparse.Namespace)
         "cwd": os.getcwd(),
         "script": str(Path(__file__).resolve()),
         "scan_idle": bool(getattr(args, "scan_idle", False)),
+        "launch_mode": str(getattr(args, "launch_mode", "agent-request")),
     }
     return metadata
 
@@ -294,6 +296,54 @@ def start_runner(args: argparse.Namespace) -> JsonDict:
             "result_type": "patrol_runner_start_timeout",
             "message": str(exc),
         }
+
+
+def build_tidy_agent_run_request(args: argparse.Namespace, scan: JsonDict) -> JsonDict:
+    analysis = scan.get("analysis", {}) if isinstance(scan.get("analysis"), dict) else {}
+    return {
+        "type": "openclaw_agent_run_request",
+        "agent": "robot-cleaner",
+        "skill": "tidy-room-agent",
+        "task_mode": str(args.task_mode),
+        "max_steps": int(args.max_steps),
+        "reason": "heartbeat_idle_scan_found_service_target",
+        "trigger_candidates": analysis.get("heartbeat_trigger_candidates", []),
+        "required_tools": [
+            "robot_cleaner_prepare_decision_turn",
+            "robot_cleaner_execute_option",
+            "robot_cleaner_status",
+            "robot_cleaner_report",
+            "robot_cleaner_stop",
+        ],
+        "loop_contract": [
+            "Call robot_cleaner_prepare_decision_turn first.",
+            "Choose exactly one current executable option_id from option_set.options.",
+            "Call robot_cleaner_execute_option with that option_id.",
+            "After every execution, prepare again before choosing another option.",
+            "Stop only on room_complete, recover_failed, explicit stop, or max_steps.",
+        ],
+        "prompt": (
+            "启动一个非 heartbeat 的 tidy-room-agent 任务来整理当前房间。"
+            "heartbeat 回合本身不得执行机器人动作，也不得直接调用 "
+            "robot_cleaner_prepare_decision_turn 或 robot_cleaner_execute_option。"
+            "新的 tidy-room-agent 任务启动后，每轮先调用 robot_cleaner_prepare_decision_turn，"
+            "再从当前 option_set.options 中选择一个 executable_now=true 的 option_id，"
+            "并调用 robot_cleaner_execute_option 执行。优先级遵守 tidy-room-agent/SKILL.md："
+            "pick/pursue/place/recover/orient/continue/explore:inspection_waypoint，然后才允许 fallback。"
+            "每次执行后必须重新 prepare。持续运行直到 room_complete、recover failed、用户停止或达到 "
+            "max_steps，然后调用 robot_cleaner_report 汇报。"
+        ),
+    }
+
+
+def tidy_agent_request_user_message(request: JsonDict) -> str:
+    candidates = request.get("trigger_candidates", [])
+    candidate_count = len(candidates) if isinstance(candidates, list) else 0
+    return (
+        "心跳主动感知到当前房间存在疑似地面/近地面整理目标，"
+        "已请求 OpenClaw 进入 tidy-room-agent 自主整理循环。"
+        f"触发候选数：{candidate_count}。"
+    )
 
 
 def status_report_ready(status: JsonDict) -> bool:
@@ -536,7 +586,7 @@ def idle_scan(timeout: int, perception_backend: str, *, task_mode: str) -> JsonD
         save_vis = str(
             os.getenv(
                 "ROBOT_HEARTBEAT_YOLO_SAVE_VIS",
-                str(MEMORY_DIR / "yolo-heartbeat-annotated-rgbd.jpg"),
+                "",
             )
             or ""
         ).strip()
@@ -689,32 +739,46 @@ def check_once(args: argparse.Namespace) -> JsonDict:
             analysis,
             task_mode=str(args.task_mode),
         ):
-            start_result = start_runner(args)
-            start_ok = start_result.get("status") == "success"
             task_noun = "suspected service candidate" if str(args.task_mode).lower() == "tidy" else "floor target"
-            result.update(
-                {
-                    "result_type": (
-                        "heartbeat_target_found_started"
-                        if start_ok
-                        else "heartbeat_target_found_start_failed"
-                    ),
-                    "action_taken": "start_patrol_runner" if start_ok else "start_patrol_runner_failed",
-                    "message": (
-                        f"idle scan found a {task_noun}; started patrol-runner in detached mode"
-                        if start_ok
-                        else f"idle scan found a {task_noun}, but patrol-runner did not start"
-                    ),
-                    "should_notify_user": True,
-                    "notify_user": True,
-                    "user_message": (
-                        service_start_user_message(start_result)
-                        if str(args.task_mode).lower() == "tidy"
-                        else start_user_message(start_result)
-                    ),
-                    "runner_start": start_result,
-                }
-            )
+            if str(args.launch_mode) == "patrol-runner":
+                start_result = start_runner(args)
+                start_ok = start_result.get("status") == "success"
+                result.update(
+                    {
+                        "result_type": (
+                            "heartbeat_target_found_started"
+                            if start_ok
+                            else "heartbeat_target_found_start_failed"
+                        ),
+                        "action_taken": "start_patrol_runner" if start_ok else "start_patrol_runner_failed",
+                        "message": (
+                            f"idle scan found a {task_noun}; started patrol-runner in detached mode"
+                            if start_ok
+                            else f"idle scan found a {task_noun}, but patrol-runner did not start"
+                        ),
+                        "should_notify_user": True,
+                        "notify_user": True,
+                        "user_message": (
+                            service_start_user_message(start_result)
+                            if str(args.task_mode).lower() == "tidy"
+                            else start_user_message(start_result)
+                        ),
+                        "runner_start": start_result,
+                    }
+                )
+            else:
+                agent_request = build_tidy_agent_run_request(args, scan)
+                result.update(
+                    {
+                        "result_type": "heartbeat_tidy_agent_run_requested",
+                        "action_taken": "request_openclaw_tidy_agent_run",
+                        "message": f"idle scan found a {task_noun}; requested an OpenClaw tidy-room-agent run",
+                        "should_notify_user": True,
+                        "notify_user": True,
+                        "user_message": tidy_agent_request_user_message(agent_request),
+                        "agent_run_request": agent_request,
+                    }
+                )
         else:
             task_noun = (
                 "household service target"
@@ -756,18 +820,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--perception-backend",
         choices=sorted(PERCEPTION_BACKENDS.keys()),
         default=os.getenv("ROBOT_PERCEPTION_BACKEND", "yolo"),
-        help="Scene analysis backend for idle scan and any started patrol-runner.",
+        help="Scene analysis backend for idle scan.",
     )
     parser.add_argument(
         "--task-mode",
         choices=["clean", "tidy"],
         default=os.getenv("ROBOT_TASK_MODE", "tidy"),
-        help="Runner task mode. tidy starts on service-object detections, clean starts on floor-clean targets.",
+        help="Task mode. tidy starts on service-object detections, clean starts on floor-clean targets.",
+    )
+    parser.add_argument(
+        "--launch-mode",
+        choices=["agent-request", "patrol-runner"],
+        default=os.getenv("ROBOT_HEARTBEAT_LAUNCH_MODE", "agent-request"),
+        help=(
+            "What to do when idle scan finds a task. agent-request asks OpenClaw to start "
+            "tidy-room-agent; patrol-runner keeps the legacy detached script runner."
+        ),
     )
     parser.add_argument(
         "--scan-idle",
         action="store_true",
-        help="When IDLE, do one get-vision + analyze pass and start patrol-runner if a task target is detected.",
+        help="When IDLE, do one get-vision + analyze pass and trigger launch-mode if a task target is detected.",
     )
     parser.add_argument(
         "--no-scan-idle",

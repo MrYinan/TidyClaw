@@ -45,11 +45,15 @@ python skills\build-decision-context\scripts\build_decision_context.py --task-mo
 ## Agent 规则
 
 - 当这个 skill 可用时，不要把完整 `position-map.json`、`semantic-map.json` 或 `object-memory.json` 读进聊天上下文。
+- 主坐标和主地图来自 AI2-THOR groundtruth。`action_odometry` / `position-map` 只作为 fallback/debug，不应进入大模型主决策链。
 - 大模型不要自由生成机器人动作，只能从 `option_set.options` 中选择一个 `option_id`。
 - 大模型的输出应该只包含 `selected_option_id` 和一句简短理由。
 - 不要直接执行 `option_set` 中的动作；必须交给 runner 或执行层重新校验。
 - `observe:refresh` 不是物理动作。
 - `place_precheck:*` 不是物理动作，只用于让后端验证当前点云放置候选是否真的 executor-ready。
+- `orient:waypoint_floor_scan` 是 waypoint 到达后的原地安全信息增益转向；执行后必须重新构建 context。
+- `continue:active_waypoint_goal` 和 `explore:inspection_waypoint:<id>` 是当前巡视主线；`frontier_cluster` / `route_step` 是 fallback。
+- `pursue:pickup_target:<handle>` 表示 full observe 已看到地面 pickup target，但还没到可拾取位姿；它应优先于 waypoint 巡视。
 - `move:*`、`pick:*`、`place:*`、`clean:*` 最多对应一个最终物理动作。
 - `place-object` 成功只表示一个 tidy 子任务完成，不表示整个房间完成。
 
