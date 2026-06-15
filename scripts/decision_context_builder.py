@@ -105,8 +105,10 @@ SURFACE_REGION_SOURCES = {
 
 GOAL_LEVEL_OPTION_KINDS = {
     "service_action",
+    "pursue_pickup_target",
     "place_precheck",
     "clean_action",
+    "orient_waypoint_floor_scan",
     "explore_inspection_waypoint",
     "continue_active_waypoint_goal",
     "explore_frontier_cluster",
@@ -1142,6 +1144,128 @@ def candidate_ref(candidate: JsonDict) -> JsonDict:
     )
 
 
+def pickup_target_handle(candidate: JsonDict, *, index: int = 0) -> str:
+    return str(
+        first_present(
+            candidate.get("track_id"),
+            candidate.get("candidate_id"),
+            candidate.get("candidate_signature"),
+            candidate.get("label"),
+            f"pickup_target_{index}",
+        )
+    )
+
+
+def pursue_pickup_target_option_id(candidate: JsonDict, *, index: int = 0) -> str:
+    return option_id("pursue:pickup_target", pickup_target_handle(candidate, index=index))
+
+
+def pickup_candidate_pursuit_action(candidate: JsonDict, costmap: JsonDict) -> tuple[str, str]:
+    actionability = as_dict(candidate.get("actionability"))
+    geometry = as_dict(candidate.get("geometry"))
+    position_hint = str(candidate.get("position_hint") or geometry.get("position_hint") or "")
+    needs_alignment = actionability.get("needs_alignment") is True
+    needs_approach = actionability.get("needs_approach") is True
+
+    if position_hint == "front-left" or (needs_alignment and position_hint != "front-right"):
+        action = "RotateLeft"
+    elif position_hint == "front-right":
+        action = "RotateRight"
+    elif position_hint == "front-center" or needs_approach:
+        action = "MoveAhead"
+    else:
+        action = "RotateLeft"
+
+    if action == "MoveAhead":
+        safe, reason = action_safe(costmap, action)
+        if safe is True and not low_confidence_move_record(costmap, action):
+            return action, reason or "approach_visible_pickup_target"
+        return "RotateLeft", "approach_blocked_or_low_confidence; rotate_to_reobserve_visible_pickup_target"
+    safe, reason = action_safe(costmap, action)
+    if safe is False:
+        alternate = "RotateRight" if action == "RotateLeft" else "RotateLeft"
+        alternate_safe, alternate_reason = action_safe(costmap, alternate)
+        if alternate_safe is not False:
+            return alternate, alternate_reason or "alternate_turn_to_reobserve_visible_pickup_target"
+    return action, reason or "align_visible_pickup_target"
+
+
+def pickup_candidate_pursuit_ready(candidate: JsonDict) -> bool:
+    actionability = as_dict(candidate.get("actionability"))
+    if actionability.get("pickup_now") is True and actionability.get("reachable") is True:
+        return False
+    if str(candidate.get("task_class") or "") != "pickup_target":
+        return False
+    if actionability.get("blocked") is True or actionability.get("failed_recently") is True:
+        return False
+    if actionability.get("is_floor_level") is False:
+        return False
+    if actionability.get("visual_box_ambiguous") is True:
+        return False
+    try:
+        confidence = float(candidate.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence < 0.45:
+        return False
+    position_hint = str(candidate.get("position_hint") or as_dict(candidate.get("geometry")).get("position_hint") or "")
+    return bool(
+        position_hint in {"front-left", "front-center", "front-right"}
+        and (
+            actionability.get("needs_alignment") is True
+            or actionability.get("needs_approach") is True
+            or actionability.get("reachable") is True
+        )
+    )
+
+
+def build_pursue_pickup_target_options(
+    *,
+    pickup_candidates: list[Any],
+    costmap: JsonDict,
+    max_targets: int = 2,
+) -> list[JsonDict]:
+    result: list[JsonDict] = []
+    for index, raw in enumerate(pickup_candidates):
+        item = as_dict(raw)
+        if not pickup_candidate_pursuit_ready(item):
+            continue
+        action, safety_reason = pickup_candidate_pursuit_action(item, costmap)
+        result.append(
+            clean_empty(
+                {
+                    "option_id": pursue_pickup_target_option_id(item, index=index),
+                    "kind": "pursue_pickup_target",
+                    "physical_action": True,
+                    "tool": "move-robot",
+                    "action": action,
+                    "executable_now": True,
+                    "decision_level": "task_goal",
+                    "llm_priority": "primary",
+                    "fallback_only": False,
+                    "one_step_only": True,
+                    "candidate_ref": candidate_ref(item),
+                    "observed_handle": {
+                        "handle_id": pickup_target_handle(item, index=index),
+                        "label": item.get("label"),
+                        "task_class": item.get("task_class"),
+                    },
+                    "pursuit_policy": "visible_floor_pickup_target_interrupts_waypoint_patrol",
+                    "required_next": "robot_cleaner_prepare_decision_turn",
+                    "reason": (
+                        "Visible floor pickup target is not pickup-ready yet; "
+                        "approach or align one safe step, then re-observe before picking."
+                    ),
+                    "safety_source": "navigation-costmap",
+                    "costmap_reason": safety_reason,
+                }
+            )
+        )
+        if len(result) >= max(1, int(max_targets)):
+            break
+    return result
+
+
 def candidate_matches_ref(candidate: JsonDict, ref: JsonDict) -> bool:
     if not ref:
         return False
@@ -1375,7 +1499,17 @@ def annotate_option_selection_contract(options: list[JsonDict]) -> JsonDict:
         for option in options
         if option.get("kind") == "continue_active_waypoint_goal" and option.get("executable_now") is True
     ]
-    waypoint_decision_option_ids = continue_option_ids + inspection_option_ids
+    pursue_pickup_option_ids = [
+        str(option.get("option_id"))
+        for option in options
+        if option.get("kind") == "pursue_pickup_target" and option.get("executable_now") is True
+    ]
+    floor_scan_option_ids = [
+        str(option.get("option_id"))
+        for option in options
+        if option.get("kind") == "orient_waypoint_floor_scan" and option.get("executable_now") is True
+    ]
+    waypoint_decision_option_ids = floor_scan_option_ids + continue_option_ids + inspection_option_ids
     explore_option_ids = [
         str(option.get("option_id"))
         for option in options
@@ -1429,7 +1563,11 @@ def annotate_option_selection_contract(options: list[JsonDict]) -> JsonDict:
             continue
 
         option["fallback_only"] = False
-        if kind == "continue_active_waypoint_goal":
+        if kind == "orient_waypoint_floor_scan":
+            option["decision_level"] = "waypoint_observation_setup"
+            option["llm_priority"] = "primary"
+            option["allowed_when"] = "active_inspection_waypoint_cell_reached_but_floor_scan_turn_not_prepared"
+        elif kind == "continue_active_waypoint_goal":
             option["decision_level"] = "navigation_goal_continuation"
             option["llm_priority"] = "primary"
             option["allowed_when"] = "active_inspection_waypoint_goal_in_progress"
@@ -1468,6 +1606,10 @@ def annotate_option_selection_contract(options: list[JsonDict]) -> JsonDict:
             option["decision_level"] = "recovery"
             option["llm_priority"] = "primary"
             option["allowed_when"] = "dead_end_or_blocked_region_recovery"
+        elif kind == "pursue_pickup_target":
+            option["decision_level"] = "task_goal"
+            option["llm_priority"] = "primary"
+            option["allowed_when"] = "visible_floor_pickup_target_requires_approach_alignment_or_reobservation"
         elif kind in {"service_action", "place_precheck", "clean_action"}:
             option["decision_level"] = "task"
             option["llm_priority"] = "primary"
@@ -1502,6 +1644,8 @@ def annotate_option_selection_contract(options: list[JsonDict]) -> JsonDict:
             ),
             "fallback_options": fallback_options,
             "goal_options": goal_option_ids,
+            "pursue_pickup_target_options": pursue_pickup_option_ids,
+            "waypoint_floor_scan_options": floor_scan_option_ids,
             "explore_goal_options": explore_option_ids,
             "explore_inspection_waypoint_options": inspection_option_ids,
             "continue_active_waypoint_options": continue_option_ids,
@@ -1660,6 +1804,7 @@ def build_recovery_options(
 def build_inspection_waypoint_options(
     *,
     coverage_waypoints: JsonDict | None,
+    costmap: JsonDict,
     holding: bool,
     has_task_options: bool,
     max_waypoints: int = 4,
@@ -1676,6 +1821,15 @@ def build_inspection_waypoint_options(
     active_waypoint_id = str(active_goal.get("waypoint_id") or "").strip()
     active_status = str(active_goal.get("status") or "").strip()
     if active_waypoint_id and active_status not in {"blocked", "failed"}:
+        active_route = as_dict(coverage.get("active_waypoint_route"))
+        route_step = as_dict(active_route.get("route_step"))
+        if active_waypoint_reached_and_unprepared(coverage)[1]:
+            scan_option = build_waypoint_floor_scan_option(
+                coverage_waypoints=coverage,
+                costmap=costmap,
+            )
+            if scan_option:
+                return [scan_option]
         return [
             clean_empty(
                 {
@@ -1697,6 +1851,33 @@ def build_inspection_waypoint_options(
                         "next_action": active_goal.get("next_action"),
                         "next_cell": active_goal.get("next_cell"),
                         "purpose": active_goal.get("purpose"),
+                    },
+                    "active_waypoint_route": {
+                        "status": active_route.get("status"),
+                        "route_id": active_route.get("route_id"),
+                        "waypoint_id": active_route.get("waypoint_id"),
+                        "goal_cell": active_route.get("goal_cell"),
+                        "current_cell": active_route.get("current_cell"),
+                        "current_heading": active_route.get("current_heading"),
+                        "next_action": active_route.get("next_action"),
+                        "next_cell": active_route.get("next_cell"),
+                        "path": active_route.get("path"),
+                        "path_length": active_route.get("path_length"),
+                        "action_safety": active_route.get("action_safety"),
+                    },
+                    "route_step": {
+                        "route_id": route_step.get("route_id"),
+                        "step_index": route_step.get("step_index"),
+                        "status": route_step.get("status"),
+                        "action": route_step.get("action"),
+                        "current_cell": route_step.get("current_cell"),
+                        "current_heading": route_step.get("current_heading"),
+                        "target_cell": route_step.get("target_cell"),
+                        "next_cell": route_step.get("next_cell"),
+                        "goal_cell": route_step.get("goal_cell"),
+                        "desired_heading": route_step.get("desired_heading"),
+                        "heading_after_action": route_step.get("heading_after_action"),
+                        "progress_effect": route_step.get("progress_effect"),
                     },
                     "coverage_progress": {
                         "sweep_coverage_rate": coverage.get("sweep_coverage_rate"),
@@ -1750,6 +1931,108 @@ def build_inspection_waypoint_options(
         if len(result) >= max(1, int(max_waypoints)):
             break
     return result
+
+
+def active_waypoint_reached_and_unprepared(coverage_waypoints: JsonDict | None) -> tuple[JsonDict, str]:
+    coverage = as_dict(coverage_waypoints)
+    active_goal = as_dict(coverage.get("active_waypoint_goal"))
+    waypoint_id = str(active_goal.get("waypoint_id") or "").strip()
+    if not waypoint_id:
+        return {}, ""
+    status = str(active_goal.get("status") or "").strip().lower()
+    prepared = active_goal.get("floor_scan_prepared") is True
+    if prepared:
+        return {}, ""
+    if status not in {"reached", "arrived", "active"}:
+        return {}, ""
+    current_cell = str(active_goal.get("current_cell") or "").strip()
+    target_cell = str(active_goal.get("cell") or "").strip()
+    if current_cell and target_cell and current_cell != target_cell:
+        return {}, ""
+    waypoint_status = as_dict(as_dict(coverage.get("waypoint_status")).get(waypoint_id))
+    distance = number_or_none(waypoint_status.get("last_distance_cells"), digits=0)
+    if status not in {"reached", "arrived"} and not (current_cell and target_cell == current_cell) and distance != 0:
+        return {}, ""
+    return active_goal, waypoint_id
+
+
+def choose_waypoint_floor_scan_action(costmap: JsonDict) -> tuple[str, str, JsonDict]:
+    left = costmap_action_record(costmap, "RotateLeft")
+    right = costmap_action_record(costmap, "RotateRight")
+
+    def score(record: JsonDict) -> tuple[int, float]:
+        if record.get("safe") is False:
+            return (-1000, -1.0)
+        safety = 10 if record.get("safe") is True else 1
+        clearance = number_or_none(
+            first_present(
+                record.get("clearance_m"),
+                record.get("min_clearance_m"),
+                record.get("side_clearance_m"),
+                record.get("observed_ratio"),
+            ),
+            digits=4,
+        )
+        return (safety, float(clearance) if clearance is not None else 0.0)
+
+    left_score = score(left)
+    right_score = score(right)
+    if right_score > left_score:
+        return "RotateRight", str(right.get("reason") or "right_turn_selected_for_waypoint_floor_scan"), right
+    return "RotateLeft", str(left.get("reason") or "left_turn_selected_for_waypoint_floor_scan"), left
+
+
+def build_waypoint_floor_scan_option(
+    *,
+    coverage_waypoints: JsonDict | None,
+    costmap: JsonDict,
+) -> JsonDict | None:
+    active_goal, waypoint_id = active_waypoint_reached_and_unprepared(coverage_waypoints)
+    if not waypoint_id:
+        return None
+    action, safety_reason, action_record = choose_waypoint_floor_scan_action(costmap)
+    safe, costmap_reason = action_safe(costmap, action)
+    if safe is False:
+        fallback = "RotateRight" if action == "RotateLeft" else "RotateLeft"
+        fallback_safe, fallback_reason = action_safe(costmap, fallback)
+        if fallback_safe is False:
+            return None
+        action = fallback
+        safety_reason = fallback_reason or "fallback_safe_turn_for_waypoint_floor_scan"
+        action_record = costmap_action_record(costmap, fallback)
+    return clean_empty(
+        {
+            "option_id": "orient:waypoint_floor_scan",
+            "kind": "orient_waypoint_floor_scan",
+            "physical_action": True,
+            "tool": "move-robot",
+            "action": action,
+            "executable_now": True,
+            "decision_level": "waypoint_observation_setup",
+            "llm_priority": "primary",
+            "fallback_only": False,
+            "one_step_only": True,
+            "active_waypoint_goal": {
+                "waypoint_id": waypoint_id,
+                "cell": active_goal.get("cell"),
+                "status": active_goal.get("status"),
+                "floor_scan_prepared": False,
+            },
+            "floor_scan_policy": "safe_in_place_turn_before_full_waypoint_observe",
+            "reason": (
+                "Active inspection waypoint cell is reached; rotate in place once before full "
+                "YOLO/depth observation so the view is less likely to be dominated by a table, counter, or cabinet face."
+            ),
+            "safety_source": "navigation-costmap",
+            "costmap_reason": safety_reason or costmap_reason,
+            "action_safety": {
+                "safe": action_record.get("safe"),
+                "reason": action_record.get("reason"),
+                "observed_ratio": action_record.get("observed_ratio"),
+            },
+            "required_next": "robot_cleaner_prepare_decision_turn",
+        }
+    )
 
 
 def build_options(
@@ -1807,6 +2090,12 @@ def build_options(
                         "reason": "Visible pickup target is reachable and pickup_now=true.",
                     }
                 )
+        options.extend(
+            build_pursue_pickup_target_options(
+                pickup_candidates=pickup_candidates,
+                costmap=costmap,
+            )
+        )
 
     if structured_ok and holding and phase in SERVICE_PLACE_PHASES | {""}:
         for candidate in [*surface_candidates, *receptacle_candidates]:
@@ -1918,6 +2207,7 @@ def build_options(
     )
     inspection_waypoint_options = build_inspection_waypoint_options(
         coverage_waypoints=as_dict(coverage_waypoints),
+        costmap=costmap,
         holding=holding,
         has_task_options=has_task_options,
     )
@@ -1982,7 +2272,7 @@ def build_options(
             "llm_should_choose_from": "primary_options_first",
             "raw_move_policy": "fallback_only_when_goal_level_options_exist",
             "explore_policy": (
-                "when no pick/place option is appropriate and explore goal options exist, "
+                "when no pick/place/pursue-pickup option is appropriate and explore goal options exist, "
                 "choose continue:active_waypoint_goal when an inspection waypoint goal is active; "
                 "otherwise choose explore:inspection_waypoint:<id> as the model decision target; "
                 "legacy explore:frontier_cluster, explore:route_step, explore:waypoint, explore:frontier, "
@@ -1992,6 +2282,11 @@ def build_options(
             "recovery_policy": (
                 "if recovery_options are present, choose one before repeated observe:refresh, "
                 "done:probe, or normal exploration; recover:lookdown restores camera pitch after recover:lookup"
+            ),
+            "pickup_pursuit_policy": (
+                "visible floor pickup targets interrupt waypoint patrol. If a target is seen but not "
+                "pickup-ready, choose pursue:pickup_target:<handle> before continue/new inspection waypoint; "
+                "the executor performs exactly one safe align/approach step and the next turn must re-observe."
             ),
         },
         "rule_baseline_option_id": rule_baseline,
@@ -2505,6 +2800,9 @@ def choose_rule_baseline_option(
                 return str(option["option_id"])
     for option in options:
         if option.get("kind") == "recovery_action":
+            return str(option["option_id"])
+    for option in options:
+        if option.get("kind") == "orient_waypoint_floor_scan":
             return str(option["option_id"])
     for option in options:
         if option.get("kind") == "continue_active_waypoint_goal":

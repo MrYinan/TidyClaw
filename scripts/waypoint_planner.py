@@ -34,6 +34,7 @@ try:
     from scripts.inspection_waypoints import build_inspection_waypoints, waypoint_by_id
     from scripts.map_backend import load_map_backend
     from scripts.map_backend.base import JsonDict, as_dict, as_list
+    from scripts.position_map_core import edge_key
     from scripts.route_manager import route_id_for, route_step_for_next_cell
     from scripts.runtime_config import apply_runtime_environment, restore_runtime_environment
 except ImportError:  # pragma: no cover - direct script execution
@@ -49,6 +50,7 @@ except ImportError:  # pragma: no cover - direct script execution
     from inspection_waypoints import build_inspection_waypoints, waypoint_by_id
     from map_backend import load_map_backend
     from map_backend.base import JsonDict, as_dict, as_list
+    from position_map_core import edge_key
     from route_manager import route_id_for, route_step_for_next_cell
     from runtime_config import apply_runtime_environment, restore_runtime_environment
 
@@ -167,6 +169,37 @@ def action_safety_record(costmap: Mapping[str, Any], action: str) -> JsonDict:
     return as_dict(as_dict(costmap.get("action_safety")).get(action))
 
 
+def blocked_edge_set(*sources: Mapping[str, Any]) -> set[str]:
+    blocked: set[str] = set()
+    for source in sources:
+        data = as_dict(source)
+        edges = as_dict(data.get("edges"))
+        for item in as_list(edges.get("blocked_edges")) + as_list(edges.get("hard_blocked_edges")):
+            text = str(item or "").strip()
+            if text:
+                blocked.add(text)
+        for item in as_list(data.get("blocked_edges")) + as_list(data.get("hard_blocked_edges")):
+            text = str(item or "").strip()
+            if text:
+                blocked.add(text)
+    return blocked
+
+
+def route_step_blocked_edge(route_step: Mapping[str, Any], blocked_edges: set[str]) -> str:
+    current = str(route_step.get("current_cell") or "").strip()
+    target = str(route_step.get("next_cell") or route_step.get("target_cell") or "").strip()
+    action = str(route_step.get("action") or "").strip()
+    if action not in TRANSLATION_ACTIONS or not current or not target or current == target:
+        return ""
+    direct = edge_key(current, target)
+    reverse = edge_key(target, current)
+    if direct in blocked_edges:
+        return direct
+    if reverse in blocked_edges:
+        return reverse
+    return ""
+
+
 def min_observed_ratio(record: Mapping[str, Any]) -> float:
     try:
         return float(record.get("min_observed_ratio"))
@@ -230,6 +263,7 @@ def build_waypoint_route(
     current_cell: str,
     current_heading: str,
     costmap: Mapping[str, Any],
+    blocked_edges: set[str] | None = None,
     previous_route: Mapping[str, Any] | None = None,
 ) -> JsonDict:
     waypoint_id = str(waypoint.get("waypoint_id") or "")
@@ -271,7 +305,10 @@ def build_waypoint_route(
             }
         )
 
-    next_cell = str(plan.get("next_cell") or (path[1] if len(path) > 1 else ""))
+    # Global planner's non-holonomic action may be a turn-in-place, in which
+    # case plan.next_cell is the current cell. Route steps still need the next
+    # path cell so they can derive the correct turn toward it.
+    next_cell = str((path[1] if len(path) > 1 else "") or plan.get("next_cell") or "")
     route_step = route_step_for_next_cell(
         route_id=route_id,
         step_index=step_index,
@@ -282,8 +319,20 @@ def build_waypoint_route(
         path=path,
     )
     action = str(route_step.get("action") or plan.get("next_action") or "")
-    safety = validate_action_safety(costmap, action)
-    status = _route_status_from_safety(str(plan.get("status") or ""), safety)
+    blocked_edge = route_step_blocked_edge(route_step, blocked_edges or set())
+    if blocked_edge:
+        safety = {
+            "safe": False,
+            "reason": "route_step_uses_hard_blocked_edge",
+            "action": action,
+            "blocked_edge": blocked_edge,
+        }
+        status = "blocked"
+        blocked_reason = "route_step_uses_hard_blocked_edge"
+    else:
+        safety = validate_action_safety(costmap, action)
+        status = _route_status_from_safety(str(plan.get("status") or ""), safety)
+        blocked_reason = None if safety.get("safe") is True else _route_block_reason(plan, safety)
     return clean_empty(
         {
             "schema": ACTIVE_WAYPOINT_ROUTE_SCHEMA,
@@ -303,7 +352,7 @@ def build_waypoint_route(
                 "source": WAYPOINT_ROUTE_STEP_SOURCE,
             },
             "action_safety": safety,
-            "blocked_reason": None if safety.get("safe") is True else _route_block_reason(plan, safety),
+            "blocked_reason": blocked_reason,
             "planner": plan.get("planner"),
             "planner_status": plan.get("status"),
             "updated_at": now_iso(),
@@ -447,6 +496,7 @@ def _plan_active_waypoint(
         }
     costmap = read_json(memory / "navigation-costmap.json")
     planner = AStarGlobalPlanner(memory)
+    blocked_edges = blocked_edge_set(snapshot.to_position_status(), room)
     plan = planner.plan_to_goal(
         current_cell=current_cell,
         current_heading=current_heading,
@@ -455,6 +505,7 @@ def _plan_active_waypoint(
         goal_type="inspection_waypoint",
         position_status=snapshot.to_position_status(),
         semantic_status={"cells": {}},
+        blocked_edges=blocked_edges,
         drive_model="nonholonomic",
     )
     previous_route = as_dict(coverage_state.get("active_waypoint_route"))
@@ -464,6 +515,7 @@ def _plan_active_waypoint(
         current_cell=current_cell,
         current_heading=current_heading,
         costmap=costmap,
+        blocked_edges=blocked_edges,
         previous_route=previous_route,
     )
     next_state = dict(coverage_state)

@@ -39,6 +39,8 @@ DECISION_CONTEXT_SCHEMA = "robot_cleaner_decision_context_v1"
 PLACE_PRECHECK_CACHE_SCHEMA = "robot_cleaner_place_precheck_cache_v1"
 PHYSICAL_KINDS = {
     "move_action",
+    "pursue_pickup_target",
+    "orient_waypoint_floor_scan",
     "explore_inspection_waypoint",
     "continue_active_waypoint_goal",
     "explore_frontier_cluster",
@@ -49,7 +51,11 @@ PHYSICAL_KINDS = {
     "service_action",
     "clean_action",
 }
-NAVIGATION_ONLY_WAYPOINT_KINDS = {"explore_inspection_waypoint", "continue_active_waypoint_goal"}
+NAVIGATION_ONLY_WAYPOINT_KINDS = {
+    "explore_inspection_waypoint",
+    "continue_active_waypoint_goal",
+    "orient_waypoint_floor_scan",
+}
 SURFACE_REGION_SOURCES = {
     "pointcloud_plane",
     "pointcloud_plane_completion",
@@ -81,6 +87,11 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.option_state_sync import sync_option_result
 from scripts.runtime_config import apply_runtime_environment, restore_runtime_environment
 from scripts.waypoint_planner import continue_active_waypoint_goal, plan_to_inspection_waypoint
+from scripts.coverage_waypoint_state import (
+    load_room_state,
+    mark_waypoint_floor_scan_prepared,
+    save_room_state,
+)
 
 
 @dataclass
@@ -311,6 +322,20 @@ def as_list(value: Any) -> list[Any]:
     return [value]
 
 
+def clean_empty(value: Any) -> Any:
+    if isinstance(value, dict):
+        result: JsonDict = {}
+        for key, item in value.items():
+            cleaned = clean_empty(item)
+            if cleaned in (None, "", [], {}):
+                continue
+            result[key] = cleaned
+        return result
+    if isinstance(value, list):
+        return [cleaned for item in value if (cleaned := clean_empty(item)) not in (None, "", [], {})]
+    return value
+
+
 def number_or_none(value: Any) -> int | float | None:
     if isinstance(value, bool):
         return None
@@ -349,6 +374,49 @@ def waypoint_id_for_option(option: JsonDict) -> str:
         return option_id[len(prefix) :].strip()
     active = as_dict(option.get("active_waypoint_goal"))
     return str(active.get("waypoint_id") or "").strip()
+
+
+def mark_selected_waypoint_floor_scan_prepared(option: JsonDict, action: str) -> JsonDict:
+    waypoint_id = waypoint_id_for_option(option)
+    if not waypoint_id:
+        return {
+            "status": "error",
+            "result_type": "waypoint_floor_scan_state_update_failed",
+            "reason": "missing_waypoint_id",
+        }
+    room = load_room_state(MEMORY_DIR)
+    coverage = as_dict(room.get("coverage_waypoints"))
+    if not coverage:
+        return {
+            "status": "error",
+            "result_type": "waypoint_floor_scan_state_update_failed",
+            "reason": "coverage_waypoints_unavailable",
+            "waypoint_id": waypoint_id,
+        }
+    try:
+        updated = mark_waypoint_floor_scan_prepared(
+            coverage,
+            waypoint_id,
+            action=action,
+            reason="safe_turn_before_full_waypoint_observe",
+        )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "result_type": "waypoint_floor_scan_state_update_failed",
+            "reason": type(exc).__name__,
+            "message": str(exc),
+            "waypoint_id": waypoint_id,
+        }
+    room["coverage_waypoints"] = updated
+    save_room_state(room, MEMORY_DIR)
+    return {
+        "status": "success",
+        "result_type": "waypoint_floor_scan_state_updated",
+        "waypoint_id": waypoint_id,
+        "action": action,
+        "floor_scan_prepared": True,
+    }
 
 
 def move_action_safety_record(context: JsonDict, action: str) -> JsonDict:
@@ -444,6 +512,21 @@ def place_candidate_precheck_ready(candidate: JsonDict) -> bool:
     if actionability.get("affordance_ready") is False:
         return False
     return bool(has_interaction_point(candidate) and has_placement_contract(candidate))
+
+
+def pickup_pursuit_candidate_ready(candidate: JsonDict) -> bool:
+    actionability = as_dict(candidate.get("actionability"))
+    if str(candidate.get("task_class") or candidate.get("task_semantic_class") or "") != "pickup_target":
+        return False
+    if actionability.get("pickup_now") is True and actionability.get("reachable") is True:
+        return False
+    if actionability.get("blocked") is True or actionability.get("failed_recently") is True:
+        return False
+    if actionability.get("is_floor_level") is False:
+        return False
+    if actionability.get("visual_box_ambiguous") is True:
+        return False
+    return True
 
 
 def required_next_for_place_candidate(candidate: JsonDict) -> str:
@@ -625,6 +708,40 @@ def validate_option(
             )
     if option.get("kind") == "move_action":
         action = resolved_move_action_for_option(context, option)
+        errors.extend(validate_resolved_move_safety(context, action, option))
+    if option.get("kind") == "pursue_pickup_target":
+        action = resolved_move_action_for_option(context, option)
+        if not str(option.get("option_id") or "").startswith("pursue:pickup_target:"):
+            errors.append({"type": "invalid_pursue_pickup_target_option_id", "option_id": option_id})
+        candidate = find_candidate_for_option(context, option)
+        if not candidate:
+            errors.append(
+                {
+                    "type": "pursue_pickup_target_candidate_not_found",
+                    "option_id": option_id,
+                    "candidate_ref": option.get("candidate_ref"),
+                }
+            )
+        elif not pickup_pursuit_candidate_ready(candidate):
+            errors.append(
+                {
+                    "type": "pursue_pickup_target_candidate_not_eligible",
+                    "required_next": "observe:refresh",
+                    "actionability": as_dict(candidate.get("actionability")),
+                }
+            )
+        errors.extend(validate_resolved_move_safety(context, action, option))
+    if option.get("kind") == "orient_waypoint_floor_scan":
+        action = resolved_move_action_for_option(context, option)
+        active_goal = as_dict(option.get("active_waypoint_goal"))
+        if option_id != "orient:waypoint_floor_scan":
+            errors.append({"type": "invalid_waypoint_floor_scan_option_id", "option_id": option_id})
+        if action not in {"RotateLeft", "RotateRight"}:
+            errors.append({"type": "invalid_waypoint_floor_scan_action", "action": action})
+        if not str(active_goal.get("waypoint_id") or "").strip():
+            errors.append({"type": "waypoint_floor_scan_missing_goal"})
+        if active_goal.get("floor_scan_prepared") is True:
+            errors.append({"type": "waypoint_floor_scan_already_prepared"})
         errors.extend(validate_resolved_move_safety(context, action, option))
     if option.get("kind") == "explore_inspection_waypoint":
         waypoint_id = waypoint_id_for_option(option)
@@ -1129,6 +1246,51 @@ def run_waypoint_plan_step(
     }
 
 
+def committed_waypoint_plan_from_option(option: JsonDict) -> JsonDict:
+    route = as_dict(option.get("active_waypoint_route"))
+    route_step = as_dict(option.get("route_step") or route.get("route_step"))
+    action = str(route_step.get("action") or route.get("next_action") or "").strip()
+    if str(route.get("status") or "") != "active" or not action:
+        return {}
+    plan = {
+        "schema": "robot_cleaner_waypoint_plan_v1",
+        "status": "active",
+        "result_type": "waypoint_plan_ready_from_committed_option",
+        "waypoint": {
+            "waypoint_id": route.get("waypoint_id") or as_dict(option.get("active_waypoint_goal")).get("waypoint_id"),
+            "cell": route.get("goal_cell") or as_dict(option.get("active_waypoint_goal")).get("cell"),
+        },
+        "current_pose": {
+            "cell": route.get("current_cell") or route_step.get("current_cell"),
+            "heading": route.get("current_heading") or route_step.get("current_heading"),
+        },
+        "route": {
+            **route,
+            "route_step": route_step or route.get("route_step"),
+        },
+        "next_action": action,
+        "next_cell": route_step.get("next_cell") or route.get("next_cell"),
+        "required_next": "execute_waypoint_route_step",
+        "committed_from_decision_context": True,
+    }
+    return clean_empty(plan)
+
+
+def committed_plan_matches_latest(committed: JsonDict, latest: JsonDict) -> bool:
+    committed_route = as_dict(committed.get("route"))
+    latest_pose = as_dict(latest.get("current_pose"))
+    committed_pose = as_dict(committed.get("current_pose"))
+    if str(latest.get("status") or "") == "reached":
+        return False
+    if str(latest_pose.get("cell") or "") != str(committed_pose.get("cell") or ""):
+        return False
+    if str(latest_pose.get("heading") or "") != str(committed_pose.get("heading") or ""):
+        return False
+    if str(as_dict(latest.get("waypoint")).get("waypoint_id") or "") != str(as_dict(committed.get("waypoint")).get("waypoint_id") or ""):
+        return False
+    return str(committed_route.get("status") or "") == "active"
+
+
 def run_selected_option(
     context: JsonDict,
     option: JsonDict,
@@ -1168,6 +1330,46 @@ def run_selected_option(
             timeout_seconds=timeout_seconds,
             result_type="option_move_executed",
         )
+    if kind == "pursue_pickup_target":
+        candidate = find_candidate_for_option(context, option)
+        extra = {
+            "candidate_ref": as_dict(option.get("candidate_ref")),
+            "observed_handle": as_dict(option.get("observed_handle")),
+            "pursuit_policy": option.get("pursuit_policy"),
+            "required_next": "robot_cleaner_prepare_decision_turn",
+            "one_step_only": True,
+        }
+        if candidate:
+            extra["candidate_payload"] = candidate_executor_payload(candidate, role="pickup")
+        return run_move_step(
+            context,
+            option,
+            action=resolved_move_action_for_option(context, option),
+            timeout_seconds=timeout_seconds,
+            result_type="option_pursue_pickup_target_step_executed",
+            extra=extra,
+        )
+    if kind == "orient_waypoint_floor_scan":
+        resolved_action = resolved_move_action_for_option(context, option)
+        result = run_move_step(
+            context,
+            option,
+            action=resolved_action,
+            timeout_seconds=timeout_seconds,
+            result_type="option_waypoint_floor_scan_oriented",
+            extra={
+                "active_waypoint_goal": as_dict(option.get("active_waypoint_goal")),
+                "floor_scan_policy": option.get("floor_scan_policy"),
+                "required_next": "robot_cleaner_prepare_decision_turn",
+                "one_step_only": True,
+            },
+        )
+        if result.get("status") == "success":
+            result["waypoint_floor_scan_state"] = mark_selected_waypoint_floor_scan_prepared(
+                option,
+                resolved_action,
+            )
+        return result
     if kind == "explore_inspection_waypoint":
         waypoint_id = waypoint_id_for_option(option)
         plan = plan_to_inspection_waypoint(
@@ -1183,10 +1385,24 @@ def run_selected_option(
             result_type="option_explore_inspection_waypoint_step_executed",
         )
     if kind == "continue_active_waypoint_goal":
-        plan = continue_active_waypoint_goal(
-            memory_dir=MEMORY_DIR,
-            persist=True,
-        )
+        committed_plan = committed_waypoint_plan_from_option(option)
+        if committed_plan:
+            latest_plan = continue_active_waypoint_goal(
+                memory_dir=MEMORY_DIR,
+                persist=False,
+            )
+            if committed_plan_matches_latest(committed_plan, latest_plan):
+                plan = committed_plan
+            else:
+                plan = continue_active_waypoint_goal(
+                    memory_dir=MEMORY_DIR,
+                    persist=True,
+                )
+        else:
+            plan = continue_active_waypoint_goal(
+                memory_dir=MEMORY_DIR,
+                persist=True,
+            )
         return run_waypoint_plan_step(
             context,
             option,

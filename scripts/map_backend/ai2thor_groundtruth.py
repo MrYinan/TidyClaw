@@ -198,6 +198,11 @@ def known_open_edges(cells: dict[str, JsonDict]) -> list[str]:
     return edges
 
 
+def last_blocked_edge_values(room_state: JsonDict) -> list[str]:
+    last_blocked = as_dict(room_state.get("last_blocked_edge"))
+    return unique_strings(last_blocked.get("edge"), last_blocked.get("reverse_edge"))
+
+
 def normalize_payload(raw: JsonDict) -> JsonDict:
     if isinstance(raw.get("groundtruth_map"), dict):
         return as_dict(raw.get("groundtruth_map"))
@@ -286,8 +291,13 @@ class AI2ThorGroundTruthMapBackend:
         frontiers = build_frontiers(cells, visited_in_map)
         open_edges = known_open_edges(cells)
         room_is_groundtruth = str(room_state.get("map_backend") or "") == self.backend_name
-        blocked_edges = unique_strings(room_state.get("blocked_edges")) if room_is_groundtruth else []
-        hard_blocked = unique_strings(room_state.get("hard_blocked_edges")) if room_is_groundtruth else []
+        last_blocked_edges = last_blocked_edge_values(room_state) if room_is_groundtruth else []
+        blocked_edges = (
+            unique_strings(room_state.get("blocked_edges"), last_blocked_edges) if room_is_groundtruth else []
+        )
+        hard_blocked = (
+            unique_strings(room_state.get("hard_blocked_edges"), last_blocked_edges) if room_is_groundtruth else []
+        )
         blocked_set = set(blocked_edges) | set(hard_blocked)
         open_edges = [edge for edge in open_edges if edge not in blocked_set]
         free_count = len(cells)

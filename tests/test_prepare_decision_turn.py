@@ -224,6 +224,7 @@ class PrepareDecisionTurnTests(unittest.TestCase):
                             "waypoint_id": "wp_front",
                             "cell": "0,1",
                             "status": "active",
+                            "floor_scan_prepared": True,
                         }
                     },
                 }
@@ -248,6 +249,63 @@ class PrepareDecisionTurnTests(unittest.TestCase):
         self.assertIn("wp_front", coverage["observed_waypoint_ids"])
         self.assertIsNone(coverage["active_waypoint_goal"])
         self.assertEqual(coverage["observed_waypoint_count"], 1)
+
+    def test_observe_reached_active_waypoint_requires_floor_scan_turn(self) -> None:
+        import json
+        import shutil
+        import uuid
+        from pathlib import Path
+
+        memory = Path(__file__).resolve().parents[1] / ".test-tmp" / f"prepare-waypoint-scan-{uuid.uuid4().hex}"
+        memory.mkdir(parents=True, exist_ok=False)
+        self.addCleanup(shutil.rmtree, memory, ignore_errors=True)
+        (memory / "position-map.json").write_text(
+            json.dumps(
+                {
+                    "pose": {"cell": "0,1", "heading": "north"},
+                    "cells": {
+                        "0,0": {"state": "free", "visited": True},
+                        "0,1": {"state": "free", "visited": True},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (memory / "room-state.json").write_text(
+            json.dumps(
+                {
+                    "inspection_waypoints": [
+                        {"waypoint_id": "wp_front", "cell": "0,1"},
+                        {"waypoint_id": "wp_home", "cell": "0,0"},
+                    ],
+                    "coverage_waypoints": {
+                        "active_waypoint_goal": {
+                            "waypoint_id": "wp_front",
+                            "cell": "0,1",
+                            "status": "active",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        refresh = {
+            "status": "success",
+            "vision": {"data": {"image_path": "memory/rgb.png"}},
+            "perception": {"data": {"status": "success", "result_type": "scene_analyzed_yolo"}},
+            "perception_written": "memory/yolo-current-rgbd.json",
+        }
+
+        with patch("scripts.prepare_decision_turn.MEMORY_DIR", memory):
+            result = observe_reached_active_waypoint(refresh)
+
+        room = json.loads((memory / "room-state.json").read_text(encoding="utf-8"))
+        coverage = room["coverage_waypoints"]
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reason"], "waypoint_floor_scan_not_prepared")
+        self.assertEqual(result["required_next"], "orient:waypoint_floor_scan")
+        self.assertNotIn("wp_front", coverage["observed_waypoint_ids"])
+        self.assertEqual(coverage["active_waypoint_goal"]["waypoint_id"], "wp_front")
 
 
 if __name__ == "__main__":

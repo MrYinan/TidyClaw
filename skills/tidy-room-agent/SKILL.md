@@ -64,13 +64,15 @@ metadata: {"openclaw":{"emoji":"robot"}}
 正常优先级：
 
 1. 如果存在 `pick:*`，优先拾取地面或近地面可拾取物。
-2. 如果已经持有物体，优先选择 `place_precheck:*` 或 `place:*`。
-3. 如果存在 `recover:*`，说明后端认为当前路线或局部安全需要恢复。优先选择一个当前存在的 `recover:*`。
-4. 如果存在 `continue:active_waypoint_goal`，继续当前 inspection waypoint。
-5. 如果没有 active waypoint，选择一个 `explore:inspection_waypoint:<id>` 作为新的巡视目标。
-6. `explore:frontier_cluster:*`、`explore:route_step:*`、`explore:waypoint:*`、`explore:frontier:*` 都是旧探索接口或执行层 fallback。只有当前轮没有 `continue:active_waypoint_goal` 和 `explore:inspection_waypoint:<id>`，或执行结果明确要求 fallback 时，才允许选择。
-7. 底层 `move:*` 只作为恢复或无目标级 option 时的 fallback。
-8. `done:probe` 只用于检查完成条件，不能把一次放置成功当成整个房间完成。
+2. 如果存在 `pursue:pickup_target:<handle>`，说明 waypoint/full observe 已看到地面 pickup target，但还没到 pickup-ready。优先选择它，中断 waypoint 巡视，先安全对齐/接近/重观察。
+3. 如果已经持有物体，优先选择 `place_precheck:*` 或 `place:*`。
+4. 如果存在 `recover:*`，说明后端认为当前路线或局部安全需要恢复。优先选择一个当前存在的 `recover:*`。
+5. 如果存在 `orient:waypoint_floor_scan`，说明已经到达 active inspection waypoint，但还没有为地面巡视做安全转向。优先选择它；它只执行一次原地 `RotateLeft/RotateRight`，下一轮重新 prepare 后才 full observe。
+6. 如果存在 `continue:active_waypoint_goal`，且没有 pick/pursue/place/recovery/orient，继续当前 inspection waypoint。
+7. 如果没有 active waypoint，且没有 pick/pursue/place/recovery/orient，选择一个 `explore:inspection_waypoint:<id>` 作为新的巡视目标。
+8. `explore:frontier_cluster:*`、`explore:route_step:*`、`explore:waypoint:*`、`explore:frontier:*` 都是旧探索接口或执行层 fallback。只有当前轮没有 `continue:active_waypoint_goal` 和 `explore:inspection_waypoint:<id>`，或执行结果明确要求 fallback 时，才允许选择。
+9. 底层 `move:*` 只作为恢复或无目标级 option 时的 fallback。
+10. `done:probe` 只用于检查完成条件，不能把一次放置成功当成整个房间完成。
 
 ## Recovery 规则
 
@@ -87,7 +89,9 @@ metadata: {"openclaw":{"emoji":"robot"}}
 
 硬规则：
 
-- 有 `continue:active_waypoint_goal` 时，不要改选新的 frontier 或底层 move。
+- 有 `pursue:pickup_target:<handle>` 时，它优先于 `continue:active_waypoint_goal`；waypoint 是寻找整理目标的手段，不是整理目标本身。
+- 有 `orient:waypoint_floor_scan` 时，优先执行它；waypoint 到达后要先安全转向，再让下一轮 full observe 记录观察结果。
+- 有 `continue:active_waypoint_goal` 且没有 pick/pursue/place/recovery/orient 时，不要改选新的 frontier 或底层 move。
 - 没有 active waypoint 且存在 `explore:inspection_waypoint:<id>` 时，优先选择一个 inspection waypoint。
 - `explore:inspection_waypoint:<id>` 只是选择巡视目标；执行层会把它解析成一小步安全动作。
 - 每次执行后必须重新 prepare；如果路线还没到达，下一轮通常会出现 `continue:active_waypoint_goal`。
@@ -97,8 +101,10 @@ metadata: {"openclaw":{"emoji":"robot"}}
 
 - `observe:refresh`：刷新 RGB-D 和结构化感知，不是物理动作。
 - `pick:*`：执行一个已验证的拾取动作。
+- `pursue:pickup_target:<handle>`：已观察到地面 pickup target，但还不能直接 pick。执行一个安全的对齐/接近动作；下一轮必须重新 prepare/observe，直到出现 `pick:*` 或后端拒绝/cooldown。
 - `place_precheck:*`：只做放置预检查，不执行放置。成功后下一轮重新 prepare，等待新的 `place:*`。
 - `place:*`：执行一个已通过执行层检查的放置动作。成功只表示一个整理子任务完成。
+- `orient:waypoint_floor_scan`：active waypoint 到达后的一次原地安全转向，用于避开桌面、柜门、台面正前方遮挡；执行后下一轮必须重新 prepare，由 full observe/Yolo+depth 决定是否追拾物体或继续巡视。
 - `continue:active_waypoint_goal`：继续当前 active inspection waypoint。
 - `explore:inspection_waypoint:<id>`：选择一个稳定巡视 waypoint 作为目标。
 - `explore:frontier_cluster:*` / `explore:route_step:*` / `explore:waypoint:*` / `explore:frontier:*`：旧探索接口，保留为 fallback。

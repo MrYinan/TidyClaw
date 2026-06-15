@@ -200,6 +200,44 @@ class WaypointPlannerTests(unittest.TestCase):
         self.assertEqual(result["route"]["blocked_reason"], "inflated_obstacle_in_swept_volume")
         self.assertEqual(result["coverage_waypoints"]["active_waypoint_goal"]["status"], "blocked")
 
+    def test_plan_avoids_hard_blocked_edge_when_rerouting_waypoint(self) -> None:
+        memory = make_tmp_dir("waypoint-plan-hard-blocked-edge")
+        self.addCleanup(shutil.rmtree, memory, ignore_errors=True)
+        state = authored_waypoint_state()
+        state["active_waypoint_goal"] = {
+            "waypoint_id": "wp_front",
+            "cell": "0,1",
+            "status": "active",
+        }
+        write_memory_fixture(
+            memory,
+            room_extra={
+                "blocked_edges": ["0,0->0,1", "0,1->0,0"],
+                "hard_blocked_edges": ["0,0->0,1", "0,1->0,0"],
+                "inspection_waypoints": [
+                    {
+                        "waypoint_id": "wp_front",
+                        "cell": "0,1",
+                        "purpose": "coverage_scan",
+                        "waypoint_source": "test_authored",
+                    }
+                ],
+                "coverage_waypoints": state,
+            },
+        )
+
+        result = continue_active_waypoint_goal(memory_dir=memory, persist=True)
+
+        self.assertEqual(result["status"], "active")
+        path_edges = [
+            f"{source}->{target}"
+            for source, target in zip(result["route"]["path"], result["route"]["path"][1:])
+        ]
+        self.assertNotIn("0,0->0,1", path_edges)
+        self.assertNotIn("0,1->0,0", path_edges)
+        self.assertNotEqual(result["route"]["route_step"]["next_cell"], "0,1")
+        self.assertTrue(result["route"]["action_safety"]["safe"])
+
     def test_plan_rejects_unknown_or_observed_waypoint(self) -> None:
         memory = make_tmp_dir("waypoint-plan-invalid")
         self.addCleanup(shutil.rmtree, memory, ignore_errors=True)

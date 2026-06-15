@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from scripts.authoritative_map_sync import sync_authoritative_room_state
 from scripts.map_backend import AI2ThorGroundTruthMapBackend, BackendUnavailableError, load_map_backend
 
 
@@ -92,6 +93,97 @@ class AI2ThorGroundTruthMapBackendTests(unittest.TestCase):
             backend = AI2ThorGroundTruthMapBackend(memory, source_mode="cache")
             with self.assertRaises(BackendUnavailableError):
                 backend.load_snapshot()
+        finally:
+            if memory.exists():
+                shutil.rmtree(memory)
+
+    def test_last_blocked_edge_is_preserved_as_hard_blocked_groundtruth_edge(self) -> None:
+        memory = fresh_memory("map-backend-ai2thor-last-blocked")
+        try:
+            write_json(
+                memory / "ai2thor-groundtruth-map.json",
+                {
+                    "status": "success",
+                    "result_type": "ai2thor_groundtruth_map",
+                    "scene": "FloorPlan1",
+                    "grid_size_m": 0.25,
+                    "robot": {
+                        "position": {"x": 1.0, "y": 0.9, "z": -1.0},
+                        "rotation": {"y": 0.0},
+                    },
+                    "reachable_positions": [
+                        {"x": 1.0, "y": 0.9, "z": -1.0},
+                        {"x": 1.0, "y": 0.9, "z": -0.75},
+                        {"x": 1.25, "y": 0.9, "z": -1.0},
+                    ],
+                },
+            )
+            write_json(
+                memory / "room-state.json",
+                {
+                    "map_backend": "ai2thor_groundtruth",
+                    "blocked_edges": [],
+                    "hard_blocked_edges": [],
+                    "last_blocked_edge": {
+                        "edge": "4,-4->4,-3",
+                        "reverse_edge": "4,-3->4,-4",
+                        "source": "ai2thor_groundtruth_collision_feedback",
+                    },
+                },
+            )
+
+            snapshot = AI2ThorGroundTruthMapBackend(memory, source_mode="cache").load_snapshot()
+            edges = snapshot.to_position_status()["edges"]
+
+            self.assertIn("4,-4->4,-3", edges["blocked_edges"])
+            self.assertIn("4,-3->4,-4", edges["blocked_edges"])
+            self.assertIn("4,-4->4,-3", edges["hard_blocked_edges"])
+        finally:
+            if memory.exists():
+                shutil.rmtree(memory)
+
+    def test_authoritative_sync_merges_existing_hard_blocked_edges(self) -> None:
+        memory = fresh_memory("map-backend-ai2thor-sync-blocked")
+        try:
+            write_json(
+                memory / "ai2thor-groundtruth-map.json",
+                {
+                    "status": "success",
+                    "result_type": "ai2thor_groundtruth_map",
+                    "scene": "FloorPlan1",
+                    "grid_size_m": 0.25,
+                    "robot": {
+                        "position": {"x": 1.0, "y": 0.9, "z": -1.0},
+                        "rotation": {"y": 0.0},
+                    },
+                    "reachable_positions": [
+                        {"x": 1.0, "y": 0.9, "z": -1.0},
+                        {"x": 1.0, "y": 0.9, "z": -0.75},
+                        {"x": 1.25, "y": 0.9, "z": -1.0},
+                    ],
+                },
+            )
+            write_json(
+                memory / "room-state.json",
+                {
+                    "map_backend": "ai2thor_groundtruth",
+                    "blocked_edges": ["0,0->1,0"],
+                    "hard_blocked_edges": ["0,0->1,0"],
+                    "last_blocked_edge": {
+                        "edge": "4,-4->4,-3",
+                        "reverse_edge": "4,-3->4,-4",
+                    },
+                },
+            )
+
+            with patch.dict("os.environ", {"ROBOT_MAP_BACKEND": "ai2thor", "ROBOT_AI2THOR_MAP_SOURCE": "cache"}):
+                result = sync_authoritative_room_state(memory)
+            room = json.loads((memory / "room-state.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["status"], "success")
+            self.assertIn("0,0->1,0", room["hard_blocked_edges"])
+            self.assertIn("4,-4->4,-3", room["hard_blocked_edges"])
+            self.assertIn("4,-3->4,-4", room["blocked_edges"])
         finally:
             if memory.exists():
                 shutil.rmtree(memory)

@@ -80,6 +80,39 @@ def _room_patch_from_snapshot(snapshot: MapSnapshot) -> JsonDict:
     }
 
 
+def _unique_strings(*values: Any) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for item in as_list(value):
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+def _last_blocked_edges(room: JsonDict) -> list[str]:
+    last_blocked = as_dict(room.get("last_blocked_edge"))
+    return _unique_strings(last_blocked.get("edge"), last_blocked.get("reverse_edge"))
+
+
+def _merge_public_blocked_edges(room: JsonDict, patch: JsonDict) -> None:
+    durable_hard_edges = _unique_strings(
+        room.get("hard_blocked_edges"),
+        patch.get("hard_blocked_edges"),
+        _last_blocked_edges(room),
+    )
+    durable_blocked_edges = _unique_strings(
+        room.get("blocked_edges"),
+        patch.get("blocked_edges"),
+        durable_hard_edges,
+    )
+    patch["blocked_edges"] = durable_blocked_edges
+    patch["hard_blocked_edges"] = durable_hard_edges
+
+
 def sync_authoritative_room_state(
     memory_dir: Path | str,
     *,
@@ -100,6 +133,7 @@ def sync_authoritative_room_state(
     room_path = memory / "room-state.json"
     room = read_json(room_path)
     patch = _room_patch_from_snapshot(snapshot)
+    _merge_public_blocked_edges(room, patch)
     room.update({key: value for key, value in patch.items() if value is not None})
     room["position_map_status"] = "debug_fallback"
     room["position_map_note"] = (

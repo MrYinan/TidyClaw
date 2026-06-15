@@ -35,6 +35,7 @@ from scripts.coverage_waypoint_state import (
     mark_waypoint_observed,
     normalize_coverage_waypoint_state,
     save_room_state,
+    waypoint_floor_scan_prepared,
 )
 from scripts.inspection_waypoints import build_inspection_waypoints, waypoint_by_id
 from scripts.local_costmap import LocalCostmap
@@ -43,6 +44,7 @@ from scripts.authoritative_map_sync import sync_authoritative_room_state
 from scripts.option_state_sync import ensure_tool_mission_active
 from scripts.route_manager import update_active_route
 from scripts.runtime_config import apply_runtime_environment, restore_runtime_environment
+from scripts.waypoint_planner import continue_active_waypoint_goal
 
 
 JsonDict = dict[str, Any]
@@ -226,6 +228,20 @@ def decide_perception_mode(args: argparse.Namespace, *, memory_dir: Path = MEMOR
         }
     current_cell = current_map_cell(memory_dir)
     if current_cell and target_cell and current_cell == target_cell:
+        if not waypoint_floor_scan_prepared(coverage, waypoint_id):
+            return {
+                "mode": "navigation_only",
+                "source": "auto",
+                "reason": "active_waypoint_reached_requires_safe_turn_before_task_observe",
+                "required_next": "orient:waypoint_floor_scan",
+                "active_waypoint_goal": {
+                    "waypoint_id": waypoint_id,
+                    "cell": target_cell,
+                    "status": status or active.get("status"),
+                    "floor_scan_prepared": False,
+                },
+                "current_cell": current_cell,
+            }
         return {
             "mode": "full",
             "source": "auto",
@@ -492,6 +508,22 @@ def observe_reached_active_waypoint(refresh: JsonDict) -> JsonDict:
             },
             "current_cell": current_cell,
         }
+    if not waypoint_floor_scan_prepared(coverage, waypoint_id):
+        room["coverage_waypoints"] = coverage
+        save_room_state(room, MEMORY_DIR)
+        return {
+            "status": "skipped",
+            "result_type": "waypoint_observation_not_recorded",
+            "reason": "waypoint_floor_scan_not_prepared",
+            "required_next": "orient:waypoint_floor_scan",
+            "active_waypoint_goal": {
+                "waypoint_id": waypoint_id,
+                "cell": target_cell,
+                "status": active.get("status"),
+                "floor_scan_prepared": False,
+            },
+            "current_cell": current_cell,
+        }
 
     perception = as_dict(refresh.get("perception"))
     perception_data = as_dict(perception.get("data"))
@@ -524,6 +556,30 @@ def observe_reached_active_waypoint(refresh: JsonDict) -> JsonDict:
         "pending_waypoint_count": updated.get("pending_waypoint_count"),
         "required_waypoint_count": updated.get("required_waypoint_count"),
     }
+
+
+def refresh_active_waypoint_route(*, memory_dir: Path = MEMORY_DIR) -> JsonDict:
+    """Refresh the committed one-step route for an active inspection waypoint."""
+
+    room = read_json_file(memory_dir / "room-state.json")
+    coverage = as_dict(room.get("coverage_waypoints"))
+    active = as_dict(coverage.get("active_waypoint_goal"))
+    waypoint_id = str(active.get("waypoint_id") or "").strip()
+    status = str(active.get("status") or "").strip().lower()
+    if not waypoint_id:
+        return {
+            "status": "skipped",
+            "result_type": "active_waypoint_route_refresh_skipped",
+            "reason": "no_active_waypoint_goal",
+        }
+    if status in {"blocked", "failed", "observed"}:
+        return {
+            "status": "skipped",
+            "result_type": "active_waypoint_route_refresh_skipped",
+            "reason": f"active_waypoint_status_{status or 'empty'}",
+            "waypoint_id": waypoint_id,
+        }
+    return continue_active_waypoint_goal(memory_dir=memory_dir, persist=True)
 
 
 def build_decision_context(args: argparse.Namespace, output_path: Path) -> ScriptResult:
@@ -628,6 +684,15 @@ def _prepare_decision_turn(
             "message": str(exc),
         }
 
+    try:
+        active_waypoint_route = refresh_active_waypoint_route(memory_dir=MEMORY_DIR)
+    except Exception as exc:
+        active_waypoint_route = {
+            "status": "error",
+            "result_type": "active_waypoint_route_refresh_failed",
+            "message": str(exc),
+        }
+
     context_result = build_decision_context(args, output_path)
     context = context_result.data if isinstance(context_result.data, dict) else {}
     if context_result.returncode != 0 or context.get("status") != "success":
@@ -644,6 +709,7 @@ def _prepare_decision_turn(
             "active_route": active_route,
             "authoritative_map_sync": authoritative_map_sync,
             "waypoint_observation": waypoint_observation,
+            "active_waypoint_route": active_waypoint_route,
             "context_builder": script_result_payload(context_result),
             "elapsed_ms": round((time.time() - started_at) * 1000, 1),
             "required_next": "inspect_decision_context_builder",
@@ -669,6 +735,7 @@ def _prepare_decision_turn(
         "active_route": active_route,
         "authoritative_map_sync": authoritative_map_sync,
         "waypoint_observation": waypoint_observation,
+        "active_waypoint_route": active_waypoint_route,
         "context_builder": script_result_payload(context_result),
         "decision_context": decision_context_public,
         "full_decision_context_path": display_path(output_path),

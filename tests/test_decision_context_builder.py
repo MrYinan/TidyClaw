@@ -47,7 +47,7 @@ class DecisionContextBuilderTests(unittest.TestCase):
             perception_json=str(perception_json),
             output="",
             max_candidates=3,
-            max_options=8,
+            max_options=12,
             task_mode="tidy",
             format="compact",
         )
@@ -186,6 +186,193 @@ class DecisionContextBuilderTests(unittest.TestCase):
         self.assertEqual(context["option_set"]["selection_contract"]["llm_should_choose_from"], "primary_options_first")
         self.assertIn("rule_baseline_option_id", context["option_set"])
         self.assertNotIn("recommended_option_id", context["option_set"])
+
+    def test_visible_floor_pickup_target_exposes_pursuit_before_waypoint(self) -> None:
+        memory = WORKSPACE_ROOT / "memory" / "decision-context-pursue-pickup-fixture"
+        if memory.exists():
+            shutil.rmtree(memory)
+        try:
+            write_json(memory / "mission-state.json", {"enabled": True, "mode": "SERVICE", "max_steps": 80})
+            write_json(
+                memory / "room-state.json",
+                {
+                    "room_name": "current_room",
+                    "room_complete": False,
+                    "map_backend": "ai2thor_groundtruth",
+                    "pose": {"cell": "0,0", "heading": "north"},
+                },
+            )
+            write_json(memory / "patrol-state.json", {"enabled": True, "mode": "SERVICE", "step_count": 5})
+            write_json(
+                memory / "service-task-state.json",
+                {
+                    "phase": "SEARCH_PICKUP_TARGET",
+                    "holding_object": False,
+                    "pickup_surface_policy": "floor-only",
+                },
+            )
+            write_json(
+                memory / "navigation-costmap.json",
+                {
+                    "status": "success",
+                    "action_safety": {
+                        "MoveAhead": {
+                            "safe": True,
+                            "reason": "clear_swept_volume",
+                            "observed_ratio": 1.0,
+                        },
+                        "RotateLeft": {"safe": True, "reason": "clear_turn_in_place"},
+                        "RotateRight": {"safe": True, "reason": "clear_turn_in_place"},
+                    },
+                },
+            )
+            write_json(
+                memory / "position-map.json",
+                {
+                    "pose": {"cell": "0,0", "heading": "north"},
+                    "frontiers": ["0,1"],
+                    "cells": {"0,0": {"state": "free"}},
+                },
+            )
+            write_json(memory / "object-memory.json", {"tracks": {}})
+            write_json(memory / "global-plan.json", {"status": "success", "next_action": "MoveAhead"})
+            perception = memory / "yolo-current-rgbd.json"
+            write_json(
+                perception,
+                {
+                    "status": "success",
+                    "result_type": "scene_analyzed_yolo",
+                    "perception_backend": "yolo",
+                    "online_safe": True,
+                    "pickup_target_detected": True,
+                    "frontier_exists": True,
+                    "best_pickup_candidate": {
+                        "id": "apple_far_0",
+                        "label": "apple",
+                        "raw_label": "Apple",
+                        "task_semantic_class": "pickup_target",
+                        "confidence": 0.92,
+                        "position_hint": "front-center",
+                        "surface_hint": "floor",
+                        "reachable": True,
+                        "pickup_now": False,
+                        "needs_approach": True,
+                        "is_floor_level": True,
+                        "geometry": {
+                            "bbox": {"x": 280, "y": 500, "w": 30, "h": 28},
+                            "ground_distance_m": 1.2,
+                            "bottom_y_ratio": 0.9,
+                        },
+                    },
+                },
+            )
+
+            context = build_context(self.build_args(memory, perception))
+        finally:
+            if memory.exists():
+                shutil.rmtree(memory)
+
+        option_set = context["option_set"]
+        pursue_ids = [
+            item["option_id"]
+            for item in option_set["options"]
+            if item.get("kind") == "pursue_pickup_target"
+        ]
+        self.assertEqual(len(pursue_ids), 1)
+        pursue_id = pursue_ids[0]
+        self.assertTrue(pursue_id.startswith("pursue:pickup_target:"))
+        self.assertIn(pursue_id, option_set["primary_options"])
+        waypoint_positions = [
+            option_set["primary_options"].index(item["option_id"])
+            for item in option_set["options"]
+            if item.get("kind") in {"continue_active_waypoint_goal", "explore_inspection_waypoint"}
+            and item["option_id"] in option_set["primary_options"]
+        ]
+        if waypoint_positions:
+            self.assertLess(option_set["primary_options"].index(pursue_id), min(waypoint_positions))
+        pursue = next(item for item in option_set["options"] if item["option_id"] == pursue_id)
+        self.assertEqual(pursue["action"], "MoveAhead")
+        self.assertEqual(pursue["pursuit_policy"], "visible_floor_pickup_target_interrupts_waypoint_patrol")
+
+    def test_reached_waypoint_exposes_floor_scan_turn_before_observe(self) -> None:
+        memory = WORKSPACE_ROOT / "memory" / "decision-context-waypoint-floor-scan-fixture"
+        if memory.exists():
+            shutil.rmtree(memory)
+        try:
+            write_json(memory / "mission-state.json", {"enabled": True, "mode": "SERVICE", "max_steps": 80})
+            write_json(
+                memory / "room-state.json",
+                {
+                    "room_name": "current_room",
+                    "room_complete": False,
+                    "inspection_waypoints": [
+                        {"waypoint_id": "wp_front", "cell": "0,1"},
+                        {"waypoint_id": "wp_home", "cell": "0,0"},
+                    ],
+                    "coverage_waypoints": {
+                        "active_waypoint_goal": {
+                            "waypoint_id": "wp_front",
+                            "cell": "0,1",
+                            "status": "active",
+                        }
+                    },
+                },
+            )
+            write_json(memory / "patrol-state.json", {"enabled": True, "mode": "SERVICE", "step_count": 5})
+            write_json(
+                memory / "service-task-state.json",
+                {"phase": "SEARCH_PICKUP_TARGET", "holding_object": False, "pickup_surface_policy": "floor-only"},
+            )
+            write_json(
+                memory / "navigation-costmap.json",
+                {
+                    "status": "success",
+                    "action_safety": {
+                        "RotateLeft": {"safe": True, "reason": "left_turn_clear", "observed_ratio": 0.5},
+                        "RotateRight": {"safe": True, "reason": "right_turn_clear", "observed_ratio": 0.9},
+                    },
+                },
+            )
+            write_json(
+                memory / "position-map.json",
+                {
+                    "pose": {"cell": "0,1", "heading": "north"},
+                    "cells": {
+                        "0,0": {"state": "free", "visited": True},
+                        "0,1": {"state": "free", "visited": True},
+                    },
+                },
+            )
+            write_json(memory / "object-memory.json", {"tracks": {}})
+            write_json(memory / "global-plan.json", {"status": "reset"})
+            perception = memory / "yolo-current-rgbd.json"
+            write_json(
+                perception,
+                {
+                    "status": "success",
+                    "result_type": "navigation_only_observed",
+                    "perception_mode": "navigation_only",
+                    "online_safe": True,
+                    "pickup_target_detected": False,
+                    "frontier_exists": True,
+                },
+            )
+
+            context = build_context(self.build_args(memory, perception))
+        finally:
+            if memory.exists():
+                shutil.rmtree(memory)
+
+        option_set = context["option_set"]
+        option_ids = [item["option_id"] for item in option_set["options"]]
+        self.assertIn("orient:waypoint_floor_scan", option_ids)
+        self.assertIn("orient:waypoint_floor_scan", option_set["primary_options"])
+        self.assertIn("orient:waypoint_floor_scan", option_set["waypoint_floor_scan_options"])
+        self.assertEqual(option_set["rule_baseline_option_id"], "orient:waypoint_floor_scan")
+        orient = next(item for item in option_set["options"] if item["option_id"] == "orient:waypoint_floor_scan")
+        self.assertEqual(orient["kind"], "orient_waypoint_floor_scan")
+        self.assertEqual(orient["action"], "RotateRight")
+        self.assertEqual(orient["active_waypoint_goal"]["waypoint_id"], "wp_front")
 
     def test_low_confidence_translation_move_is_not_exposed(self) -> None:
         memory = WORKSPACE_ROOT / "memory" / "decision-context-low-confidence-fixture"

@@ -174,6 +174,10 @@ def normalize_coverage_waypoint_state(
                     "blocked_at",
                     "blocked_reason",
                     "last_observation_id",
+                    "floor_scan_prepared",
+                    "floor_scan_action",
+                    "floor_scan_prepared_at",
+                    "floor_scan_reason",
                     "last_distance_cells",
                     "last_result",
                 )
@@ -198,6 +202,10 @@ def normalize_coverage_waypoint_state(
         active_goal.setdefault("status", "active")
         active_goal.setdefault("cell", waypoints[active_id].get("cell"))
         active_goal.setdefault("waypoint_source", waypoints[active_id].get("waypoint_source"))
+    active_route = as_dict(existing_state.get("active_waypoint_route"))
+    active_route_waypoint_id = str(active_route.get("waypoint_id") or "").strip()
+    if not active_goal or active_route_waypoint_id != str(active_goal.get("waypoint_id") or "").strip():
+        active_route = {}
 
     completed_count = len(set(observed_ids) | set(blocked_ids))
     required_count = len(required_ids)
@@ -236,6 +244,7 @@ def normalize_coverage_waypoint_state(
         "completed_waypoint_count": completed_count,
         "sweep_coverage_rate": round(completed_count / float(max(1, required_count)), 6),
         "active_waypoint_goal": active_goal,
+        "active_waypoint_route": active_route,
         "waypoint_status": waypoint_status,
         "next_unobserved_waypoints": next_pending[:8],
     }
@@ -272,6 +281,59 @@ def mark_waypoint_observed(
     updated["blocked_waypoint_ids"] = blocked
     updated["waypoint_status"] = status
     return _recompute_counts(updated)
+
+
+def waypoint_floor_scan_prepared(state: Mapping[str, Any], waypoint_id: str | None = None) -> bool:
+    """Return whether the active/referenced waypoint has had its arrival scan orientation."""
+
+    data = as_dict(state)
+    active = as_dict(data.get("active_waypoint_goal"))
+    waypoint = str(waypoint_id or active.get("waypoint_id") or "").strip()
+    if active and (not waypoint or str(active.get("waypoint_id") or "").strip() == waypoint):
+        if active.get("floor_scan_prepared") is True:
+            return True
+    if waypoint:
+        status = as_dict(as_dict(data.get("waypoint_status")).get(waypoint))
+        if status.get("floor_scan_prepared") is True:
+            return True
+    return False
+
+
+def mark_waypoint_floor_scan_prepared(
+    state: Mapping[str, Any],
+    waypoint_id: str,
+    *,
+    action: str,
+    reason: str = "safe_turn_before_full_waypoint_observe",
+    prepared_at: str | None = None,
+) -> JsonDict:
+    updated = dict(as_dict(state))
+    required = set(unique_strings(updated.get("required_waypoint_ids")))
+    waypoint = str(waypoint_id or "").strip()
+    if waypoint not in required:
+        raise ValueError(f"Unknown coverage waypoint_id: {waypoint}")
+    when = prepared_at or now_iso()
+    payload = {
+        "floor_scan_prepared": True,
+        "floor_scan_action": str(action or ""),
+        "floor_scan_prepared_at": when,
+        "floor_scan_reason": reason,
+        "last_result": "floor_scan_prepared",
+    }
+    active = as_dict(updated.get("active_waypoint_goal"))
+    if str(active.get("waypoint_id") or "").strip() == waypoint:
+        active = dict(active)
+        active.update(payload)
+        active.setdefault("status", "active")
+        updated["active_waypoint_goal"] = active
+    status = {key: dict(as_dict(value)) for key, value in as_dict(updated.get("waypoint_status")).items()}
+    item = status.setdefault(waypoint, {"waypoint_id": waypoint})
+    item.update(payload)
+    if item.get("status") not in {"observed", "blocked"}:
+        item["status"] = "active"
+    updated["waypoint_status"] = status
+    updated["updated_at"] = now_iso()
+    return updated
 
 
 def mark_waypoint_blocked(
